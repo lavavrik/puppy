@@ -1,6 +1,7 @@
 //! HTTP download engine building blocks.
 
 pub mod download;
+pub mod engine;
 pub mod probe;
 pub mod resume;
 pub mod segments;

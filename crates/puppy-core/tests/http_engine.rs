@@ -1,0 +1,211 @@
+mod support;
+
+use puppy_core::config::HttpConfig;
+use puppy_core::engine::{Engine, EngineError, EngineEvent, StartMode};
+use puppy_core::http::engine::HttpEngine;
+use puppy_core::http::resume::{part_path, sidecar_path};
+use puppy_core::types::{AddRequest, DownloadState, RequestContext, Source};
+use std::path::Path;
+use std::time::{Duration, Instant};
+use support::{ServerCfg, TestServer};
+
+const KIB: u64 = 1024;
+
+fn cfg(dir: &Path) -> HttpConfig {
+    HttpConfig {
+        backoff_base_ms: 10,
+        backoff_max_ms: 100,
+        flush_interval_ms: 100,
+        default_dir: dir.to_path_buf(),
+        ..HttpConfig::default()
+    }
+}
+
+fn request(s: &TestServer, dir: &Path) -> AddRequest {
+    AddRequest {
+        source: Source::Http {
+            url: s.url("/file.bin"),
+        },
+        output_dir: Some(dir.to_path_buf()),
+        filename: None,
+        context: RequestContext::default(),
+    }
+}
+
+async fn wait_completed(e: &HttpEngine, id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let st = e.status(id).expect("status");
+        if matches!(st.state, DownloadState::Completed) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out; last {st:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn engine_add_and_complete_emits_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 256 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let mut rx = e.subscribe();
+    e.add(1, request(&s, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ev = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        if matches!(ev, EngineEvent::Completed { id: 1 }) {
+            break;
+        }
+    }
+    assert!(matches!(
+        e.status(1).unwrap().state,
+        DownloadState::Completed
+    ));
+}
+
+#[tokio::test]
+async fn engine_rejects_magnet_and_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg::default()).await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let magnet = Source::Magnet {
+        uri: "magnet:?xt=urn:btih:abc".into(),
+    };
+    assert!(!e.accepts(&magnet));
+    assert!(!e.accepts(&Source::Http {
+        url: "ftp://x/y".parse().unwrap()
+    }));
+    let mut req = request(&s, dir.path());
+    req.source = magnet;
+    assert!(matches!(
+        e.add(1, req, StartMode::Fresh).await,
+        Err(EngineError::Unsupported(_))
+    ));
+    e.add(2, request(&s, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+    assert!(matches!(
+        e.add(2, request(&s, dir.path()), StartMode::Fresh).await,
+        Err(EngineError::Invalid(_))
+    ));
+    assert!(matches!(
+        e.remove(99, false).await,
+        Err(EngineError::NotFound(99))
+    ));
+    assert!(matches!(
+        e.set_download_limit(99, None),
+        Err(EngineError::NotFound(99))
+    ));
+    e.remove(2, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn engine_global_budget_applies_across_downloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 512 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    e.set_global_download_budget(Some(256 * KIB));
+    let start = Instant::now();
+    for id in [1, 2] {
+        let mut req = request(&s, dir.path());
+        req.filename = Some(format!("f{id}.bin"));
+        e.add(id, req, StartMode::Fresh).await.unwrap();
+    }
+    wait_completed(&e, 1).await;
+    wait_completed(&e, 2).await;
+    // 1 MiB total at 256 KiB/s is ~4 s; allow for the initial burst.
+    let el = start.elapsed();
+    assert!(el >= Duration::from_millis(3000), "too fast: {el:?}");
+}
+
+#[tokio::test]
+async fn engine_remove_deletes_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 4 * 1024 * KIB,
+        bytes_per_sec: Some(512 * KIB),
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let added = e
+        .add(1, request(&s, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    e.pause(1).await.unwrap();
+    assert!(part_path(&added.path).exists());
+    e.remove(1, true).await.unwrap();
+    assert!(!part_path(&added.path).exists());
+    assert!(!sidecar_path(&added.path).exists());
+    assert!(!added.path.exists());
+    assert!(e.status(1).is_none());
+}
+
+#[tokio::test]
+async fn engine_remove_completed_deletes_final_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 64 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let added = e
+        .add(1, request(&s, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+    wait_completed(&e, 1).await;
+    assert!(added.path.exists());
+    e.remove(1, true).await.unwrap();
+    assert!(!added.path.exists());
+    assert!(e.status(1).is_none());
+}
+
+#[tokio::test]
+async fn engine_restore_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 2 * 1024 * KIB,
+        bytes_per_sec: Some(1024 * KIB),
+        ..ServerCfg::default()
+    })
+    .await;
+    let e1 = HttpEngine::new(cfg(dir.path())).unwrap();
+    let req = request(&s, dir.path());
+    let added = e1.add(1, req.clone(), StartMode::Fresh).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    e1.pause(1).await.unwrap();
+    assert!(matches!(e1.status(1).unwrap().state, DownloadState::Paused));
+    drop(e1);
+
+    let e2 = HttpEngine::new(cfg(dir.path())).unwrap();
+    e2.add(
+        1,
+        req,
+        StartMode::Restore {
+            path: added.path.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_completed(&e2, 1).await;
+    assert_eq!(
+        std::fs::metadata(&added.path).unwrap().len(),
+        2 * 1024 * KIB
+    );
+}
