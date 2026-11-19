@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub type DownloadId = u64;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
     Http { url: url::Url },
@@ -13,7 +13,7 @@ pub enum Source {
     TorrentFile { path: PathBuf },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestContext {
     pub headers: Vec<(String, String)>,
     pub cookies: Option<String>,
@@ -22,7 +22,7 @@ pub struct RequestContext {
     pub basic_auth: Option<(String, Option<String>)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AddRequest {
     pub source: Source,
     pub output_dir: Option<PathBuf>,
