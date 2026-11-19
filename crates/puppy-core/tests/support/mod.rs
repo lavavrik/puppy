@@ -24,6 +24,8 @@ pub struct ServerCfg {
     pub head_allowed: bool,
     /// Answer HEAD with `Content-Length: 0` regardless of the real length.
     pub head_zero_length: bool,
+    /// Answer the first GET with 503 (re-armed by `set_cfg`).
+    pub get_503_once: bool,
     /// Advertise range support but answer every request with 200 and the full body.
     pub ranges_lie: bool,
     pub disposition: Option<String>,
@@ -42,6 +44,7 @@ impl Default for ServerCfg {
             content_length: true,
             head_allowed: true,
             head_zero_length: false,
+            get_503_once: false,
             ranges_lie: false,
             disposition: None,
             bytes_per_sec: None,
@@ -54,6 +57,7 @@ struct Shared {
     cfg: Mutex<ServerCfg>,
     version: AtomicU32,
     fail_used: AtomicBool,
+    get_503_used: AtomicBool,
     requests: Mutex<Vec<HeaderMap>>,
     range_requests: Mutex<usize>,
 }
@@ -76,6 +80,7 @@ impl TestServer {
             cfg: Mutex::new(cfg),
             version: AtomicU32::new(0),
             fail_used: AtomicBool::new(false),
+            get_503_used: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
             range_requests: Mutex::new(0),
         });
@@ -106,6 +111,7 @@ impl TestServer {
     pub fn set_cfg(&self, f: impl FnOnce(&mut ServerCfg)) {
         f(&mut self.shared.cfg.lock().unwrap());
         self.shared.fail_used.store(false, Ordering::SeqCst);
+        self.shared.get_503_used.store(false, Ordering::SeqCst);
     }
 
     /// Headers of every request received, in order.
@@ -181,6 +187,9 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
         Method::HEAD if cfg.head_allowed => true,
         _ => return plain(StatusCode::METHOD_NOT_ALLOWED),
     };
+    if !is_head && cfg.get_503_once && !sh.get_503_used.swap(true, Ordering::SeqCst) {
+        return plain(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let range_hdr = req
         .headers()
         .get(header::RANGE)

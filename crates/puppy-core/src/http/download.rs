@@ -370,13 +370,11 @@ impl Inner {
     }
 
     fn resume_state(&self) -> HttpResumeState {
-        let segments = self
-            .lock()
-            .plan
-            .segments
-            .iter()
-            .map(SegEntry::snapshot)
-            .collect();
+        let (segments, single_stream) = {
+            let st = self.lock();
+            let segs = st.plan.segments.iter().map(SegEntry::snapshot).collect();
+            (segs, st.plan.single)
+        };
         let r = &self.remote;
         HttpResumeState {
             version: VERSION,
@@ -388,6 +386,7 @@ impl Inner {
             last_modified: r.last_modified.clone(),
             final_path: self.final_path.clone(),
             segments,
+            single_stream,
         }
     }
 

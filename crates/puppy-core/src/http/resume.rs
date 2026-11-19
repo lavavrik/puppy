@@ -24,6 +24,10 @@ pub struct HttpResumeState {
     pub last_modified: Option<String>,
     pub final_path: PathBuf,
     pub segments: Vec<Segment>,
+    /// One plain GET from offset 0 (no ranges, unknown length, or fallen back after a
+    /// server ignored ranges): cannot be continued, only restarted.
+    #[serde(default)]
+    pub single_stream: bool,
 }
 
 fn append_ext(final_path: &Path, ext: &str) -> PathBuf {
@@ -130,6 +134,7 @@ mod tests {
             last_modified: None,
             final_path: final_path.to_path_buf(),
             segments,
+            single_stream: false,
         }
     }
 
@@ -167,6 +172,23 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn single_stream_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("a.iso");
+        let mut json = serde_json::to_value(state(&final_path, vec![seg(0, 100, 0)])).unwrap();
+        json.as_object_mut().unwrap().remove("single_stream");
+        tokio::fs::write(sidecar_path(&final_path), json.to_string())
+            .await
+            .unwrap();
+        assert!(
+            !HttpResumeState::load(&final_path)
+                .await
+                .unwrap()
+                .single_stream
+        );
     }
 
     #[tokio::test]

@@ -142,6 +142,10 @@ pub async fn probe(
                 info.disposition = p.disposition.or(info.disposition);
             }
             Err(e) if !head_ok => return Err(e),
+            // 416 for `bytes=0-0` confirms an empty file.
+            Err(EngineError::Http { status: 416 }) => {}
+            // HEAD's 0 is unconfirmed (error, timeout, 5xx, 429): the size is unknown.
+            Err(_) if head_zero => info.total = None,
             Err(_) => {}
         }
     }

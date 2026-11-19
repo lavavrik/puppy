@@ -4,7 +4,7 @@ use puppy_core::config::HttpConfig;
 use puppy_core::engine::EngineEvent;
 use puppy_core::http::download::HttpDownload;
 use puppy_core::http::probe::build_client;
-use puppy_core::http::resume::{part_path, sidecar_path};
+use puppy_core::http::resume::{HttpResumeState, part_path, sidecar_path};
 use puppy_core::limiter::TokenBucket;
 use puppy_core::types::{
     AddRequest, AttentionReason, DownloadState, DownloadStatus, EngineDetail, RequestContext,
@@ -390,4 +390,52 @@ async fn zero_length_file() {
     wait_state(&dl, is_completed, TIMEOUT).await;
     assert_eq!(std::fs::read(&added.path).unwrap().len(), 0);
     assert_no_leftovers(&added.path);
+}
+
+#[tokio::test]
+async fn head_zero_length_flaky_get_downloads_full_file() {
+    let s = server(|c| {
+        c.len = MIB;
+        c.head_zero_length = true;
+        c.get_503_once = true;
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(&s, dir.path(), cfg(dir.path())).await;
+    assert_eq!(added.total_bytes, None);
+    wait_state(&dl, is_completed, TIMEOUT).await;
+    let (segs, resumable) = segments(&dl);
+    assert_eq!(segs.len(), 1);
+    assert!(!resumable);
+    assert_file(&added.path, MIB, 0);
+    assert_no_leftovers(&added.path);
+}
+
+async fn sidecar_single_stream_flag(f: impl FnOnce(&mut ServerCfg)) -> bool {
+    let s = server(|c| {
+        c.bytes_per_sec = Some(256 * KIB);
+        f(c);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(&s, dir.path(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT).await;
+    dl.pause().await;
+    let state = HttpResumeState::load(&added.path).await.unwrap();
+    dl.cancel(true).await;
+    state.single_stream
+}
+
+#[tokio::test]
+async fn sidecar_marks_single_stream() {
+    assert!(!sidecar_single_stream_flag(|_| {}).await);
+    assert!(sidecar_single_stream_flag(|c| c.ranges = false).await);
+    assert!(
+        sidecar_single_stream_flag(|c| {
+            c.ranges = false;
+            c.content_length = false;
+        })
+        .await
+    );
+    assert!(sidecar_single_stream_flag(|c| c.ranges_lie = true).await);
 }

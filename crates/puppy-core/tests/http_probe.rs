@@ -237,3 +237,18 @@ async fn probe_empty_file_keeps_head_info() {
     assert_eq!(info.total, Some(0));
     assert_eq!(s.range_requests(), 1);
 }
+
+#[tokio::test]
+async fn probe_head_zero_then_get_fails_is_unknown_length() {
+    // HEAD's 0 is not confirmed by the fallback GET, so the size must be unknown.
+    let s = TestServer::start(ServerCfg {
+        head_zero_length: true,
+        get_503_once: true,
+        ..Default::default()
+    })
+    .await;
+    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
+        .await
+        .unwrap();
+    assert_eq!(info.total, None);
+}
