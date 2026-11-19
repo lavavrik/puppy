@@ -31,6 +31,7 @@ fn capacity(rate: u64) -> f64 {
 impl TokenBucket {
     /// `None` means unlimited. A limited bucket starts empty.
     pub fn new(bps: Option<u64>) -> Self {
+        let bps = bps.filter(|&r| r > 0);
         TokenBucket(Arc::new(Inner {
             state: Mutex::new(State {
                 rate: bps,
@@ -42,12 +43,14 @@ impl TokenBucket {
     }
 
     pub fn set_rate(&self, bps: Option<u64>) {
+        let bps = bps.filter(|&r| r > 0);
         {
             let mut s = self.0.state.lock().unwrap();
             refill(&mut s);
             s.rate = bps;
-            if let Some(r) = bps {
-                s.tokens = s.tokens.min(capacity(r));
+            match bps {
+                Some(r) => s.tokens = s.tokens.min(capacity(r)),
+                None => s.tokens = 0.0,
             }
         }
         self.0.changed.notify_waiters();
@@ -112,6 +115,17 @@ mod tests {
         }
         let e = t.elapsed().as_secs_f64();
         assert!((3.75..=5.25).contains(&e), "elapsed {e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_rate_is_unlimited() {
+        let t = Instant::now();
+        let b = TokenBucket::new(Some(0));
+        b.acquire(100_000_000).await;
+        let b = TokenBucket::new(Some(1000));
+        b.set_rate(Some(0));
+        b.acquire(100_000_000).await;
+        assert_eq!(t.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
