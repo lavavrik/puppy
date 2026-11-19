@@ -74,6 +74,16 @@ pub(super) fn open_part(final_path: &Path) -> io::Result<File> {
         .open(part_path(final_path))
 }
 
+/// Length of a regular file, `None` if there is none.
+pub(super) async fn file_len(path: &Path) -> io::Result<Option<u64>> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() => Ok(Some(m.len())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub(super) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {

@@ -12,15 +12,17 @@ use crate::engine::{Added, EngineError, EngineEvent};
 use crate::http::probe::RemoteInfo;
 use crate::http::resume::{HttpResumeState, VERSION, part_path, sidecar_path};
 use crate::http::segments::{Segment, plan_segments};
+use crate::http::validate::{Validation, validate_remote};
 use crate::http::worker::SegmentShared;
 use crate::limiter::TokenBucket;
 use crate::types::{
-    AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, SegmentView, Source,
+    AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
+    RequestContext, SegmentView, Source,
 };
-use files::prepare;
+use files::{file_len, prepare};
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -144,62 +146,104 @@ impl Plan {
         }
     }
 
+    /// The plan recorded in a sidecar. Single streams restart from zero.
+    fn restored(state: &HttpResumeState) -> Self {
+        if state.single_stream || state.total.is_none() {
+            return Plan::single(state.total, false);
+        }
+        Plan {
+            single: false,
+            fell_back: false,
+            segments: state
+                .segments
+                .iter()
+                .map(|s| SegEntry::new(s.start, s.end, s.done))
+                .collect(),
+        }
+    }
+
+    /// A finished file of `len` bytes.
+    fn finished(len: u64) -> Self {
+        Plan {
+            single: false,
+            fell_back: false,
+            segments: (len > 0)
+                .then(|| SegEntry::new(0, len, len))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Nothing known (no sidecar); never run.
+    fn unknown() -> Self {
+        Plan {
+            single: true,
+            fell_back: false,
+            segments: Vec::new(),
+        }
+    }
+
     fn done_bytes(&self) -> u64 {
         self.segments.iter().map(SegEntry::done).sum()
     }
 }
 
-impl HttpDownload {
-    /// Probes, creates `<final>.part` (preallocated when the size is known) and starts
-    /// transferring in the background. Returns once the name and path are known.
-    pub async fn start_fresh(
+/// What every way of creating a download is given by its caller.
+struct Env {
+    id: DownloadId,
+    client: reqwest::Client,
+    cfg: HttpConfig,
+    global: TokenBucket,
+    events: broadcast::Sender<EngineEvent>,
+}
+
+impl Env {
+    fn new(
         id: DownloadId,
-        req: AddRequest,
         client: reqwest::Client,
         mut cfg: HttpConfig,
         global: TokenBucket,
         events: broadcast::Sender<EngineEvent>,
-    ) -> Result<(Self, Added), EngineError> {
-        let Source::Http { url } = &req.source else {
-            return Err(EngineError::Unsupported("not an HTTP source"));
-        };
-        let url = url.clone();
+    ) -> Self {
         cfg.min_segment_bytes = cfg.min_segment_bytes.max(1);
         cfg.connections = cfg.connections.max(1);
-        let _ = events.send(EngineEvent::StateChanged {
+        Env {
             id,
-            state: DownloadState::Starting,
-        });
-        let (remote, final_path) = match prepare(&client, &url, &req, &cfg).await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = events.send(EngineEvent::StateChanged {
-                    id,
-                    state: DownloadState::Failed {
-                        reason: e.to_string(),
-                    },
-                });
-                return Err(e);
-            }
-        };
-        let plan = Plan::new(remote.total, remote.accepts_ranges, &cfg);
-        let name = final_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            client,
+            cfg,
+            global,
+            events,
+        }
+    }
+
+    fn emit(&self, state: DownloadState) {
+        let _ = self
+            .events
+            .send(EngineEvent::StateChanged { id: self.id, state });
+    }
+
+    /// The download in state `Starting`, not yet running.
+    fn build(
+        self,
+        request: AddRequest,
+        remote: RemoteInfo,
+        final_path: PathBuf,
+        plan: Plan,
+    ) -> (Arc<Inner>, Added) {
+        let name = file_name(&final_path);
         let added = Added {
             name: name.clone(),
             path: final_path.clone(),
             total_bytes: remote.total,
         };
         let inner = Arc::new(Inner {
-            id,
-            request: req,
-            client,
-            cfg,
-            global,
+            id: self.id,
+            request,
+            client: self.client,
+            cfg: self.cfg,
+            global: self.global,
             limit: TokenBucket::new(None),
-            events,
+            events: self.events,
             remote,
             final_path,
             name,
@@ -210,7 +254,181 @@ impl HttpDownload {
             bps: AtomicU64::new(0),
             control: tokio::sync::Mutex::new(Control::default()),
         });
+        (inner, added)
+    }
+}
+
+/// Request and remote facts recorded in a sidecar.
+fn from_sidecar(state: &HttpResumeState, final_path: &Path) -> (AddRequest, RemoteInfo) {
+    let remote = RemoteInfo {
+        final_url: state.final_url.clone(),
+        total: state.total,
+        accepts_ranges: !state.single_stream,
+        etag: state.etag.clone(),
+        etag_strong: state.etag_strong,
+        last_modified: state.last_modified.clone(),
+        filename: file_name(final_path),
+    };
+    (state.request.clone(), remote)
+}
+
+/// Stand-ins when the sidecar cannot be read: such a download is only ever shown or
+/// cancelled, never run.
+fn placeholder(final_path: &Path) -> (AddRequest, RemoteInfo) {
+    let url = url::Url::from_file_path(final_path)
+        .unwrap_or_else(|()| url::Url::parse("file:///").expect("static URL"));
+    let request = AddRequest {
+        source: Source::Http { url: url.clone() },
+        output_dir: final_path.parent().map(Path::to_path_buf),
+        filename: Some(file_name(final_path)),
+        context: RequestContext::default(),
+    };
+    let remote = RemoteInfo {
+        final_url: url,
+        total: None,
+        accepts_ranges: false,
+        etag: None,
+        etag_strong: false,
+        last_modified: None,
+        filename: file_name(final_path),
+    };
+    (request, remote)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The sidecar's segments must tile `[0, total)` and `.part` must be `total` bytes long.
+fn check_layout(state: &HttpResumeState, total: u64, part_len: u64) -> Result<(), String> {
+    let mut cursor = 0;
+    for s in &state.segments {
+        if s.start != cursor {
+            return Err(format!("resume sidecar: gap or overlap at offset {cursor}"));
+        }
+        cursor = s.end;
+    }
+    if cursor != total {
+        return Err(format!(
+            "resume sidecar: segments end at {cursor}, file is {total} bytes"
+        ));
+    }
+    if part_len != total {
+        return Err(format!(
+            "partial file is {part_len} bytes, expected {total}"
+        ));
+    }
+    Ok(())
+}
+
+impl HttpDownload {
+    /// Probes, creates `<final>.part` (preallocated when the size is known) and starts
+    /// transferring in the background. Returns once the name and path are known.
+    pub async fn start_fresh(
+        id: DownloadId,
+        req: AddRequest,
+        client: reqwest::Client,
+        cfg: HttpConfig,
+        global: TokenBucket,
+        events: broadcast::Sender<EngineEvent>,
+    ) -> Result<(Self, Added), EngineError> {
+        let Source::Http { url } = &req.source else {
+            return Err(EngineError::Unsupported("not an HTTP source"));
+        };
+        let url = url.clone();
+        let env = Env::new(id, client, cfg, global, events);
+        env.emit(DownloadState::Starting);
+        let (remote, final_path) = match prepare(&env.client, &url, &req, &env.cfg).await {
+            Ok(v) => v,
+            Err(e) => {
+                env.emit(DownloadState::Failed {
+                    reason: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        let plan = Plan::new(remote.total, remote.accepts_ranges, &env.cfg);
+        let (inner, added) = env.build(req, remote, final_path, plan);
         inner.control.lock().await.run = Some(spawn_run(&inner));
+        Ok((HttpDownload { inner }, added))
+    }
+
+    /// Continues a download from its sidecar after a crash or restart, but only once the
+    /// remote file is proven unchanged (see [`validate_remote`]). Outcomes that need the
+    /// user (`NeedsAttention`) or a retry (`Failed`, from a transient validation error;
+    /// `resume` retries) are returned as `Ok` with the download in that state. Files are
+    /// never deleted here, except a stale sidecar next to an already finished file.
+    pub async fn restore(
+        id: DownloadId,
+        final_path: &Path,
+        client: reqwest::Client,
+        cfg: HttpConfig,
+        global: TokenBucket,
+        events: broadcast::Sender<EngineEvent>,
+    ) -> Result<(Self, Added), EngineError> {
+        let env = Env::new(id, client, cfg, global, events);
+        env.emit(DownloadState::Starting);
+        let final_path = final_path.to_path_buf();
+        let sidecar = sidecar_path(&final_path);
+        let loaded = HttpResumeState::load(&final_path).await;
+        let part_len = file_len(&part_path(&final_path)).await?;
+
+        // Finalizing renames `.part` before deleting the sidecar: a final file with a
+        // sidecar but no `.part` was completed (and fsynced) before the crash.
+        if part_len.is_none()
+            && file_len(&sidecar).await?.is_some()
+            && let Some(len) = file_len(&final_path).await?
+        {
+            match tokio::fs::remove_file(&sidecar).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %sidecar.display(), "cannot delete: {e}"),
+            }
+            let (request, mut remote) = match &loaded {
+                Ok(state) => from_sidecar(state, &final_path),
+                Err(_) => placeholder(&final_path),
+            };
+            remote.total = Some(len);
+            let (inner, added) = env.build(request, remote, final_path, Plan::finished(len));
+            inner.set_state(DownloadState::Completed);
+            let _ = inner.events.send(EngineEvent::Completed { id });
+            return Ok((HttpDownload { inner }, added));
+        }
+
+        let state = match loaded {
+            Ok(s) => s,
+            Err(e) => {
+                let (request, remote) = placeholder(&final_path);
+                let (inner, added) = env.build(request, remote, final_path, Plan::unknown());
+                inner.needs_attention(AttentionReason::ValidationFailed {
+                    detail: format!("cannot load resume sidecar: {e}"),
+                });
+                return Ok((HttpDownload { inner }, added));
+            }
+        };
+        let (request, remote) = from_sidecar(&state, &final_path);
+        let (inner, added) = env.build(request, remote, final_path, Plan::restored(&state));
+        let reason = match (part_len, state.total) {
+            (None, _) => Some(AttentionReason::ValidationFailed {
+                detail: "partial file is missing".into(),
+            }),
+            (Some(_), None) => Some(AttentionReason::NotResumable),
+            _ if state.single_stream => Some(AttentionReason::NotResumable),
+            (Some(len), Some(total)) => check_layout(&state, total, len)
+                .err()
+                .map(|detail| AttentionReason::ValidationFailed { detail }),
+        };
+        if let Some(reason) = reason {
+            inner.needs_attention(reason);
+            return Ok((HttpDownload { inner }, added));
+        }
+        let mut c = inner.control.lock().await;
+        if let Ok(true) = inner.validate().await {
+            c.run = Some(spawn_run(&inner));
+        }
+        drop(c);
         Ok((HttpDownload { inner }, added))
     }
 
@@ -221,7 +439,9 @@ impl HttpDownload {
         self.inner.stop(&mut c).await;
     }
 
-    /// Re-runs the remaining segments (single streams restart from zero).
+    /// Re-runs the remaining segments (single streams restart from zero) once the remote
+    /// file is validated as unchanged. A changed remote leaves the download in
+    /// `NeedsAttention` (`Ok`); a validation error leaves it `Failed` and is returned.
     pub async fn resume(&self) -> Result<(), EngineError> {
         let mut c = self.inner.control.lock().await;
         if c.cancelled {
@@ -247,7 +467,9 @@ impl HttpDownload {
             }
             _ => {}
         }
-        // Seam: remote validation before continuing is added here by restore support.
+        if !self.inner.validate().await? {
+            return Ok(());
+        }
         c.run = Some(spawn_run(&self.inner));
         Ok(())
     }
@@ -350,6 +572,38 @@ impl Inner {
         let _ = self
             .events
             .send(EngineEvent::StateChanged { id: self.id, state });
+    }
+
+    fn needs_attention(&self, reason: AttentionReason) {
+        self.set_state(DownloadState::NeedsAttention { reason });
+    }
+
+    /// Checks that the remote still serves the file `.part` holds bytes of. `Ok(true)`:
+    /// continue. `Ok(false)`: now `NeedsAttention`. `Err`: now `Failed` (retryable).
+    /// Single streams restart from zero, so there is nothing to validate.
+    async fn validate(&self) -> Result<bool, EngineError> {
+        if self.lock().plan.single {
+            return Ok(true);
+        }
+        let state = self.resume_state();
+        let part = part_path(&self.final_path);
+        match validate_remote(&self.client, &state, &part, &self.cfg).await {
+            Ok(Validation::Ok) => Ok(true),
+            Ok(Validation::Changed) => {
+                self.needs_attention(AttentionReason::RemoteChanged);
+                Ok(false)
+            }
+            Ok(Validation::NotResumable) => {
+                self.needs_attention(AttentionReason::NotResumable);
+                Ok(false)
+            }
+            Err(e) => {
+                self.set_state(DownloadState::Failed {
+                    reason: format!("validating the remote file failed: {e}"),
+                });
+                Err(e)
+            }
+        }
     }
 
     fn task_failed(&self, e: tokio::task::JoinError) {

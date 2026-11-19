@@ -176,7 +176,7 @@ fn carries_validator(h: &header::HeaderMap, validator: &str) -> bool {
 }
 
 /// Parses `bytes <start>-<end>/<total>`; total is `None` for `*`.
-fn parse_content_range(v: &str) -> Option<(u64, Option<u64>)> {
+pub(crate) fn parse_content_range(v: &str) -> Option<(u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes")?.trim_start();
     let (range, total) = rest.split_once('/')?;
     let (s, _e) = range.split_once('-')?;
