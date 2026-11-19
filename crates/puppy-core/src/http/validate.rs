@@ -3,7 +3,7 @@
 
 use crate::config::HttpConfig;
 use crate::engine::EngineError;
-use crate::http::probe::apply_context;
+use crate::http::probe::{apply_context, timed};
 use crate::http::resume::HttpResumeState;
 use crate::http::worker::parse_content_range;
 use futures_util::StreamExt;
@@ -55,6 +55,7 @@ async fn validate(
         Some(_) => (None, true),
         None => (state.last_modified.as_deref(), true),
     };
+    let read_timeout = Duration::from_millis(cfg.read_timeout_ms);
     let completed: Vec<(u64, u64)> = state
         .segments
         .iter()
@@ -72,10 +73,10 @@ async fn validate(
             .unwrap_or_default()
     };
     if windows.is_empty() {
-        return probe_only(client, state, if_range, total).await;
+        return probe_only(client, state, if_range, total, read_timeout).await;
     }
     for (start, end) in windows {
-        let got = match fetch(client, state, if_range, start, end).await? {
+        let got = match fetch(client, state, if_range, (start, end), read_timeout).await? {
             Fetched::Range { total: t, .. } if t != Some(total) => return Ok(Validation::Changed),
             Fetched::Range { data, .. } => data,
             // Completed bytes lie inside the recorded total: the file shrank.
@@ -99,15 +100,18 @@ async fn probe_only(
     state: &HttpResumeState,
     if_range: Option<&str>,
     total: u64,
+    read_timeout: Duration,
 ) -> Result<Validation, EngineError> {
-    Ok(match fetch(client, state, if_range, 0, 1).await? {
-        Fetched::Range { total: t, .. } if t == Some(total) => Validation::Ok,
-        Fetched::Range { .. } => Validation::Changed,
-        // An empty file cannot satisfy any range; `bytes */0` confirms it is still empty.
-        Fetched::Unsatisfiable { total: Some(0) } if total == 0 => Validation::Ok,
-        Fetched::Unsatisfiable { .. } => Validation::Changed,
-        Fetched::Other(v) => v,
-    })
+    Ok(
+        match fetch(client, state, if_range, (0, 1), read_timeout).await? {
+            Fetched::Range { total: t, .. } if t == Some(total) => Validation::Ok,
+            Fetched::Range { .. } => Validation::Changed,
+            // An empty file cannot satisfy any range; `bytes */0` confirms it is still empty.
+            Fetched::Unsatisfiable { total: Some(0) } if total == 0 => Validation::Ok,
+            Fetched::Unsatisfiable { .. } => Validation::Changed,
+            Fetched::Other(v) => v,
+        },
+    )
 }
 
 enum Fetched {
@@ -119,13 +123,13 @@ enum Fetched {
     Other(Validation),
 }
 
-/// GETs `[start, end)` (with `If-Range` when given).
+/// GETs `[start, end)` (with `If-Range` when given); `read_timeout` bounds each wait.
 async fn fetch(
     client: &reqwest::Client,
     state: &HttpResumeState,
     if_range: Option<&str>,
-    start: u64,
-    end: u64,
+    (start, end): (u64, u64),
+    read_timeout: Duration,
 ) -> Result<Fetched, EngineError> {
     let mut rb = client
         .get(state.final_url.clone())
@@ -133,10 +137,12 @@ async fn fetch(
     if let Some(v) = if_range {
         rb = rb.header(header::IF_RANGE, v);
     }
-    let resp = apply_context(rb, &state.request.context)
-        .send()
-        .await
-        .map_err(|e| EngineError::Network(e.to_string()))?;
+    let resp = timed(
+        read_timeout,
+        apply_context(rb, &state.request.context).send(),
+    )
+    .await?
+    .map_err(|e| EngineError::Network(e.to_string()))?;
     let content_range = resp
         .headers()
         .get(header::CONTENT_RANGE)
@@ -168,7 +174,7 @@ async fn fetch(
     let want = usize::try_from(end - start).unwrap_or(usize::MAX);
     let mut data = Vec::with_capacity(want);
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = timed(read_timeout, stream.next()).await? {
         let chunk = chunk.map_err(|e| EngineError::Network(e.to_string()))?;
         if data.len() + chunk.len() > want {
             // More than requested: not the range we asked for.

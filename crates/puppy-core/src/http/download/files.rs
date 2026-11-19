@@ -19,7 +19,8 @@ pub(super) async fn prepare(
     req: &AddRequest,
     cfg: &HttpConfig,
 ) -> Result<(RemoteInfo, PathBuf), EngineError> {
-    let remote = probe(client, url, &req.context).await?;
+    let read_timeout = std::time::Duration::from_millis(cfg.read_timeout_ms);
+    let remote = probe(client, url, &req.context, read_timeout).await?;
     let dir = req
         .output_dir
         .clone()

@@ -439,3 +439,34 @@ async fn sidecar_marks_single_stream() {
     );
     assert!(sidecar_single_stream_flag(|c| c.ranges_lie = true).await);
 }
+
+#[tokio::test]
+async fn low_limit_does_not_reconnect() {
+    // Waiting on the limiter for longer than the read timeout must not count as a stalled
+    // connection: the body is already arriving, only we are slow to take it.
+    // 48 KiB arrives in three 16 KiB chunks; at 8 KiB/s each limiter wait (2 s) exceeds
+    // the read timeout.
+    let s = server(|c| c.len = 48 * KIB).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.connections = 1;
+    c.read_timeout_ms = 1000;
+    let (tx, _) = broadcast::channel(256);
+    let client = build_client(&c).unwrap();
+    let (dl, added) = HttpDownload::start_fresh(
+        1,
+        request(&s, dir.path()),
+        client,
+        c,
+        TokenBucket::new(Some(8 * KIB)),
+        tx,
+    )
+    .await
+    .unwrap();
+    wait_state(&dl, is_completed, TIMEOUT).await;
+    assert_file(&added.path, 48 * KIB, 0);
+    // The HEAD probe plus a single ranged GET.
+    let seen = s.requests_seen().len();
+    assert!(seen <= 2, "reconnected: {seen} requests");
+    assert_eq!(s.range_requests(), 1);
+}

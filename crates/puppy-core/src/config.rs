@@ -13,7 +13,8 @@ pub struct HttpConfig {
     pub spot_check_bytes: u64,
     /// TCP/TLS connect timeout.
     pub connect_timeout_ms: u64,
-    /// Idle timeout per read (headers or body); a stalled connection errors out.
+    /// Idle timeout per network wait (response headers or the next body chunk), measured
+    /// only while actually waiting on the server; a stalled connection errors out.
     pub read_timeout_ms: u64,
     /// Upper bound for validating a remote file before resuming it.
     pub validate_timeout_ms: u64,

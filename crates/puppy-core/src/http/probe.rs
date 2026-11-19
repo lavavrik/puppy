@@ -32,8 +32,10 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
         // multi-connection downloads (per-connection throttling is what they work around).
         .http1_only()
         .redirect(reqwest::redirect::Policy::limited(10))
+        // No client-level read timeout: its deadline keeps running while a caller is not
+        // polling the body (e.g. waiting on a rate limiter) and then fires spuriously.
+        // Callers bound each network wait with `timed` instead.
         .connect_timeout(Duration::from_millis(cfg.connect_timeout_ms))
-        .read_timeout(Duration::from_millis(cfg.read_timeout_ms))
         .user_agent(concat!("puppy/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = &cfg.proxy {
         let proxy = reqwest::Proxy::all(proxy.as_str())
@@ -43,6 +45,16 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
     builder
         .build()
         .map_err(|e| EngineError::Network(e.to_string()))
+}
+
+/// Bounds one wait on the network (response headers or the next body chunk) by `limit`.
+pub(crate) async fn timed<F: std::future::Future>(
+    limit: Duration,
+    f: F,
+) -> Result<F::Output, EngineError> {
+    tokio::time::timeout(limit, f)
+        .await
+        .map_err(|_| EngineError::Network("timed out waiting for the server".into()))
 }
 
 /// Applies per-download request context. Invalid header names/values are skipped.
@@ -112,16 +124,22 @@ fn collect(resp: &Response) -> Partial {
     }
 }
 
+/// Probes `url`; `read_timeout` bounds each wait for response headers.
 pub async fn probe(
     client: &Client,
     url: &url::Url,
     ctx: &RequestContext,
+    read_timeout: Duration,
 ) -> Result<RemoteInfo, EngineError> {
-    let head = apply_context(client.head(url.clone()), ctx).send().await;
+    let head = timed(
+        read_timeout,
+        apply_context(client.head(url.clone()), ctx).send(),
+    )
+    .await;
     let mut final_url = url.clone();
     let mut info = Partial::default();
     let mut head_ok = false;
-    if let Ok(resp) = head
+    if let Ok(Ok(resp)) = head
         && resp.status().is_success()
     {
         final_url = resp.url().clone();
@@ -133,7 +151,7 @@ pub async fn probe(
     // length is confirmed with a ranged GET as well.
     let head_zero = head_ok && info.total == Some(0);
     if !head_ok || info.total.is_none() || head_zero {
-        match range_probe(client, url, ctx).await {
+        match range_probe(client, url, ctx, read_timeout).await {
             Ok((url2, p)) => {
                 final_url = url2;
                 // After a HEAD claiming 0, the GET is authoritative (even if it is unsized).
@@ -173,14 +191,13 @@ async fn range_probe(
     client: &Client,
     url: &url::Url,
     ctx: &RequestContext,
+    read_timeout: Duration,
 ) -> Result<(url::Url, Partial), EngineError> {
-    let resp = apply_context(
+    let rb = apply_context(
         client.get(url.clone()).header(header::RANGE, "bytes=0-0"),
         ctx,
-    )
-    .send()
-    .await
-    .map_err(net_err)?;
+    );
+    let resp = timed(read_timeout, rb.send()).await?.map_err(net_err)?;
     let status = resp.status();
     if !status.is_success() {
         return Err(EngineError::Http {

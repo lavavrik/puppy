@@ -2,7 +2,7 @@
 
 use crate::config::HttpConfig;
 use crate::fsutil::write_at;
-use crate::http::probe::apply_context;
+use crate::http::probe::{apply_context, timed};
 use crate::limiter::TokenBucket;
 use crate::meter::SpeedMeter;
 use crate::types::RequestContext;
@@ -207,10 +207,12 @@ async fn attempt_once(
     }
     let rb = apply_context(rb, &ctx.context);
 
+    let read_timeout = Duration::from_millis(ctx.cfg.read_timeout_ms);
     let resp = tokio::select! {
         _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-        r = rb.send() => match r {
-            Ok(r) => r,
+        r = timed(read_timeout, rb.send()) => match r {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Attempt::Retry { progress: false, why: e.to_string() },
             Err(e) => return Attempt::Retry { progress: false, why: e.to_string() },
         },
     };
@@ -264,17 +266,23 @@ async fn attempt_once(
     loop {
         let item = tokio::select! {
             _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-            i = stream.next() => i,
+            i = timed(read_timeout, stream.next()) => i,
         };
         let chunk = match item {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => {
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => {
                 return Attempt::Retry {
                     progress,
                     why: e.to_string(),
                 };
             }
-            None => {
+            Err(e) => {
+                return Attempt::Retry {
+                    progress,
+                    why: e.to_string(),
+                };
+            }
+            Ok(None) => {
                 let cursor = start + seg.done.load(Ordering::Acquire);
                 if cursor >= seg.end() {
                     return Attempt::Exit(WorkerExit::Done);

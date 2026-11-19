@@ -4,14 +4,14 @@
 //! cannot continue mid-file, so every attempt (retry or resume) restarts at offset 0.
 
 use crate::fsutil::write_at;
-use crate::http::probe::apply_context;
+use crate::http::probe::{apply_context, timed};
 use crate::http::worker::{SegmentShared, WorkerCtx, WorkerExit, backoff};
 use crate::meter::SpeedMeter;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 enum Attempt {
     Exit(WorkerExit),
@@ -66,10 +66,12 @@ fn restart(seg: &SegmentShared) {
 
 async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMeter) -> Attempt {
     let rb = apply_context(ctx.client.get(ctx.url.clone()), &ctx.context);
+    let read_timeout = Duration::from_millis(ctx.cfg.read_timeout_ms);
     let resp = tokio::select! {
         _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-        r = rb.send() => match r {
-            Ok(r) => r,
+        r = timed(read_timeout, rb.send()) => match r {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Attempt::Retry(e.to_string()),
             Err(e) => return Attempt::Retry(e.to_string()),
         },
     };
@@ -93,12 +95,13 @@ async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMet
     loop {
         let item = tokio::select! {
             _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-            i = stream.next() => i,
+            i = timed(read_timeout, stream.next()) => i,
         };
         let chunk = match item {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => return Attempt::Retry(e.to_string()),
-            None => {
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => return Attempt::Retry(e.to_string()),
+            Err(e) => return Attempt::Retry(e.to_string()),
+            Ok(None) => {
                 let done = seg.done.load(Ordering::Acquire);
                 return match ctx.expected_total {
                     Some(exp) if done < exp => Attempt::Retry("connection closed early".into()),

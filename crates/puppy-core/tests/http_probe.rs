@@ -6,6 +6,7 @@ use puppy_core::types::RequestContext;
 use support::{ServerCfg, TestServer};
 
 const MIB4: u64 = 4 * 1024 * 1024;
+const RT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn client() -> reqwest::Client {
     build_client(&HttpConfig::default()).unwrap()
@@ -14,9 +15,14 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn probe_basic() {
     let s = TestServer::start(ServerCfg::default()).await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.total, Some(MIB4));
     assert!(info.accepts_ranges);
     assert_eq!(info.etag.as_deref(), Some("\"v0\""));
@@ -28,9 +34,14 @@ async fn probe_basic() {
 #[tokio::test]
 async fn probe_follows_redirect() {
     let s = TestServer::start(ServerCfg::default()).await;
-    let info = probe(&client(), &s.url("/redirect"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/redirect"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.final_url.path(), "/file.bin");
     assert_eq!(info.filename, "file.bin");
 }
@@ -42,9 +53,14 @@ async fn probe_head_not_allowed_falls_back() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.total, Some(MIB4));
     assert!(info.accepts_ranges);
     assert_eq!(s.range_requests(), 1);
@@ -57,9 +73,14 @@ async fn probe_head_without_length_falls_back() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.total, Some(MIB4));
     assert!(info.accepts_ranges);
 }
@@ -71,9 +92,14 @@ async fn probe_no_ranges() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert!(!info.accepts_ranges);
     assert_eq!(info.total, Some(MIB4));
 }
@@ -92,9 +118,14 @@ async fn probe_disposition_filename() {
             ..Default::default()
         })
         .await;
-        let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-            .await
-            .unwrap();
+        let info = probe(
+            &client(),
+            &s.url("/file.bin"),
+            &RequestContext::default(),
+            RT,
+        )
+        .await
+        .unwrap();
         assert_eq!(info.filename, want);
     }
 }
@@ -108,7 +139,9 @@ async fn probe_sends_context() {
         referer: Some("http://example.com/page".into()),
         ..Default::default()
     };
-    probe(&client(), &s.url("/file.bin"), &ctx).await.unwrap();
+    probe(&client(), &s.url("/file.bin"), &ctx, RT)
+        .await
+        .unwrap();
     let seen = s.requests_seen();
     assert!(!seen.is_empty());
     let h = &seen[0];
@@ -215,9 +248,14 @@ async fn probe_head_zero_length_falls_back() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.total, Some(MIB4));
     assert!(info.accepts_ranges);
     assert_eq!(s.range_requests(), 1);
@@ -230,9 +268,14 @@ async fn probe_empty_file_keeps_head_info() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     // The range fallback gets 416 for an empty file; HEAD's length 0 stands.
     assert_eq!(info.total, Some(0));
     assert_eq!(s.range_requests(), 1);
@@ -247,8 +290,13 @@ async fn probe_head_zero_then_get_fails_is_unknown_length() {
         ..Default::default()
     })
     .await;
-    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
-        .await
-        .unwrap();
+    let info = probe(
+        &client(),
+        &s.url("/file.bin"),
+        &RequestContext::default(),
+        RT,
+    )
+    .await
+    .unwrap();
     assert_eq!(info.total, None);
 }
