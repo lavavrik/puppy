@@ -28,6 +28,9 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
     );
     let mut builder = Client::builder()
         .default_headers(defaults)
+        // HTTP/2 would multiplex every segment request over one TCP connection, defeating
+        // multi-connection downloads (per-connection throttling is what they work around).
+        .http1_only()
         .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(Duration::from_millis(cfg.connect_timeout_ms))
         .read_timeout(Duration::from_millis(cfg.read_timeout_ms))
