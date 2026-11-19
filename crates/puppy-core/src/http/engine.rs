@@ -47,6 +47,23 @@ impl HttpEngine {
     }
 }
 
+type Downloads = Mutex<HashMap<DownloadId, Option<Arc<HttpDownload>>>>;
+
+/// Releases a reserved id if `add` fails or its future is dropped mid-await.
+struct Reservation<'a> {
+    map: &'a Downloads,
+    id: DownloadId,
+    armed: bool,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.map.lock().unwrap().remove(&self.id);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Engine for HttpEngine {
     fn kind(&self) -> EngineKind {
@@ -79,6 +96,11 @@ impl Engine for HttpEngine {
             self.global.clone(),
             self.events.clone(),
         );
+        let mut guard = Reservation {
+            map: &self.downloads,
+            id,
+            armed: true,
+        };
         let result = match mode {
             StartMode::Fresh => {
                 HttpDownload::start_fresh(id, req, client, cfg, global, events).await
@@ -87,17 +109,13 @@ impl Engine for HttpEngine {
                 HttpDownload::restore(id, &path, client, cfg, global, events).await
             }
         };
-        let mut map = self.downloads.lock().unwrap();
-        match result {
-            Ok((dl, added)) => {
-                map.insert(id, Some(Arc::new(dl)));
-                Ok(added)
-            }
-            Err(e) => {
-                map.remove(&id);
-                Err(e)
-            }
-        }
+        let (dl, added) = result?; // the guard releases the id on error
+        self.downloads
+            .lock()
+            .unwrap()
+            .insert(id, Some(Arc::new(dl)));
+        guard.armed = false;
+        Ok(added)
     }
 
     async fn pause(&self, id: DownloadId) -> Result<(), EngineError> {

@@ -209,3 +209,66 @@ async fn engine_restore_mode() {
         2 * 1024 * KIB
     );
 }
+
+#[tokio::test]
+async fn engine_failed_add_releases_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 16 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let mut bad = request(&s, dir.path());
+    bad.source = Source::Http {
+        url: s.url("/missing"),
+    };
+    assert!(e.add(1, bad, StartMode::Fresh).await.is_err());
+    e.add(1, request(&s, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn engine_dropped_add_releases_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let stall = TestServer::start(ServerCfg {
+        stall_headers: true,
+        ..ServerCfg::default()
+    })
+    .await;
+    let good = TestServer::start(ServerCfg {
+        len: 16 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_millis(100),
+        e.add(1, request(&stall, dir.path()), StartMode::Fresh),
+    )
+    .await;
+    assert!(r.is_err(), "add should have timed out");
+    e.add(1, request(&good, dir.path()), StartMode::Fresh)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn engine_concurrent_same_id_one_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = TestServer::start(ServerCfg {
+        len: 16 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let (a, b) = tokio::join!(
+        e.add(1, request(&s, dir.path()), StartMode::Fresh),
+        e.add(1, request(&s, dir.path()), StartMode::Fresh)
+    );
+    let oks = [a.is_ok(), b.is_ok()].iter().filter(|x| **x).count();
+    assert_eq!(oks, 1);
+    let err = if a.is_err() { a } else { b }.unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+}
