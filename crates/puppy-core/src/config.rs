@@ -11,6 +11,12 @@ pub struct HttpConfig {
     pub backoff_max_ms: u64,
     pub flush_interval_ms: u64,
     pub spot_check_bytes: u64,
+    /// TCP/TLS connect timeout.
+    pub connect_timeout_ms: u64,
+    /// Idle timeout per read (headers or body); a stalled connection errors out.
+    pub read_timeout_ms: u64,
+    /// Upper bound for validating a remote file before resuming it.
+    pub validate_timeout_ms: u64,
     pub proxy: Option<url::Url>,
     pub default_dir: PathBuf,
 }
@@ -25,6 +31,9 @@ impl Default for HttpConfig {
             backoff_max_ms: 30_000,
             flush_interval_ms: 1000,
             spot_check_bytes: 64 * 1024,
+            connect_timeout_ms: 15_000,
+            read_timeout_ms: 30_000,
+            validate_timeout_ms: 60_000,
             proxy: None,
             default_dir: dirs::download_dir()
                 .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))

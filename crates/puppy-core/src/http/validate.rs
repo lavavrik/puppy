@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Validation {
@@ -26,8 +27,20 @@ pub enum Validation {
 /// A strong ETag is sent as `If-Range` and alone suffices. Without any ETag, Last-Modified
 /// is sent as `If-Range` but (1 s granularity) the spot check runs as well; a weak ETag
 /// counts as no validator. Network and unexpected HTTP errors are `Err` (transient), never
-/// `Changed`.
+/// `Changed`; so is exceeding `cfg.validate_timeout_ms`.
 pub async fn validate_remote(
+    client: &reqwest::Client,
+    state: &HttpResumeState,
+    part: &Path,
+    cfg: &HttpConfig,
+) -> Result<Validation, EngineError> {
+    let limit = Duration::from_millis(cfg.validate_timeout_ms);
+    tokio::time::timeout(limit, validate(client, state, part, cfg))
+        .await
+        .unwrap_or_else(|_| Err(EngineError::Network("validation timed out".into())))
+}
+
+async fn validate(
     client: &reqwest::Client,
     state: &HttpResumeState,
     part: &Path,

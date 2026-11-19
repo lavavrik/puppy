@@ -69,7 +69,14 @@ async fn restore_with_events(
     dir: &Path,
     tx: broadcast::Sender<EngineEvent>,
 ) -> (HttpDownload, Added) {
-    let c = cfg(dir);
+    restore_with(final_path, cfg(dir), tx).await
+}
+
+async fn restore_with(
+    final_path: &Path,
+    c: HttpConfig,
+    tx: broadcast::Sender<EngineEvent>,
+) -> (HttpDownload, Added) {
     let client = build_client(&c).unwrap();
     HttpDownload::restore(2, final_path, client, c, TokenBucket::new(None), tx)
         .await
@@ -492,4 +499,125 @@ async fn resume_after_pause_no_validator_spot_check() {
     dl.resume().await.unwrap();
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
     assert!(part_path(&added.path).exists());
+}
+
+#[tokio::test]
+async fn restore_final_length_mismatch_keeps_sidecar() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let final_path = paused_download(&s, dir.path()).await;
+    let sidecar = std::fs::read(sidecar_path(&final_path)).unwrap();
+    let (dl, _) = restore(&final_path, dir.path()).await;
+    wait_completed(&dl).await;
+    drop(dl);
+    std::fs::write(sidecar_path(&final_path), sidecar).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&final_path)
+        .unwrap();
+    f.set_len(LEN - 1).unwrap();
+    drop(f);
+    let (dl, _) = restore(&final_path, dir.path()).await;
+    assert_validation_failed(&dl);
+    assert!(sidecar_path(&final_path).exists(), "sidecar must be kept");
+}
+
+#[tokio::test]
+async fn restore_stalled_server_times_out_failed() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let final_path = paused_download(&s, dir.path()).await;
+    s.set_cfg(|c| c.stall_headers = true);
+    let mut c = cfg(dir.path());
+    c.validate_timeout_ms = 300;
+    let (tx, _) = broadcast::channel(256);
+    let t = Instant::now();
+    let (dl, _) = restore_with(&final_path, c, tx).await;
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    let st = dl.status();
+    match &st.state {
+        DownloadState::Failed { reason } => assert!(reason.contains("timed out"), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(part_path(&final_path).exists());
+    assert!(sidecar_path(&final_path).exists());
+}
+
+#[tokio::test]
+async fn pause_during_validation_is_prompt() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(request(&s, dir.path()), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    s.set_cfg(|c| c.stall_headers = true);
+    let before = s.requests_seen().len();
+    let dl = std::sync::Arc::new(dl);
+    let resuming = tokio::spawn({
+        let dl = dl.clone();
+        async move { dl.resume().await }
+    });
+    // Validation has sent its request and is waiting for the stalled server.
+    let deadline = Instant::now() + TIMEOUT;
+    while s.requests_seen().len() == before {
+        assert!(Instant::now() < deadline, "validation never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let t = Instant::now();
+    dl.pause().await;
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "pause took {:?}",
+        t.elapsed()
+    );
+    let st = dl.status();
+    assert!(matches!(st.state, DownloadState::Paused), "{st:?}");
+    tokio::time::timeout(Duration::from_secs(1), resuming)
+        .await
+        .expect("resume did not return")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(dl.status().state, DownloadState::Paused));
+    assert!(part_path(&added.path).exists());
+
+    // Once the server answers again, resuming validates and completes.
+    s.set_cfg(|c| c.stall_headers = false);
+    dl.resume().await.unwrap();
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+}
+
+#[tokio::test]
+async fn cancel_during_validation_is_prompt() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(request(&s, dir.path()), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    s.set_cfg(|c| c.stall_headers = true);
+    let before = s.requests_seen().len();
+    let dl = std::sync::Arc::new(dl);
+    let resuming = tokio::spawn({
+        let dl = dl.clone();
+        async move { dl.resume().await }
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    while s.requests_seen().len() == before {
+        assert!(Instant::now() < deadline, "validation never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let t = Instant::now();
+    dl.cancel(true).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "cancel took {:?}",
+        t.elapsed()
+    );
+    tokio::time::timeout(Duration::from_secs(1), resuming)
+        .await
+        .expect("resume did not return")
+        .unwrap()
+        .unwrap();
+    assert_no_leftovers(&added.path);
+    assert!(dl.resume().await.is_err(), "cancelled download resumed");
 }

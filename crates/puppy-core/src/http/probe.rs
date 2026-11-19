@@ -7,6 +7,7 @@ use crate::types::RequestContext;
 use percent_encoding::percent_decode_str;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct RemoteInfo {
@@ -28,6 +29,8 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
     let mut builder = Client::builder()
         .default_headers(defaults)
         .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_millis(cfg.connect_timeout_ms))
+        .read_timeout(Duration::from_millis(cfg.read_timeout_ms))
         .user_agent(concat!("puppy/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = &cfg.proxy {
         let proxy = reqwest::Proxy::all(proxy.as_str())

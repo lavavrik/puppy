@@ -32,6 +32,8 @@ pub struct ServerCfg {
     pub bytes_per_sec: Option<u64>,
     /// Drop the connection once, after this many body bytes of a response.
     pub fail_after_bytes_once: Option<u64>,
+    /// Accept requests but never answer them (checked when a request arrives).
+    pub stall_headers: bool,
 }
 
 impl Default for ServerCfg {
@@ -49,6 +51,7 @@ impl Default for ServerCfg {
             disposition: None,
             bytes_per_sec: None,
             fail_after_bytes_once: None,
+            stall_headers: false,
         }
     }
 }
@@ -181,6 +184,9 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
         return plain(StatusCode::NOT_FOUND);
     }
     let cfg = sh.cfg.lock().unwrap().clone();
+    if cfg.stall_headers {
+        std::future::pending::<()>().await;
+    }
     let version = sh.version.load(Ordering::SeqCst);
     let is_head = match *req.method() {
         Method::GET => false,

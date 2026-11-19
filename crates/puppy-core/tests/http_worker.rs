@@ -245,3 +245,29 @@ async fn worker_200_with_changed_validator_is_remote_changed() {
     let exit = run_segment(&ctx, 1000, seg(1000, 5000)).await;
     assert_eq!(exit, WorkerExit::RemoteChanged);
 }
+
+#[tokio::test]
+async fn worker_retries_after_read_timeout() {
+    // The first request stalls before sending headers; the read timeout turns it into a
+    // retryable error and the next attempt (server no longer stalling) succeeds.
+    let s = server(|c| c.stall_headers = true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = make_ctx(&s, rw_file(&dir), Some("\"v0\""));
+    ctx.cfg.read_timeout_ms = 200;
+    ctx.client = build_client(&ctx.cfg).unwrap();
+    let sh = seg(0, LEN);
+    let t = Instant::now();
+    let (exit, ()) = tokio::join!(run_segment(&ctx, 0, sh.clone()), async {
+        while s.requests_seen().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        s.set_cfg(|c| c.stall_headers = false);
+    });
+    assert_eq!(exit, WorkerExit::Done);
+    assert!(s.requests_seen().len() >= 2, "no retry");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    let data = read_all(&dir);
+    for (i, b) in data.iter().enumerate() {
+        assert_eq!(*b, body_byte(i as u64, 0), "byte {i}");
+    }
+}
