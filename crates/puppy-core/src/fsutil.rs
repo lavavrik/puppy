@@ -7,15 +7,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_NAME_BYTES: usize = 200;
 
-/// Reduces untrusted input to a safe single path component.
+/// Reduces untrusted input to a single path component that is safe on every OS.
 pub fn sanitize_filename(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
         return "download".to_string();
     }
-    truncate_name(cleaned, MAX_NAME_BYTES)
+    let name = if is_reserved_windows_name(cleaned) {
+        format!("_{cleaned}")
+    } else {
+        cleaned.to_string()
+    };
+    truncate_name(&name, MAX_NAME_BYTES)
+}
+
+/// Windows device names (CON, NUL, COM1..9, ...) are reserved with or without an extension.
+fn is_reserved_windows_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end();
+    let up = stem.to_ascii_uppercase();
+    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((up.starts_with("COM") || up.starts_with("LPT"))
+            && up.len() == 4
+            && matches!(up.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// Truncates to `max` bytes on a char boundary, preserving a short extension.
@@ -157,6 +176,29 @@ mod tests {
         assert_eq!(sanitize_filename("../../.bashrc"), ".bashrc");
         assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
         assert_eq!(sanitize_filename("a/b"), "b");
+    }
+
+    #[test]
+    fn sanitize_filename_windows_invalid_chars() {
+        assert_eq!(
+            sanitize_filename("a<b>c:d\"e|f?g*h.txt"),
+            "a_b_c_d_e_f_g_h.txt"
+        );
+        assert_eq!(sanitize_filename("name. . "), "name");
+        assert_eq!(sanitize_filename("report.pdf  "), "report.pdf");
+        assert_eq!(sanitize_filename("???"), "___");
+        assert_eq!(sanitize_filename(" . "), "download");
+    }
+
+    #[test]
+    fn sanitize_filename_reserved_names() {
+        assert_eq!(sanitize_filename("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("com1"), "_com1");
+        assert_eq!(sanitize_filename("Lpt9.tar.gz"), "_Lpt9.tar.gz");
+        assert_eq!(sanitize_filename("aux."), "_aux");
+        assert_eq!(sanitize_filename("console.txt"), "console.txt");
+        assert_eq!(sanitize_filename("com10"), "com10");
     }
 
     #[test]
