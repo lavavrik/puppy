@@ -128,8 +128,9 @@ fn create_tmp(path: &Path, _private: bool) -> io::Result<File> {
         .open(path)
 }
 
+/// fsyncs the directory containing `path` so a rename/create in it is durable (Unix only).
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -138,7 +139,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+pub fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

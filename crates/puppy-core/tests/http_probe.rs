@@ -207,3 +207,33 @@ async fn server_fails_once_mid_body() {
         .await;
     assert_eq!(second.unwrap().len(), 100_000);
 }
+
+#[tokio::test]
+async fn probe_head_zero_length_falls_back() {
+    let s = TestServer::start(ServerCfg {
+        head_zero_length: true,
+        ..Default::default()
+    })
+    .await;
+    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
+        .await
+        .unwrap();
+    assert_eq!(info.total, Some(MIB4));
+    assert!(info.accepts_ranges);
+    assert_eq!(s.range_requests(), 1);
+}
+
+#[tokio::test]
+async fn probe_empty_file_keeps_head_info() {
+    let s = TestServer::start(ServerCfg {
+        len: 0,
+        ..Default::default()
+    })
+    .await;
+    let info = probe(&client(), &s.url("/file.bin"), &RequestContext::default())
+        .await
+        .unwrap();
+    // The range fallback gets 416 for an empty file; HEAD's length 0 stands.
+    assert_eq!(info.total, Some(0));
+    assert_eq!(s.range_requests(), 1);
+}

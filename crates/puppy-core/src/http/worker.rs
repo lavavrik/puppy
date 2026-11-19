@@ -151,7 +151,7 @@ pub async fn run_segment(ctx: &WorkerCtx, start: u64, seg: Arc<SegmentShared>) -
     }
 }
 
-fn backoff(cfg: &HttpConfig, attempt: u32) -> Duration {
+pub(crate) fn backoff(cfg: &HttpConfig, attempt: u32) -> Duration {
     let exp = cfg
         .backoff_base_ms
         .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX))
@@ -162,6 +162,17 @@ fn backoff(cfg: &HttpConfig, attempt: u32) -> Duration {
         .unwrap_or(0);
     let jitter = if exp >= 4 { nanos % (exp / 4) } else { 0 };
     Duration::from_millis(exp + jitter)
+}
+
+/// True if the response's ETag or Last-Modified equals the `If-Range` validator.
+fn carries_validator(h: &header::HeaderMap, validator: &str) -> bool {
+    [header::ETAG, header::LAST_MODIFIED]
+        .into_iter()
+        .any(|name| {
+            h.get(name)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim() == validator)
+        })
 }
 
 /// Parses `bytes <start>-<end>/<total>`; total is `None` for `*`.
@@ -224,7 +235,13 @@ async fn attempt_once(
             }
         }
         StatusCode::OK => {
-            return Attempt::Exit(if ctx.if_range.is_some() {
+            // Under If-Range a 200 means "changed" — unless the response still carries our
+            // validator, in which case the server simply ignores ranges.
+            let changed = ctx
+                .if_range
+                .as_deref()
+                .is_some_and(|v| !carries_validator(resp.headers(), v));
+            return Attempt::Exit(if changed {
                 WorkerExit::RemoteChanged
             } else {
                 WorkerExit::RangeUnsupported

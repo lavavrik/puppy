@@ -22,6 +22,8 @@ pub struct ServerCfg {
     pub last_modified: bool,
     pub content_length: bool,
     pub head_allowed: bool,
+    /// Answer HEAD with `Content-Length: 0` regardless of the real length.
+    pub head_zero_length: bool,
     /// Advertise range support but answer every request with 200 and the full body.
     pub ranges_lie: bool,
     pub disposition: Option<String>,
@@ -39,6 +41,7 @@ impl Default for ServerCfg {
             last_modified: true,
             content_length: true,
             head_allowed: true,
+            head_zero_length: false,
             ranges_lie: false,
             disposition: None,
             bytes_per_sec: None,
@@ -239,13 +242,15 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
         }
     }
     let body_len = if cfg.len == 0 { 0 } else { end - start + 1 };
-    if cfg.content_length {
+    if is_head && cfg.head_zero_length {
+        builder = builder.header(header::CONTENT_LENGTH, 0);
+    } else if cfg.content_length {
         builder = builder.header(header::CONTENT_LENGTH, body_len);
     }
     builder = builder.status(status);
     if is_head {
         // An unsized empty stream keeps hyper from inventing `Content-Length: 0`.
-        let body = if cfg.content_length {
+        let body = if cfg.content_length || cfg.head_zero_length {
             Body::empty()
         } else {
             Body::from_stream(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())

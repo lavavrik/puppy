@@ -224,3 +224,24 @@ async fn worker_cancel() {
     assert_eq!(exit.0, WorkerExit::Cancelled);
     assert!(exit.1.saturating_duration_since(cancelled_at) < Duration::from_millis(200));
 }
+
+#[tokio::test]
+async fn worker_200_with_matching_validator_is_range_unsupported() {
+    // The server ignores ranges but the file is unchanged (same ETag): not a remote change.
+    let s = server(|c| c.ranges_lie = true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(&s, rw_file(&dir), Some("\"v0\""));
+    let exit = run_segment(&ctx, 1000, seg(1000, 5000)).await;
+    assert_eq!(exit, WorkerExit::RangeUnsupported);
+    assert!(read_all(&dir).iter().all(|b| *b == 0));
+}
+
+#[tokio::test]
+async fn worker_200_with_changed_validator_is_remote_changed() {
+    let s = server(|c| c.ranges_lie = true).await;
+    s.set_version(1);
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(&s, rw_file(&dir), Some("\"v0\""));
+    let exit = run_segment(&ctx, 1000, seg(1000, 5000)).await;
+    assert_eq!(exit, WorkerExit::RemoteChanged);
+}

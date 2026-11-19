@@ -10,7 +10,8 @@ use crate::fsutil::atomic_write;
 use crate::http::segments::Segment;
 use crate::types::AddRequest;
 
-const VERSION: u32 = 1;
+/// Current sidecar format version.
+pub const VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpResumeState {

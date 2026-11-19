@@ -123,11 +123,19 @@ pub async fn probe(
         head_ok = true;
     }
 
-    if !head_ok || info.total.is_none() {
+    // Some servers/CDNs answer HEAD with `Content-Length: 0` for real files, so a zero
+    // length is confirmed with a ranged GET as well.
+    let head_zero = head_ok && info.total == Some(0);
+    if !head_ok || info.total.is_none() || head_zero {
         match range_probe(client, url, ctx).await {
             Ok((url2, p)) => {
                 final_url = url2;
-                info.total = p.total.or(info.total);
+                // After a HEAD claiming 0, the GET is authoritative (even if it is unsized).
+                info.total = if head_zero {
+                    p.total
+                } else {
+                    p.total.or(info.total)
+                };
                 info.accepts_ranges = p.accepts_ranges || (head_ok && info.accepts_ranges);
                 info.etag = p.etag.or(info.etag);
                 info.last_modified = p.last_modified.or(info.last_modified);
