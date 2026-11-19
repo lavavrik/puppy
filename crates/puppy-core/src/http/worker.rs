@@ -9,19 +9,72 @@ use crate::types::RequestContext;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Range limits of a segment, guarded by a lock so that shrinking `end` (stealing) and
+/// claiming bytes to write can never interleave.
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds {
+    /// Exclusive end offset; shrinks only via [`SegmentShared::try_steal`].
+    pub end: u64,
+    /// Absolute offset up to which the worker has committed to write.
+    pub claimed: u64,
+}
 
 /// Live state shared between a worker and the orchestrator.
 pub struct SegmentShared {
     /// Bytes written from the segment start.
     pub done: AtomicU64,
-    /// Exclusive end offset; may shrink while the worker runs (work stealing).
-    pub end: AtomicU64,
+    pub bounds: Mutex<Bounds>,
     pub bps: AtomicU64,
     pub active: AtomicBool,
+}
+
+impl SegmentShared {
+    pub fn new(start: u64, end: u64, done: u64) -> Self {
+        debug_assert!(start + done <= end);
+        SegmentShared {
+            done: AtomicU64::new(done),
+            bounds: Mutex::new(Bounds {
+                end,
+                claimed: start + done,
+            }),
+            bps: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Bounds> {
+        self.bounds.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn end(&self) -> u64 {
+        self.lock().end
+    }
+
+    /// Bytes not yet claimed by the worker.
+    pub fn remaining(&self) -> u64 {
+        let b = self.lock();
+        b.end.saturating_sub(b.claimed)
+    }
+
+    /// Splits off the back half of the unclaimed range. Returns the thief's
+    /// `(start, end)`, or `None` if less than `2 * min_segment` remains.
+    pub fn try_steal(&self, start: u64, min_segment: u64) -> Option<(u64, u64)> {
+        let mut b = self.lock();
+        let from = b.claimed.max(start + self.done.load(Ordering::Acquire));
+        let remaining = b.end.saturating_sub(from);
+        if remaining < min_segment.saturating_mul(2) {
+            return None;
+        }
+        let mid = from + remaining / 2;
+        let old_end = b.end;
+        b.end = mid;
+        Some((mid, old_end))
+    }
 }
 
 pub struct WorkerCtx {
@@ -72,7 +125,7 @@ pub async fn run_segment(ctx: &WorkerCtx, start: u64, seg: Arc<SegmentShared>) -
         if ctx.cancel.is_cancelled() {
             return WorkerExit::Cancelled;
         }
-        if start + seg.done.load(Ordering::Relaxed) >= seg.end.load(Ordering::Relaxed) {
+        if start + seg.done.load(Ordering::Acquire) >= seg.end() {
             return WorkerExit::Done;
         }
         seg.active.store(true, Ordering::Relaxed);
@@ -129,8 +182,8 @@ async fn attempt_once(
     seg: &SegmentShared,
     meter: &mut SpeedMeter,
 ) -> Attempt {
-    let cursor = start + seg.done.load(Ordering::Relaxed);
-    let end = seg.end.load(Ordering::Relaxed);
+    let cursor = start + seg.done.load(Ordering::Acquire);
+    let end = seg.end();
     if cursor >= end {
         return Attempt::Exit(WorkerExit::Done);
     }
@@ -205,8 +258,8 @@ async fn attempt_once(
                 };
             }
             None => {
-                let cursor = start + seg.done.load(Ordering::Relaxed);
-                if cursor >= seg.end.load(Ordering::Relaxed) {
+                let cursor = start + seg.done.load(Ordering::Acquire);
+                if cursor >= seg.end() {
                     return Attempt::Exit(WorkerExit::Done);
                 }
                 return Attempt::Retry {
@@ -215,29 +268,31 @@ async fn attempt_once(
                 };
             }
         };
-        let cursor = start + seg.done.load(Ordering::Relaxed);
-        let end = seg.end.load(Ordering::Relaxed);
-        if cursor >= end {
+        let cursor = start + seg.done.load(Ordering::Acquire);
+        let want = (chunk.len() as u64).min(seg.end().saturating_sub(cursor));
+        if want == 0 {
             return Attempt::Exit(WorkerExit::Done);
-        }
-        let n = (chunk.len() as u64).min(end - cursor);
-        if n == 0 {
-            continue;
         }
         tokio::select! {
             _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
             _ = async {
-                ctx.limiters[0].acquire(n).await;
-                ctx.limiters[1].acquire(n).await;
+                ctx.limiters[0].acquire(want).await;
+                ctx.limiters[1].acquire(want).await;
             } => {}
         }
-        // `end` may have shrunk while waiting for the limiters.
-        let end = seg.end.load(Ordering::Relaxed);
-        if cursor >= end {
+        // Claim under the lock: `end` may have shrunk while waiting for the limiters.
+        let n = {
+            let mut b = seg.lock();
+            let n = (chunk.len() as u64).min(b.end.saturating_sub(cursor));
+            if n > 0 {
+                b.claimed = cursor + n;
+            }
+            n
+        };
+        if n == 0 {
             return Attempt::Exit(WorkerExit::Done);
         }
-        let n = n.min(end - cursor) as usize;
-        let buf = chunk.slice(..n);
+        let buf = chunk.slice(..n as usize);
         let file = ctx.file.clone();
         let written = tokio::task::spawn_blocking(move || write_at(&file, &buf, cursor)).await;
         match written {
@@ -246,12 +301,29 @@ async fn attempt_once(
             Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
         }
         progress = true;
-        seg.done.fetch_add(n as u64, Ordering::Relaxed);
+        seg.done.fetch_add(n, Ordering::Release);
+        debug_assert!(start + seg.done.load(Ordering::Acquire) <= seg.lock().end);
         let now = Instant::now();
-        meter.record(n as u64, now);
+        meter.record(n, now);
         seg.bps.store(meter.bps(now), Ordering::Relaxed);
-        if cursor + n as u64 >= end {
+        if cursor + n >= seg.end() {
             return Attempt::Exit(WorkerExit::Done);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_steal_respects_claimed() {
+        let s = SegmentShared::new(1000, 11_000, 0);
+        s.lock().claimed = 5000; // committed ahead of `done`
+        let (mid, end) = s.try_steal(1000, 1000).unwrap();
+        assert_eq!((mid, end), (8000, 11_000));
+        assert_eq!(s.end(), 8000);
+        assert_eq!(s.remaining(), 3000);
+        assert!(s.try_steal(1000, 2000).is_none());
     }
 }

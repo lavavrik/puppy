@@ -165,6 +165,9 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
             .body(Body::empty())
             .unwrap();
     }
+    if path == "/status/503" {
+        return plain(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if path != "/file.bin" {
         return plain(StatusCode::NOT_FOUND);
     }
