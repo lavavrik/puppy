@@ -51,16 +51,23 @@ impl Inner {
 
     /// One download's snapshot: live numbers from the engine if it holds the download,
     /// otherwise the stored record. The state is always the manager's.
+    ///
+    /// The engine detail is fetched only if `with_detail` or for HTTP downloads (their
+    /// connection count comes from it); a torrent's peer count comes from its status, so
+    /// listing torrents never builds their piece bitfields.
     fn snap(
         &self,
         id: DownloadId,
         e: &Entry,
         queue_position: Option<usize>,
+        with_detail: bool,
     ) -> (DownloadSnapshot, Option<EngineDetail>) {
         let engine = e.engine.filter(|_| e.held).map(|i| &self.engines[i]);
         let status = engine.and_then(|en| en.status(id));
-        let detail = engine.and_then(|en| en.detail(id));
-        let (connections, peers) = match &detail {
+        let detail = engine
+            .filter(|en| with_detail || en.kind() == EngineKind::Http)
+            .and_then(|en| en.detail(id));
+        let (connections, detail_peers) = match &detail {
             Some(EngineDetail::Http { segments, .. }) => {
                 let active = segments.iter().filter(|s| s.active).count();
                 (Some(u16::try_from(active).unwrap_or(u16::MAX)), None)
@@ -68,6 +75,7 @@ impl Inner {
             Some(EngineDetail::Torrent { peers, .. }) => (None, Some(*peers)),
             Some(EngineDetail::Unknown) | None => (None, None),
         };
+        let peers = status.as_ref().and_then(|s| s.peers).or(detail_peers);
         let total_bytes = status
             .as_ref()
             .and_then(|s| s.total_bytes)
@@ -124,7 +132,7 @@ impl Manager {
                 queued += 1;
                 queued - 1
             });
-            let (snap, _) = inner.snap(*id, e, pos);
+            let (snap, _) = inner.snap(*id, e, pos, false);
             totals.down_bps += snap.down_bps;
             totals.up_bps += snap.up_bps;
             match &e.state {
@@ -164,7 +172,7 @@ impl Manager {
                 })
                 .count()
         });
-        Ok(inner.snap(id, e, pos))
+        Ok(inner.snap(id, e, pos, true))
     }
 }
 

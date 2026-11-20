@@ -1444,3 +1444,115 @@ async fn global_up_limit_reaches_engines() {
     }
     m.shutdown().await;
 }
+
+/// Wraps the HTTP engine but reports itself as a torrent engine with a peer count in its
+/// status, counting `detail` calls.
+struct PeerReporter {
+    inner: HttpEngine,
+    detail_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Engine for PeerReporter {
+    fn kind(&self) -> puppy_core::engine::EngineKind {
+        puppy_core::engine::EngineKind::Torrent
+    }
+    fn accepts(&self, source: &Source) -> bool {
+        self.inner.accepts(source)
+    }
+    async fn add(
+        &self,
+        id: DownloadId,
+        req: AddRequest,
+        mode: puppy_core::engine::StartMode,
+        opts: puppy_core::engine::AddOptions,
+    ) -> Result<puppy_core::engine::Added, puppy_core::engine::EngineError> {
+        self.inner.add(id, req, mode, opts).await
+    }
+    async fn pause(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.pause(id).await
+    }
+    async fn resume(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.resume(id).await
+    }
+    async fn remove(
+        &self,
+        id: DownloadId,
+        delete_files: bool,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.remove(id, delete_files).await
+    }
+    fn status(&self, id: DownloadId) -> Option<puppy_core::types::DownloadStatus> {
+        self.inner
+            .status(id)
+            .map(|s| puppy_core::types::DownloadStatus {
+                peers: Some(7),
+                ..s
+            })
+    }
+    fn detail(&self, _id: DownloadId) -> Option<puppy_core::types::EngineDetail> {
+        self.detail_calls.fetch_add(1, Ordering::SeqCst);
+        Some(puppy_core::types::EngineDetail::Torrent {
+            piece_count: 1,
+            have: vec![0],
+            peers: 99,
+            seeds: 0,
+            leechers: 0,
+            ratio: 0.0,
+        })
+    }
+    fn set_download_limit(
+        &self,
+        id: DownloadId,
+        bps: Option<u64>,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.set_download_limit(id, bps)
+    }
+    fn set_global_download_budget(&self, bps: Option<u64>) {
+        self.inner.set_global_download_budget(bps)
+    }
+    fn subscribe(&self) -> broadcast::Receiver<puppy_core::engine::EngineEvent> {
+        self.inner.subscribe()
+    }
+}
+
+/// The list snapshot takes a torrent's peer count from its status and never asks for
+/// its detail (which builds a piece bitfield); `get` still returns the detail.
+#[tokio::test]
+async fn snapshot_reads_torrent_peers_from_status() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 256 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let engine = Arc::new(PeerReporter {
+        inner: HttpEngine::new(http_cfg(&env.dl_dir())).unwrap(),
+        detail_calls: AtomicUsize::new(0),
+    });
+    let cfg = Config {
+        download_dir: env.dl_dir(),
+        ..Config::default()
+    };
+    let m = Manager::start(vec![engine.clone()], Store::new(env.state_path()), cfg)
+        .await
+        .unwrap();
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_active_with_bytes(&m, id).await;
+    let calls_before = engine.detail_calls.load(Ordering::SeqCst);
+    let (list, _) = m.snapshot();
+    let d = list.iter().find(|d| d.id == id).unwrap();
+    assert_eq!(d.peers, Some(7), "peers from the status");
+    assert_eq!(
+        engine.detail_calls.load(Ordering::SeqCst),
+        calls_before,
+        "the list snapshot asked for the detail"
+    );
+    let (one, detail) = m.get(id).unwrap();
+    assert_eq!(one.peers, Some(7));
+    assert!(matches!(
+        detail,
+        Some(puppy_core::types::EngineDetail::Torrent { peers: 99, .. })
+    ));
+    m.shutdown().await;
+}

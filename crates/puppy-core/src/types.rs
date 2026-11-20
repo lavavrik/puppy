@@ -70,6 +70,9 @@ pub struct DownloadStatus {
     pub down_bps: u64,
     pub up_bps: u64,
     pub eta_secs: Option<u64>,
+    /// Connected peers (torrents); `None` for engines without peers.
+    #[serde(default)]
+    pub peers: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

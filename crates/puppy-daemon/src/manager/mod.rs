@@ -783,6 +783,7 @@ mod tests {
             down_bps: 0,
             up_bps: 0,
             eta_secs: None,
+            peers: None,
         }
     }
 

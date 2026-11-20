@@ -2,5 +2,8 @@
 //! librqbit type appears in this crate's public API.
 
 mod engine;
+mod map;
+mod poll;
+mod source;
 
 pub use engine::{TorrentEngine, TorrentEngineOptions};
