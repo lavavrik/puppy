@@ -1,8 +1,14 @@
 //! Versioned newline-delimited-JSON protocol spoken by the daemon and its clients.
+//!
+//! Evolution rules: new `Request` methods are additive. Servers must parse the
+//! envelope leniently (as `serde_json::Value` first, then [`parse_request`]) so an
+//! unknown method yields a `bad_request` reply carrying the right `req_id`.
+//! `Event` and `ReplyData` have an `Unknown` catch-all so older clients survive
+//! kinds added by a newer daemon.
 
 pub mod codec;
 
-pub use codec::{CodecError, read_msg, write_msg};
+pub use codec::{CodecError, MsgReader, read_msg, write_msg};
 use puppy_core::types::{AddRequest, AttentionReason, DownloadId, DownloadState, EngineDetail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -75,6 +81,16 @@ pub struct Envelope<T> {
     pub body: T,
 }
 
+/// Leniently parses a client line already decoded to a `Value`. On failure
+/// returns the `req_id` (if one could be extracted) and a message, so the
+/// server can send a `bad_request` reply.
+pub fn parse_request(
+    line_value: serde_json::Value,
+) -> Result<Envelope<Request>, (Option<u64>, String)> {
+    let req_id = line_value.get("req_id").and_then(serde_json::Value::as_u64);
+    serde_json::from_value(line_value).map_err(|e| (req_id, e.to_string()))
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
@@ -117,6 +133,9 @@ pub enum ReplyData {
         settings: Settings,
     },
     Done,
+    /// A kind this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +174,9 @@ pub enum Event {
         id: DownloadId,
         reason: AttentionReason,
     },
+    /// A kind this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -423,6 +445,112 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn unknown_kinds_deserialize_to_unknown() {
+        let m: ServerMsg =
+            serde_json::from_str(r#"{"type":"event","event":{"kind":"brand_new","x":1}}"#).unwrap();
+        assert_eq!(
+            m,
+            ServerMsg::Event {
+                event: Event::Unknown
+            }
+        );
+        let m: ServerMsg = serde_json::from_str(
+            r#"{"type":"response","req_id":1,"status":"ok","data":{"kind":"brand_new"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m,
+            ServerMsg::Response {
+                req_id: 1,
+                result: Reply::Ok {
+                    data: ReplyData::Unknown
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_request_lenient() {
+        let v = serde_json::json!({"req_id": 5, "method": "teleport"});
+        let (id, msg) = parse_request(v).unwrap_err();
+        assert_eq!(id, Some(5));
+        assert!(!msg.is_empty());
+        let (id, _) = parse_request(serde_json::json!({"method": "list"})).unwrap_err();
+        assert_eq!(id, None);
+        let ok = parse_request(serde_json::json!({"req_id": 1, "method": "list"})).unwrap();
+        assert_eq!(ok.body, Request::List);
+    }
+
+    fn line_of(n: usize) -> Vec<u8> {
+        // A JSON string of exactly n bytes total.
+        let mut v = vec![b'"'];
+        v.extend(std::iter::repeat_n(b'a', n - 2));
+        v.push(b'"');
+        v
+    }
+
+    #[tokio::test]
+    async fn codec_max_line_boundary() {
+        let mut ok = line_of(MAX_LINE);
+        ok.push(b'\n');
+        let mut r = BufReader::new(&ok[..]);
+        assert!(read_msg::<_, String>(&mut r).await.unwrap().is_some());
+        let mut bad = line_of(MAX_LINE + 1);
+        bad.push(b'\n');
+        let mut r = BufReader::new(&bad[..]);
+        assert!(matches!(
+            read_msg::<_, String>(&mut r).await,
+            Err(CodecError::TooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_msg_refuses_oversize() {
+        let mut out = Vec::new();
+        let big = "a".repeat(MAX_LINE);
+        assert!(matches!(
+            write_msg(&mut out, &big).await,
+            Err(CodecError::TooLong)
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codec_crlf_blank_lines_and_mid_line_eof() {
+        let mut r = BufReader::new(&b"\r\n\n{\"req_id\":1,\"method\":\"list\"}\r\n"[..]);
+        let m: Envelope<Request> = read_msg(&mut r).await.unwrap().unwrap();
+        assert_eq!(m.body, Request::List);
+        assert!(read_msg::<_, Request>(&mut r).await.unwrap().is_none());
+        let mut r = BufReader::new(&b"{\"req_id\":1,"[..]);
+        match read_msg::<_, Request>(&mut r).await {
+            Err(CodecError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn msg_reader_cancel_safe() {
+        let (mut a, b) = duplex(1024);
+        let mut r = MsgReader::new(BufReader::new(b));
+        a.write_all(b"{\"req_id\":1,\"met").await.unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            r.next::<Envelope<Request>>(),
+        )
+        .await;
+        assert!(first.is_err(), "should have been cancelled");
+        a.write_all(b"hod\":\"list\"}\n").await.unwrap();
+        let m = r.next::<Envelope<Request>>().await.unwrap().unwrap();
+        assert_eq!(
+            m,
+            Envelope {
+                req_id: 1,
+                body: Request::List
+            }
         );
     }
 }

@@ -16,60 +16,79 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
-/// Reads one message. `Ok(None)` on clean EOF (no pending bytes). Never buffers
-/// more than `MAX_LINE` bytes of a line; returns `TooLong` as soon as the cap is
-/// exceeded (the connection must then be closed). Blank lines are skipped. A
-/// `Json` error consumes the offending line, so the stream stays usable.
-pub async fn read_msg<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
-    r: &mut R,
-) -> Result<Option<T>, CodecError> {
-    loop {
-        let mut line: Vec<u8> = Vec::new();
-        let mut saw_newline = false;
+/// Cancel-safe framed reader. Partial lines are kept inside the reader, so
+/// dropping the `next` future (e.g. losing a `tokio::select!` race) never loses
+/// bytes: the next call resumes the same line.
+pub struct MsgReader<R> {
+    inner: R,
+    line: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin> MsgReader<R> {
+    pub fn new(r: R) -> Self {
+        Self {
+            inner: r,
+            line: Vec::new(),
+        }
+    }
+
+    /// Reads one message; cancel-safe. `Ok(None)` on clean EOF (no pending
+    /// non-blank bytes). EOF in the middle of a line is `Io(UnexpectedEof)`.
+    /// Never buffers more than `MAX_LINE` bytes of a line; `TooLong` leaves the
+    /// stream mid-line, so the connection must then be closed. Blank lines are
+    /// skipped and a trailing `\r` is stripped. A `Json` error consumes the
+    /// offending line, so the stream stays usable.
+    pub async fn next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, CodecError> {
         loop {
-            let buf = r.fill_buf().await?;
+            let buf = self.inner.fill_buf().await?;
             if buf.is_empty() {
-                break;
-            }
-            match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    if line.len() + i > MAX_LINE {
-                        return Err(CodecError::TooLong);
-                    }
-                    line.extend_from_slice(&buf[..i]);
-                    r.consume(i + 1);
-                    saw_newline = true;
-                    break;
+                if self.line.iter().all(u8::is_ascii_whitespace) {
+                    self.line.clear();
+                    return Ok(None);
                 }
-                None => {
-                    let n = buf.len();
-                    if line.len() + n > MAX_LINE {
-                        return Err(CodecError::TooLong);
-                    }
-                    line.extend_from_slice(buf);
-                    r.consume(n);
-                }
+                return Err(CodecError::Io(std::io::ErrorKind::UnexpectedEof.into()));
             }
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            if saw_newline {
+            // No awaits below: state update and consume are atomic w.r.t. cancellation.
+            let pos = buf.iter().position(|&b| b == b'\n');
+            let take = pos.unwrap_or(buf.len());
+            if self.line.len() + take > MAX_LINE {
+                return Err(CodecError::TooLong);
+            }
+            self.line.extend_from_slice(&buf[..take]);
+            self.inner.consume(take + usize::from(pos.is_some()));
+            if pos.is_none() {
                 continue;
             }
-            return Ok(None);
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            return Ok(Some(serde_json::from_slice(&line)?));
         }
-        return Ok(Some(serde_json::from_slice(&line)?));
     }
 }
 
-/// Writes `msg` as one JSON line and flushes.
+/// Convenience one-shot read. NOT cancel-safe: if the future is dropped
+/// mid-line, the partial line is lost. Use [`MsgReader`] inside `select!`.
+pub async fn read_msg<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
+    r: &mut R,
+) -> Result<Option<T>, CodecError> {
+    MsgReader::new(r).next().await
+}
+
+/// Writes `msg` as one JSON line and flushes. Refuses frames over `MAX_LINE`
+/// (`TooLong`) without writing anything.
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(
     w: &mut W,
     msg: &T,
 ) -> Result<(), CodecError> {
     let mut bytes = serde_json::to_vec(msg)?;
+    if bytes.len() > MAX_LINE {
+        return Err(CodecError::TooLong);
+    }
     bytes.push(b'\n');
     w.write_all(&bytes).await?;
     w.flush().await?;
