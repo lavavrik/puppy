@@ -281,7 +281,9 @@ pub enum WireState {
         uploaded: u64,
         ratio: f32,
         seeded_secs: u64,
+        #[serde(default)]
         ratio_target: Option<f32>,
+        #[serde(default)]
         time_target_secs: Option<u64>,
     },
     /// A state this client does not know (newer daemon).
@@ -316,6 +318,12 @@ impl From<&AttentionReason> for WireAttention {
     }
 }
 
+/// JSON has no NaN/infinity (serde_json would write `null`, which a reader rejects as an
+/// `f32`): a non-finite ratio goes on the wire as `0.0`.
+fn finite(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
 impl From<&DownloadState> for WireState {
     fn from(s: &DownloadState) -> Self {
         match s {
@@ -340,9 +348,9 @@ impl From<&DownloadState> for WireState {
                 time_target_secs,
             } => WireState::Seeding {
                 uploaded: *uploaded,
-                ratio: *ratio,
+                ratio: finite(*ratio),
                 seeded_secs: *seeded_secs,
-                ratio_target: *ratio_target,
+                ratio_target: ratio_target.map(finite),
                 time_target_secs: *time_target_secs,
             },
         }
@@ -786,6 +794,58 @@ mod tests {
         assert!(matches!(w, WireState::Seeding { uploaded: 1, .. }));
         let w: WireState = serde_json::from_str(r#"{"kind":"future_state","x":1}"#).unwrap();
         assert_eq!(w, WireState::Unknown);
+        // Targets may be omitted.
+        let w: WireState =
+            serde_json::from_str(r#"{"kind":"seeding","uploaded":1,"ratio":0.1,"seeded_secs":2}"#)
+                .unwrap();
+        assert!(matches!(
+            w,
+            WireState::Seeding {
+                ratio_target: None,
+                time_target_secs: None,
+                ..
+            }
+        ));
+        let c: DownloadState =
+            serde_json::from_str(r#"{"kind":"seeding","uploaded":1,"ratio":0.1,"seeded_secs":2}"#)
+                .unwrap();
+        assert!(matches!(
+            c,
+            DownloadState::Seeding {
+                ratio_target: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_finite_ratio_goes_on_wire_as_zero() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let s = DownloadState::Seeding {
+                uploaded: 1,
+                ratio: bad,
+                seeded_secs: 0,
+                ratio_target: Some(bad),
+                time_target_secs: None,
+            };
+            let w = WireState::from(&s);
+            let json = serde_json::to_string(&w).unwrap();
+            assert!(
+                json.contains(r#""ratio":0.0"#) && json.contains(r#""ratio_target":0.0"#),
+                "{json}"
+            );
+            let back: WireState = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                back,
+                WireState::Seeding {
+                    uploaded: 1,
+                    ratio: 0.0,
+                    seeded_secs: 0,
+                    ratio_target: Some(0.0),
+                    time_target_secs: None,
+                }
+            );
+        }
     }
 
     #[test]

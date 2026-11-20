@@ -35,3 +35,4 @@ unicode-segmentation = "1"
 # BitTorrent (only inside crates/puppy-torrent). rustls TLS (SHA-1 via aws-lc-rs through librqbit-sha1-wrapper's sha1-ring feature), never native-tls/OpenSSL.
 librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
 bytes = "1"
+humantime = "2.4.0"

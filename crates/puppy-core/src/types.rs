@@ -58,7 +58,8 @@ pub struct Selection {
     pub globs: Vec<String>,
 }
 
-/// When to stop seeding; `None`/`0` disables a trigger.
+/// When to stop seeding, per torrent. A `None` field inherits the daemon's global value;
+/// `Some(0)` disables that trigger for this torrent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeedPolicy {
     #[serde(default)]
@@ -108,7 +109,9 @@ pub enum DownloadState {
         uploaded: u64,
         ratio: f32,
         seeded_secs: u64,
+        #[serde(default)]
         ratio_target: Option<f32>,
+        #[serde(default)]
         time_target_secs: Option<u64>,
     },
 }

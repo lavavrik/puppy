@@ -71,7 +71,11 @@ mod duration_text {
             Text::Secs(n) => Ok(Duration::from_secs(n)),
             Text::Str(s) => match s.trim() {
                 "0" => Ok(Duration::ZERO),
-                t => humantime::parse_duration(t).map_err(de::Error::custom),
+                t => humantime::parse_duration(t).map_err(|e| {
+                    de::Error::custom(format!(
+                        "seed_time: invalid duration {t:?} ({e}); use e.g. \"2h\", \"30m\" or 0"
+                    ))
+                }),
             },
         }
     }
@@ -246,7 +250,8 @@ mod tests {
             assert_eq!(t.seed_time, Duration::from_secs(want), "{text}");
         }
         std::fs::write(&p, "[torrent]\nseed_time = \"soon\"\n").unwrap();
-        assert!(Config::load(&p).is_err());
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(err.contains("seed_time"), "{err}");
         // Serializes back to something it can read.
         let t = TorrentConfig::default();
         let s = toml::to_string(&t).unwrap();
