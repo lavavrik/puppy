@@ -855,3 +855,11 @@ fn torrent_limit_only_before_it_starts() {
     a.update(ch('l'), now);
     assert!(matches!(a.mode, Mode::Popup(Popup::Limit(_))));
 }
+
+#[test]
+fn quit_message_quits_from_any_mode() {
+    let (mut a, now) = connected(vec![]);
+    a.update(ch('a'), now);
+    assert_eq!(a.update(Msg::Quit, now), vec![Cmd::Quit]);
+    assert!(a.should_quit);
+}

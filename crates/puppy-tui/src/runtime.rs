@@ -74,7 +74,25 @@ pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
             std::future::ready(ok)
         })
         .filter_map(|e| std::future::ready(e.ok().and_then(input_msg)));
-    let result = run_with(api, theme, &mut terminal, Box::pin(input), None).await;
+    // A termination signal quits like `q` (the terminal is restored; the daemon keeps
+    // running). The input's end still ends the loop.
+    let input = futures_util::stream::select(
+        input
+            .map(Some)
+            .chain(futures_util::stream::once(std::future::ready(None))),
+        termination_signals().map(Some),
+    )
+    .take_while(|m| std::future::ready(m.is_some()))
+    .filter_map(std::future::ready);
+    let result = run_loop(
+        api,
+        theme,
+        &mut terminal,
+        Box::pin(input),
+        None,
+        Some(&TERMINAL_ACTIVE),
+    )
+    .await;
     drop(terminal);
     drop(guard);
     let read_error = read_error.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -111,9 +129,46 @@ pub async fn run_with<B: Backend>(
     api: Arc<dyn DaemonApi>,
     theme: Theme,
     terminal: &mut Terminal<B>,
-    mut input: impl Stream<Item = Msg> + Unpin,
+    input: impl Stream<Item = Msg> + Unpin,
     stop_after: Option<Duration>,
 ) -> anyhow::Result<App> {
+    run_loop(api, theme, terminal, input, stop_after, None).await
+}
+
+/// [`Msg::Quit`] for each SIGTERM or SIGHUP (Unix; nothing elsewhere, where closing
+/// the console ends the process).
+pub fn termination_signals() -> impl Stream<Item = Msg> + Send + Unpin + 'static {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let signals: Vec<_> = [SignalKind::terminate(), SignalKind::hangup()]
+            .into_iter()
+            .filter_map(|kind| signal(kind).ok())
+            .map(|mut s| {
+                Box::pin(futures_util::stream::poll_fn(move |cx| {
+                    s.poll_recv(cx).map(|r| r.map(|()| Msg::Quit))
+                }))
+            })
+            .collect();
+        futures_util::stream::select_all(signals)
+    }
+    #[cfg(not(unix))]
+    {
+        futures_util::stream::pending()
+    }
+}
+
+/// The loop; `live`, when given, says whether the terminal is still in dashboard
+/// mode (after the panic hook restored it, drawing would scribble over the shell).
+async fn run_loop<B: Backend>(
+    api: Arc<dyn DaemonApi>,
+    theme: Theme,
+    terminal: &mut Terminal<B>,
+    mut input: impl Stream<Item = Msg> + Unpin,
+    stop_after: Option<Duration>,
+    live: Option<&AtomicBool>,
+) -> anyhow::Result<App> {
+    let can_draw = || live.is_none_or(|l| l.load(Ordering::SeqCst));
     let term_err = |e: B::Error| anyhow::anyhow!("terminal: {e}");
     let start = Instant::now();
     let deadline = stop_after.map(|d| start + d);
@@ -170,7 +225,9 @@ pub async fn run_with<B: Backend>(
                 Some(Msg::Tick)
             }
             _ = sleep_until(draw_at), if dirty => {
-                terminal.draw(|f| draw(&mut app, f)).map_err(term_err)?;
+                if can_draw() {
+                    terminal.draw(|f| draw(&mut app, f)).map_err(term_err)?;
+                }
                 last_draw = Some(Instant::now());
                 dirty = false;
                 None
@@ -200,7 +257,7 @@ pub async fn run_with<B: Backend>(
         }
     }
     drop(connection);
-    if !app.should_quit && dirty {
+    if !app.should_quit && dirty && can_draw() {
         // Leave the final state on screen (tests read it).
         terminal.draw(|f| draw(&mut app, f)).map_err(term_err)?;
     }
@@ -444,4 +501,85 @@ fn restore_terminal() {
     let _ = execute!(out, cursor::Show);
     let _ = disable_raw_mode();
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Connected;
+    use crate::theme::ThemeChoice;
+    use async_trait::async_trait;
+    use puppy_proto::Event as DaemonEvent;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    /// A daemon that never answers.
+    struct Silent;
+
+    #[async_trait]
+    impl DaemonApi for Silent {
+        async fn connect(&self) -> Result<Connected, ApiError> {
+            std::future::pending().await
+        }
+        async fn next_event(&self) -> Option<DaemonEvent> {
+            std::future::pending().await
+        }
+        async fn exec(&self, _: Cmd) -> Result<Option<Msg>, crate::app::CmdError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_drawing_once_the_terminal_was_restored() {
+        let theme = Theme::detect(ThemeChoice::Dark, &|_| None);
+        let blank = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        // The panic hook already restored the terminal: nothing is drawn.
+        let restored = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let input = futures_util::stream::pending();
+        let stop = Some(Duration::from_secs(1));
+        run_loop(
+            Arc::new(Silent),
+            theme,
+            &mut term,
+            input,
+            stop,
+            Some(&restored),
+        )
+        .await
+        .unwrap();
+        assert_eq!(term.backend().buffer(), &blank);
+        // While it is active, frames are drawn.
+        let active = AtomicBool::new(true);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let input = futures_util::stream::pending();
+        run_loop(
+            Arc::new(Silent),
+            theme,
+            &mut term,
+            input,
+            stop,
+            Some(&active),
+        )
+        .await
+        .unwrap();
+        assert_ne!(term.backend().buffer(), &blank);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_and_sighup_quit() {
+        for sig in ["-TERM", "-HUP"] {
+            let mut signals = termination_signals();
+            // Registered before the signal is sent (the handler replaces the default
+            // action, which would end this test process).
+            let status = std::process::Command::new("kill")
+                .args([sig, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let msg = timeout(Duration::from_secs(5), signals.next()).await;
+            assert_eq!(msg, Ok(Some(Msg::Quit)), "{sig}");
+        }
+    }
 }
