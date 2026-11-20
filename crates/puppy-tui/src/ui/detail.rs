@@ -10,14 +10,21 @@ use ratatui::text::Span;
 use ratatui::widgets::{Sparkline, Widget};
 
 use super::list::size_text;
-use super::{centered, groups, panel, state_icon, state_word, text, width};
+use super::{
+    as_shown, centered, grey_out, groups, panel, stale, state_icon, state_word, text, width,
+};
 use crate::app::App;
 use crate::format;
 use crate::theme::{Theme, Token};
 use crate::widgets::{ConnectionBars, PieceMap, SegmentStrip};
 
-/// Speed samples shown in the sparkline.
+/// Speed samples (one per second) shown in the sparkline.
 const SPARK_SAMPLES: usize = 60;
+/// The sparkline's heading.
+pub const SPEED_HEADING: &str = "speed · last 60 s";
+/// Rows the HTTP section needs at least (heading and segment strip): a placeholder
+/// reserves as many, so the pane does not jump when the detail arrives.
+const HTTP_MIN: u16 = 2;
 /// Key/value labels: `Downloaded` plus a space.
 const LABEL_W: u16 = 11;
 /// From this inner width on, the key/value grid uses two columns.
@@ -52,6 +59,8 @@ pub(super) fn draw(app: &App, buf: &mut Buffer, area: Rect) {
         centered(buf, body, y, &[("Nothing selected", t.style(Token::Dim))]);
         return;
     };
+    let stale = stale(app);
+    let d = &*as_shown(d, stale);
     let detail = app
         .detail
         .as_ref()
@@ -73,6 +82,9 @@ pub(super) fn draw(app: &App, buf: &mut Buffer, area: Rect) {
         c.gap(plan.gaps[2]);
     }
     engine.draw(t, buf, &mut c, d, &plan);
+    if stale {
+        grey_out(t, buf, inner);
+    }
 }
 
 /// What the engine section shows.
@@ -117,8 +129,7 @@ impl Plan {
         let grid = if two_col { 4 } else { 6 };
         let engine_min = match engine {
             Engine::Nothing => 0,
-            Engine::Placeholder(_) => 1,
-            Engine::Http { .. } => 2,
+            Engine::Placeholder(_) | Engine::Http { .. } => HTTP_MIN,
             Engine::Torrent { .. } => 1 + MAP_MIN,
         };
         let mut avail = height.saturating_sub(1 + grid + engine_min);
@@ -177,18 +188,8 @@ fn take(avail: &mut u16, want: u16) -> u16 {
 impl<'a> Engine<'a> {
     fn of(d: &DownloadSnapshot, detail: Option<&'a EngineDetail>) -> Self {
         match detail {
-            None => {
-                let fetched = matches!(d.kind, EngineKindTag::Http | EngineKindTag::Torrent)
-                    && matches!(
-                        d.state,
-                        WireState::Active | WireState::Starting | WireState::Paused
-                    );
-                if fetched {
-                    Engine::Placeholder("No detail yet")
-                } else {
-                    Engine::Nothing
-                }
-            }
+            None if App::fetches_detail(d) => Engine::Placeholder("No detail yet"),
+            None => Engine::Nothing,
             Some(EngineDetail::Unknown) => Engine::Placeholder("No detail available"),
             Some(EngineDetail::Http {
                 segments,
@@ -225,6 +226,8 @@ impl<'a> Engine<'a> {
                 if let Some(r) = c.line() {
                     text(buf, r.x, r.y, r.width, msg, dim);
                 }
+                // The rest of the reserved rows stay blank.
+                c.take(HTTP_MIN - 1);
             }
             Engine::Http {
                 segments,
@@ -431,7 +434,7 @@ fn field(t: &Theme, buf: &mut Buffer, x: u16, y: u16, w: u16, key: &str, value: 
     }
 }
 
-/// `Speed history` heading with the peak on the right, then `rows` of sparkline.
+/// The [`SPEED_HEADING`] with the peak on the right, then `rows` of sparkline.
 fn speed(app: &App, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, rows: u16) {
     let t = &app.theme;
     let Some(head) = c.line() else { return };
@@ -444,7 +447,7 @@ fn speed(app: &App, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, rows
         .copied();
     let peak = recent.clone().max().unwrap_or(0);
     let peak_text = format!("peak {}", format::speed(peak));
-    heading(t, buf, head, "Speed history", &peak_text);
+    heading(t, buf, head, SPEED_HEADING, &peak_text);
     let Some(r) = c.take(rows.min(c.left())) else {
         return;
     };

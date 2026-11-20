@@ -223,7 +223,8 @@ fn delete_opens_confirm_then_remove_cmd() {
     );
     assert!(matches!(a.mode, Mode::Normal));
 
-    // Delete key, then Esc cancels.
+    // Delete key (past the paste-burst guard), then Esc cancels.
+    let now = now + LATER;
     a.update(key(KeyCode::Delete), now);
     assert!(matches!(a.mode, Mode::Popup(Popup::ConfirmDelete { .. })));
     assert!(a.update(key(KeyCode::Esc), now).is_empty());
@@ -415,7 +416,8 @@ fn history_ring_caps_at_120() {
                     ..Totals::default()
                 },
             }),
-            now,
+            // One sample per second.
+            now + Duration::from_secs(i),
         );
     }
     let h = a.history.get(1).unwrap();
@@ -507,6 +509,7 @@ fn limit_popups_parse_rates() {
         }]
     );
 
+    let now = now + LATER;
     a.update(ch('l'), now);
     for c in "abc".chars() {
         a.update(ch(c), now);
@@ -663,4 +666,192 @@ fn confirm_delete_space_toggles_and_only_enter_confirms() {
             delete_files: true
         }]
     );
+}
+
+// ---------------------------------------------------------------------------------
+// Final fix wave
+
+fn torrent(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
+    DownloadSnapshot {
+        kind: EngineKindTag::Torrent,
+        ..snap(id, name, state)
+    }
+}
+
+fn http_detail(connections: u16) -> puppy_core::types::EngineDetail {
+    puppy_core::types::EngineDetail::Http {
+        segments: Vec::new(),
+        connections,
+        resumable: true,
+    }
+}
+
+/// Past the paste-burst guard after a popup submit.
+const LATER: Duration = Duration::from_millis(100);
+
+#[test]
+fn global_limits_submit_is_optimistic_and_refresh_replaces_settings() {
+    let (mut a, now) = connected(vec![]);
+    a.update(ch('L'), now);
+    for c in "2M".chars() {
+        a.update(ch(c), now);
+    }
+    assert_eq!(
+        a.update(key(KeyCode::Enter), now),
+        vec![Cmd::SetGlobalLimits {
+            down: Some(2 << 20),
+            up: None
+        }]
+    );
+    let s = a.settings.as_ref().unwrap();
+    assert_eq!(
+        (s.global_down_limit, s.global_up_limit),
+        (Some(2 << 20), None)
+    );
+
+    // The daemon's answer wins (here it normalised the limit and set max 5).
+    let mut fresh = settings(5);
+    fresh.global_down_limit = Some(3 << 20);
+    a.update(Msg::Settings(fresh.clone()), now);
+    assert_eq!(a.settings, Some(fresh));
+    // Reopening `L` shows the new values.
+    a.update(ch('L'), now + LATER);
+    match &a.mode {
+        Mode::Popup(Popup::GlobalLimits(f)) => {
+            assert_eq!(f.down.value, "3.0M");
+            assert_eq!(f.up.value, "");
+        }
+        m => panic!("{m:?}"),
+    }
+}
+
+#[test]
+fn selecting_a_running_item_fetches_detail_at_once() {
+    let (mut a, now) = connected(vec![
+        snap(1, "a", WireState::Active),
+        snap(2, "b", WireState::Completed),
+        snap(3, "c", WireState::Paused),
+    ]);
+    assert_eq!(a.update(ch('j'), now), Vec::<Cmd>::new());
+    assert_eq!(a.update(ch('j'), now), vec![Cmd::FetchDetail(3)]);
+    assert_eq!(a.update(ch('g'), now), vec![Cmd::FetchDetail(1)]);
+    // Not moving: no fetch (ticks do the polling).
+    assert_eq!(a.update(ch('k'), now), Vec::<Cmd>::new());
+}
+
+#[test]
+fn detail_cache_shows_last_detail_when_moving_back() {
+    let (mut a, now) = connected(vec![
+        snap(1, "a", WireState::Active),
+        snap(2, "b", WireState::Active),
+    ]);
+    a.update(Msg::Detail(1, Some(http_detail(1))), now);
+    a.update(ch('j'), now);
+    assert!(a.detail.is_none());
+    a.update(Msg::Detail(2, Some(http_detail(2))), now);
+    assert_eq!(a.detail, Some((2, http_detail(2))));
+    a.update(ch('k'), now);
+    assert_eq!(a.detail, Some((1, http_detail(1))));
+    a.update(ch('j'), now);
+    assert_eq!(a.detail, Some((2, http_detail(2))));
+
+    // A removed download's entry is dropped.
+    a.update(snapshot(vec![snap(1, "a", WireState::Active)]), now);
+    assert!(a.cached_detail(2).is_none());
+    assert!(a.cached_detail(1).is_some());
+}
+
+#[test]
+fn detail_cache_keeps_the_last_32() {
+    let downloads: Vec<_> = (1..=40)
+        .map(|i| snap(i, &format!("d{i}"), WireState::Active))
+        .collect();
+    let (mut a, now) = connected(downloads);
+    for i in 1..=40 {
+        a.update(Msg::Detail(i, Some(http_detail(1))), now);
+    }
+    assert!((1..=8).all(|i| a.cached_detail(i).is_none()));
+    assert!((9..=40).all(|i| a.cached_detail(i).is_some()));
+    // Use refreshes: 9 survives the next insert, 10 goes.
+    a.update(Msg::Detail(9, Some(http_detail(2))), now);
+    a.update(Msg::Detail(1, Some(http_detail(1))), now);
+    assert!(a.cached_detail(9).is_some());
+    assert!(a.cached_detail(10).is_none());
+}
+
+#[test]
+fn detail_dropped_when_the_selection_stops_running() {
+    let (mut a, now) = connected(vec![snap(1, "a", WireState::Active)]);
+    a.update(Msg::Detail(1, Some(http_detail(4))), now);
+    assert!(a.detail.is_some());
+    a.update(snapshot(vec![snap(1, "a", WireState::Completed)]), now);
+    assert!(a.detail.is_none());
+    assert!(a.cached_detail(1).is_none());
+    // A late reply for it is not shown either.
+    a.update(Msg::Detail(1, Some(http_detail(4))), now);
+    assert!(a.detail.is_none());
+}
+
+#[test]
+fn keys_right_after_a_popup_submit_are_a_paste_burst() {
+    let (mut a, now) = connected(vec![snap(1, "a", WireState::Active)]);
+    a.update(ch('l'), now);
+    for c in "5M".chars() {
+        a.update(ch(c), now);
+    }
+    assert_eq!(a.update(key(KeyCode::Enter), now).len(), 1);
+    // The rest of the paste (`\n` then more text) arrives within 30 ms: swallowed.
+    let soon = now + Duration::from_millis(10);
+    assert!(a.update(ch('p'), soon).is_empty());
+    assert!(a.update(ch('q'), soon).is_empty());
+    assert!(!a.should_quit);
+    assert_eq!(a.mode, Mode::Normal);
+    // Ctrl+C still quits.
+    let mut b = a.clone();
+    b.update(ctrl('c'), soon);
+    assert!(b.should_quit);
+    // After 30 ms keys work again.
+    let later = now + Duration::from_millis(31);
+    assert_eq!(a.update(ch('p'), later), vec![Cmd::Pause(1)]);
+}
+
+#[test]
+fn unsupported_error_is_a_friendly_info_toast() {
+    let (mut a, now) = connected(vec![]);
+    a.update(
+        Msg::CmdResult(CmdOutcome {
+            label: "limit".into(),
+            result: Err(puppy_tui::app::CmdError::Unsupported(
+                "per-torrent limits while running".into(),
+            )),
+        }),
+        now,
+    );
+    assert_eq!(
+        a.toasts[0].text,
+        "not supported for this download: per-torrent limits while running"
+    );
+    assert_eq!(a.toasts[0].kind, ToastKind::Info);
+}
+
+#[test]
+fn torrent_limit_only_before_it_starts() {
+    let (mut a, now) = connected(vec![
+        torrent(1, "t", WireState::Active),
+        torrent(2, "q", WireState::Queued),
+    ]);
+    let running = a.downloads[0].clone();
+    let queued = a.downloads[1].clone();
+    assert!(!a.can(puppy_tui::app::Action::Limit, &running));
+    assert!(a.can(puppy_tui::app::Action::Limit, &queued));
+    assert!(a.update(ch('l'), now).is_empty());
+    assert_eq!(a.mode, Mode::Normal);
+    assert_eq!(
+        a.toasts[0].text,
+        "per-torrent limits can only be set before a torrent starts"
+    );
+    assert_eq!(a.toasts[0].kind, ToastKind::Info);
+    a.update(ch('j'), now);
+    a.update(ch('l'), now);
+    assert!(matches!(a.mode, Mode::Popup(Popup::Limit(_))));
 }

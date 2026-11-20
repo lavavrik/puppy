@@ -17,7 +17,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
 use unicode_width::UnicodeWidthStr;
 
-use puppy_proto::WireState;
+use std::borrow::Cow;
+
+use puppy_proto::{DownloadSnapshot, WireState};
+use ratatui::style::{Color, Modifier};
 
 use crate::app::{App, Banner, Conn, HitTarget, Mode};
 use crate::format;
@@ -113,6 +116,82 @@ fn layout(area: Rect, banner: bool) -> Layout {
 
 /// Draws everything; returns where the terminal cursor goes (filter input), if shown.
 fn draw_into(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
+    let theme = app.theme;
+    paint_background(&theme, buf, area);
+    let cursor = draw_parts(app, buf, area);
+    // Popups and toasts clear their area (back to the terminal's colours): paint it.
+    fill_background(&theme, buf, area);
+    cursor
+}
+
+/// Truecolor palettes bring their own background, so the colours never depend on the
+/// terminal's (a dark palette on a light terminal stays readable). ANSI and mono
+/// palettes keep the terminal's.
+fn owns_background(theme: &Theme) -> bool {
+    !theme.mono && theme.p.bg != Color::Reset
+}
+
+/// Paints the palette's background and text colour over `area`.
+fn paint_background(theme: &Theme, buf: &mut Buffer, area: Rect) {
+    if owns_background(theme) {
+        buf.set_style(area, Style::new().fg(theme.p.fg).bg(theme.p.bg));
+    }
+}
+
+/// Gives cells left on the terminal's default colours the palette's.
+fn fill_background(theme: &Theme, buf: &mut Buffer, area: Rect) {
+    if !owns_background(theme) {
+        return;
+    }
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = theme.p.bg;
+                }
+                if cell.fg == Color::Reset {
+                    cell.fg = theme.p.fg;
+                }
+            }
+        }
+    }
+}
+
+/// Whether the daemon is away: what is shown is stale (dimmed, rates unknown).
+pub(crate) fn stale(app: &App) -> bool {
+    matches!(app.conn, Conn::Reconnecting { .. })
+}
+
+/// `d` as drawn: while the daemon is away its speeds and ETA are unknown (`—`).
+pub(crate) fn as_shown(d: &DownloadSnapshot, stale: bool) -> Cow<'_, DownloadSnapshot> {
+    if !stale {
+        return Cow::Borrowed(d);
+    }
+    Cow::Owned(DownloadSnapshot {
+        down_bps: 0,
+        up_bps: 0,
+        eta_secs: None,
+        ..d.clone()
+    })
+}
+
+/// Everything in `area` in the dim colour (DIM in mono): stale while the daemon is
+/// away.
+pub(crate) fn grey_out(t: &Theme, buf: &mut Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if t.mono {
+                    cell.modifier.insert(Modifier::DIM);
+                } else {
+                    cell.fg = t.p.dim;
+                }
+            }
+        }
+    }
+}
+
+fn draw_parts(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
     let (min_w, min_h) = MIN_SIZE;
     if area.width < min_w || area.height < min_h {
         too_small(&app.theme, buf, area);

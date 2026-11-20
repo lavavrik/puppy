@@ -233,6 +233,9 @@ fn spawn_cmd(
     };
     let detail = detail_id.is_some();
     let restart = cmd == Cmd::RestartDaemon;
+    // The daemon may adjust or refuse new settings: the footer and the `L` popup show
+    // what it really has (this also undoes the app's optimistic update on failure).
+    let refresh = matches!(cmd, Cmd::SetGlobalLimits { .. } | Cmd::SetMaxActive(_));
     tasks.spawn(async move {
         let r = api.exec(cmd).await;
         if restart {
@@ -255,6 +258,12 @@ fn spawn_cmd(
             detail: detail_id,
             msg,
         });
+        if refresh && let Ok(Some(msg @ Msg::Settings(_))) = api.exec(Cmd::FetchSettings).await {
+            let _ = results.send(Done {
+                detail: None,
+                msg: Some(msg),
+            });
+        }
     });
 }
 
@@ -271,6 +280,7 @@ fn label(cmd: &Cmd) -> &'static str {
         Cmd::SetGlobalLimits { .. } => "global limits",
         Cmd::SetMaxActive(_) => "max active",
         Cmd::FetchDetail(_) => "details",
+        Cmd::FetchSettings => "settings",
         Cmd::RestartDaemon => "restart daemon",
         Cmd::Quit => "quit",
     }

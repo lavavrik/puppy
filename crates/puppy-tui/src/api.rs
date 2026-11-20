@@ -9,7 +9,7 @@ use puppy_client::{Client, ClientError, Paths};
 use puppy_proto::{DownloadSnapshot, ErrorCode, Event, ReplyData, Request, Settings};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::app::{Cmd, Msg};
+use crate::app::{Cmd, CmdError, Msg};
 
 /// Snapshot events per second the dashboard asks for (every 250 ms).
 pub const SUBSCRIBE_INTERVAL_MS: u64 = 250;
@@ -51,7 +51,7 @@ pub trait DaemonApi: Send + Sync + 'static {
     async fn next_event(&self) -> Option<Event>;
     /// Runs a command: [`Cmd::FetchDetail`] answers `Some(Msg::Detail)`, the others
     /// `None`. Never called with [`Cmd::Quit`].
-    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, String>;
+    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, CmdError>;
 }
 
 /// [`DaemonApi`] over a [`Client`], starting the daemon (`exe daemon …`) when none runs.
@@ -139,13 +139,13 @@ impl DaemonApi for ClientApi {
         self.events.lock().await.as_mut()?.recv().await
     }
 
-    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, String> {
+    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, CmdError> {
         if cmd == Cmd::RestartDaemon {
             self.set_client(None);
             return Client::shutdown_incompatible(&self.paths)
                 .await
                 .map(|()| None)
-                .map_err(|e| e.to_string());
+                .map_err(|e| CmdError::Failed(e.to_string()));
         }
         let client = self.client()?;
         let request = match cmd {
@@ -168,7 +168,14 @@ impl DaemonApi for ClientApi {
             Cmd::FetchDetail(id) => {
                 return match client.call(Request::Get { id }).await {
                     Ok(ReplyData::Download { detail, .. }) => Ok(Some(Msg::Detail(id, detail))),
-                    Ok(d) => Err(format!("unexpected reply: {d:?}")),
+                    Ok(d) => Err(CmdError::Failed(format!("unexpected reply: {d:?}"))),
+                    Err(e) => Err(call_error(e)),
+                };
+            }
+            Cmd::FetchSettings => {
+                return match client.call(Request::GetSettings).await {
+                    Ok(ReplyData::Settings { settings }) => Ok(Some(Msg::Settings(settings))),
+                    Ok(d) => Err(CmdError::Failed(format!("unexpected reply: {d:?}"))),
                     Err(e) => Err(call_error(e)),
                 };
             }
@@ -179,9 +186,39 @@ impl DaemonApi for ClientApi {
 }
 
 /// A failed call, for a toast: the daemon's own message when it refused.
-fn call_error(e: ClientError) -> String {
+fn call_error(e: ClientError) -> CmdError {
     match e {
-        ClientError::Daemon { message, .. } if !message.is_empty() => message,
-        e => e.to_string(),
+        ClientError::Daemon {
+            code: ErrorCode::Unsupported,
+            message,
+        } => {
+            // The daemon's text repeats what the toast already says.
+            let reason = message.strip_prefix("unsupported: ").unwrap_or(&message);
+            CmdError::Unsupported(reason.to_string())
+        }
+        ClientError::Daemon { message, .. } if !message.is_empty() => CmdError::Failed(message),
+        e => CmdError::Failed(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_refusals_are_their_own_error() {
+        let e = call_error(ClientError::Daemon {
+            code: ErrorCode::Unsupported,
+            message: "unsupported: per-torrent limits while running".into(),
+        });
+        assert_eq!(
+            e,
+            CmdError::Unsupported("per-torrent limits while running".into())
+        );
+        let e = call_error(ClientError::Daemon {
+            code: ErrorCode::InvalidState,
+            message: "nope".into(),
+        });
+        assert_eq!(e, CmdError::Failed("nope".into()));
     }
 }

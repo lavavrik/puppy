@@ -7,7 +7,7 @@ pub mod history;
 pub mod input;
 pub mod keys;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -27,6 +27,15 @@ pub const TOAST_TTL: Duration = Duration::from_secs(4);
 /// Toasts visible at once (the oldest is dropped).
 pub const MAX_TOASTS: usize = 3;
 pub const MAX_ACTIVE_RANGE: (u16, u16) = (1, 32);
+/// Engine details remembered for this many downloads (least recently used goes).
+pub const DETAIL_CACHE: usize = 32;
+/// After a popup submit, plain keys arriving this soon are the rest of a paste burst
+/// (terminals without bracketed paste, e.g. legacy Windows consoles, type it out).
+pub const PASTE_BURST: Duration = Duration::from_millis(30);
+/// A torrent's per-download limit is taken when it starts, not while it runs.
+pub const TORRENT_LIMIT_TOAST: &str = "per-torrent limits can only be set before a torrent starts";
+/// Toast prefix for [`CmdError::Unsupported`].
+pub const UNSUPPORTED_PREFIX: &str = "not supported for this download: ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Conn {
@@ -124,11 +133,40 @@ pub struct Toast {
     pub until: Instant,
 }
 
+/// Why a daemon command failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CmdError {
+    /// The daemon cannot do this for this download (its engine does not support it).
+    Unsupported(String),
+    /// Any other failure: the text for the toast.
+    Failed(String),
+}
+
+impl std::fmt::Display for CmdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CmdError::Unsupported(s) | CmdError::Failed(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<String> for CmdError {
+    fn from(s: String) -> Self {
+        CmdError::Failed(s)
+    }
+}
+
+impl From<&str> for CmdError {
+    fn from(s: &str) -> Self {
+        CmdError::Failed(s.to_string())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CmdOutcome {
     /// What was attempted (`pause`), for the error toast.
     pub label: String,
-    pub result: Result<(), String>,
+    pub result: Result<(), CmdError>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +192,10 @@ pub enum Msg {
     ConnectError(String),
     CmdResult(CmdOutcome),
     Detail(DownloadId, Option<EngineDetail>),
+    /// The daemon's settings, fetched again after changing them.
+    Settings(Settings),
+    /// Quit (a termination signal).
+    Quit,
 }
 
 // Cmds are short-lived (one per key press), so the inline `AddRequest` costs nothing.
@@ -185,6 +227,8 @@ pub enum Cmd {
     },
     SetMaxActive(u16),
     FetchDetail(DownloadId),
+    /// Answered with [`Msg::Settings`]; the runtime issues it after changing settings.
+    FetchSettings,
     /// Stop the incompatible daemon (`U`); the runtime then reconnects, which starts
     /// this version's daemon.
     RestartDaemon,
@@ -245,7 +289,11 @@ pub struct App {
     /// Case-insensitive substring filter on name/source.
     pub filter: TextInput,
     pub mode: Mode,
+    /// The selection's engine detail (from the cache until a fresh one arrives).
     pub detail: Option<(DownloadId, EngineDetail)>,
+    /// Recent details by download, least recently used first (at most
+    /// [`DETAIL_CACHE`]), so moving back to an item shows its detail at once.
+    detail_cache: VecDeque<(DownloadId, EngineDetail)>,
     pub history: History,
     /// Oldest first.
     pub toasts: VecDeque<Toast>,
@@ -265,6 +313,8 @@ pub struct App {
     pub banner: Option<Banner>,
     /// The last left click on a list row, for double-click detection.
     last_click: Option<(DownloadId, Instant)>,
+    /// When a popup was last submitted (paste burst guard, [`PASTE_BURST`]).
+    submitted_at: Option<Instant>,
 }
 
 impl App {
@@ -280,6 +330,7 @@ impl App {
             filter: TextInput::new(),
             mode: Mode::Normal,
             detail: None,
+            detail_cache: VecDeque::new(),
             history: History::default(),
             toasts: VecDeque::new(),
             size: (80, 24),
@@ -291,6 +342,7 @@ impl App {
             help_scroll: 0,
             banner: None,
             last_click: None,
+            submitted_at: None,
         }
     }
 
@@ -344,10 +396,49 @@ impl App {
                 d.state,
                 WireState::Failed { .. } | WireState::NeedsAttention { .. }
             ),
+            // A torrent takes its limit when it starts.
+            Action::Limit if d.kind == EngineKindTag::Torrent => {
+                matches!(d.state, WireState::Queued)
+            }
             Action::Limit => !matches!(d.state, WireState::Completed),
             Action::MoveUp => d.queue_position.is_some_and(|p| p > 0),
             Action::MoveDown => d.queue_position.is_some_and(|p| p + 1 < self.queue_len()),
         }
+    }
+
+    /// Whether the daemon has an engine detail for `d` worth showing (it is fetched
+    /// while the download runs or is paused).
+    pub fn fetches_detail(d: &DownloadSnapshot) -> bool {
+        matches!(d.kind, EngineKindTag::Http | EngineKindTag::Torrent)
+            && matches!(
+                d.state,
+                WireState::Active | WireState::Starting | WireState::Paused
+            )
+    }
+
+    /// The cached engine detail of `id`, if any.
+    pub fn cached_detail(&self, id: DownloadId) -> Option<&EngineDetail> {
+        self.detail_cache
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, d)| d)
+    }
+
+    /// Remembers `detail` for `id` as the most recently used entry.
+    fn cache_detail(&mut self, id: DownloadId, detail: EngineDetail) {
+        self.detail_cache.retain(|(i, _)| *i != id);
+        self.detail_cache.push_back((id, detail));
+        while self.detail_cache.len() > DETAIL_CACHE {
+            self.detail_cache.pop_front();
+        }
+    }
+
+    /// The cached detail of `id`, marked as just used.
+    fn take_cached_detail(&mut self, id: DownloadId) -> Option<EngineDetail> {
+        let k = self.detail_cache.iter().position(|(i, _)| *i == id)?;
+        let entry = self.detail_cache.remove(k)?;
+        self.detail_cache.push_back(entry.clone());
+        Some(entry.1)
     }
 
     fn queue_len(&self) -> usize {
@@ -380,9 +471,17 @@ impl App {
         // a double click starts).
         let click =
             matches!(&msg, Msg::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left));
-        let cmds = self.update_inner(msg, now);
+        let mut cmds = self.update_inner(msg, now);
         if !click && before != (self.selected, std::mem::discriminant(&self.mode)) {
             self.last_click = None;
+        }
+        // A new selection gets its detail now, not at the next tick.
+        if self.selected != before.0
+            && let Some(d) = self.selection()
+            && Self::fetches_detail(d)
+            && !cmds.contains(&Cmd::FetchDetail(d.id))
+        {
+            cmds.push(Cmd::FetchDetail(d.id));
         }
         cmds
     }
@@ -442,12 +541,35 @@ impl App {
                 Vec::new()
             }
             Msg::CmdResult(outcome) => {
-                if let Err(e) = outcome.result {
-                    self.push_toast(format!("{}: {e}", outcome.label), ToastKind::Error, now);
+                match outcome.result {
+                    Ok(()) => {}
+                    Err(CmdError::Unsupported(m)) => {
+                        self.push_toast(format!("{UNSUPPORTED_PREFIX}{m}"), ToastKind::Info, now);
+                    }
+                    Err(CmdError::Failed(e)) => {
+                        self.push_toast(format!("{}: {e}", outcome.label), ToastKind::Error, now);
+                    }
                 }
                 Vec::new()
             }
+            Msg::Settings(settings) => {
+                self.settings = Some(settings);
+                Vec::new()
+            }
+            Msg::Quit => self.quit(),
             Msg::Detail(id, detail) => {
+                // A late reply for a download that stopped running (or is gone) is stale.
+                if !self
+                    .downloads
+                    .iter()
+                    .any(|d| d.id == id && Self::fetches_detail(d))
+                {
+                    return Vec::new();
+                }
+                match &detail {
+                    Some(d) => self.cache_detail(id, d.clone()),
+                    None => self.detail_cache.retain(|(i, _)| *i != id),
+                }
                 if self.selected == Some(id) {
                     self.detail = detail.map(|d| (id, d));
                 }
@@ -460,15 +582,7 @@ impl App {
         self.ticks = self.ticks.wrapping_add(1);
         self.toasts.retain(|t| t.until > now);
         match self.selection() {
-            Some(d)
-                if matches!(d.kind, EngineKindTag::Http | EngineKindTag::Torrent)
-                    && matches!(
-                        d.state,
-                        WireState::Active | WireState::Starting | WireState::Paused
-                    ) =>
-            {
-                vec![Cmd::FetchDetail(d.id)]
-            }
+            Some(d) if Self::fetches_detail(d) => vec![Cmd::FetchDetail(d.id)],
             _ => Vec::new(),
         }
     }
@@ -476,7 +590,7 @@ impl App {
     fn on_event(&mut self, event: Event, now: Instant) {
         match event {
             Event::Snapshot { downloads, totals } => {
-                self.history.record(&downloads, &totals);
+                self.history.record(&downloads, &totals, now);
                 self.totals = totals;
                 self.replace_downloads(downloads);
             }
@@ -511,6 +625,22 @@ impl App {
     fn replace_downloads(&mut self, downloads: Vec<DownloadSnapshot>) {
         let old_index = self.selected_index();
         self.downloads = downloads;
+        // Details of downloads that are gone or no longer running are stale (a
+        // finished download's segment strip would stay frozen).
+        let live: HashSet<DownloadId> = self
+            .downloads
+            .iter()
+            .filter(|d| Self::fetches_detail(d))
+            .map(|d| d.id)
+            .collect();
+        self.detail_cache.retain(|(id, _)| live.contains(id));
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|(id, _)| !live.contains(id))
+        {
+            self.detail = None;
+        }
         self.fix_selection(old_index);
     }
 
@@ -524,7 +654,9 @@ impl App {
             _ => Some(ids[fallback.unwrap_or(0).min(ids.len() - 1)]),
         };
         if self.detail.as_ref().map(|(id, _)| *id) != self.selected {
-            self.detail = None;
+            self.detail = self
+                .selected
+                .and_then(|id| self.take_cached_detail(id).map(|d| (id, d)));
         }
         self.list_offset = self.list_offset.min(ids.len().saturating_sub(1));
     }
@@ -576,6 +708,17 @@ impl App {
         if keys::is_ctrl_c(&key) {
             return self.quit();
         }
+        // The rest of a paste burst that a popup submit cut short: dropped, so it
+        // does not act as dashboard keys.
+        if self
+            .submitted_at
+            .is_some_and(|at| now.saturating_duration_since(at) < PASTE_BURST)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
         match self.mode {
             Mode::Normal
                 if matches!(self.banner, Some(Banner::Incompatible(_)))
@@ -606,7 +749,7 @@ impl App {
                 }
                 Vec::new()
             }
-            Mode::Popup(_) => self.on_popup_key(key),
+            Mode::Popup(_) => self.on_popup_key(key, now),
         }
     }
 
@@ -741,6 +884,12 @@ impl App {
             return Some(d);
         }
         let text = match (action, d.queue_position) {
+            (Action::Limit, _)
+                if d.kind == EngineKindTag::Torrent
+                    && !matches!(d.state, WireState::Completed | WireState::Unknown) =>
+            {
+                TORRENT_LIMIT_TOAST.to_string()
+            }
             (Action::MoveUp, Some(_)) if !matches!(d.state, WireState::Unknown) => {
                 "already first in the queue".to_string()
             }
@@ -832,7 +981,7 @@ impl App {
         Vec::new()
     }
 
-    fn on_popup_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
+    fn on_popup_key(&mut self, key: KeyEvent, now: Instant) -> Vec<Cmd> {
         let Mode::Popup(popup) = &mut self.mode else {
             return Vec::new();
         };
@@ -909,13 +1058,28 @@ impl App {
                 }
             }
         };
-        match submitted {
-            Some(cmd) => {
-                self.mode = Mode::Normal;
-                vec![cmd]
+        let Some(cmd) = submitted else {
+            return Vec::new();
+        };
+        self.mode = Mode::Normal;
+        self.submitted_at = Some(now);
+        // Shown at once; the runtime fetches the daemon's settings afterwards, which
+        // also undoes this if the command failed.
+        match &cmd {
+            Cmd::SetGlobalLimits { down, up } => {
+                if let Some(s) = &mut self.settings {
+                    s.global_down_limit = *down;
+                    s.global_up_limit = *up;
+                }
             }
-            None => Vec::new(),
+            Cmd::SetLimit { id, bps } => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == *id) {
+                    d.limit = *bps;
+                }
+            }
+            _ => {}
         }
+        vec![cmd]
     }
 }
 
@@ -1028,7 +1192,8 @@ mod tests {
         assert!(a.detail.is_some());
         a.update(Msg::Key(KeyEvent::from(KeyCode::Down)), now);
         assert_eq!(a.selected, Some(2));
-        assert!(a.detail.is_none());
+        // Detail 2 arrived earlier: cached, shown at once.
+        assert!(matches!(a.detail, Some((2, _))));
     }
 
     #[test]

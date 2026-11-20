@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Sparkline, Widget};
 
-use super::{groups, spans, width};
+use super::{grey_out, groups, spans, stale, width};
 use crate::app::{Action, AddField, App, HitTarget, Mode, Popup};
 use crate::format;
 use crate::theme::Token;
@@ -39,8 +39,13 @@ fn stats(app: &App, buf: &mut Buffer, r: Rect) {
         t.style(Token::Dim),
         t.style(Token::Accent),
     );
-    let down = format::speed(tot.down_bps);
-    let up = format::speed(tot.up_bps);
+    // While the daemon is away the rates are unknown.
+    let stale = stale(app);
+    let (down, up) = if stale {
+        (format::speed(0), format::speed(0))
+    } else {
+        (format::speed(tot.down_bps), format::speed(tot.up_bps))
+    };
     let active = format!("{} active", tot.active);
     let queued = format!("{} queued", tot.queued);
     let done = format!("{} done", tot.completed);
@@ -110,6 +115,9 @@ fn stats(app: &App, buf: &mut Buffer, r: Rect) {
             .max(peak)
             .style(accent)
             .render(area, buf);
+    }
+    if stale {
+        grey_out(t, buf, r);
     }
 }
 
@@ -198,6 +206,9 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         if can(action) {
             v.push(hint(key, label, Some(c)));
         }
+    }
+    if !app.filter.is_empty() {
+        v.push(hint("Esc", "clear filter", Some(ESC)));
     }
     v.extend([
         hint("/", "filter", Some('/')),

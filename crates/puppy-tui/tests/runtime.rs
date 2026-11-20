@@ -13,7 +13,7 @@ use futures_util::Stream;
 use puppy_core::types::{DownloadId, EngineDetail};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Event, Settings, Totals, WireState};
 use puppy_tui::api::{ApiError, Connected, DaemonApi};
-use puppy_tui::app::{App, Banner, Cmd, Conn, Msg};
+use puppy_tui::app::{App, Banner, Cmd, CmdError, Conn, Msg};
 use puppy_tui::runtime::run_with;
 use puppy_tui::theme::{Theme, ThemeChoice};
 use ratatui::Terminal;
@@ -77,9 +77,9 @@ fn ctrl_c() -> Msg {
 
 /// What the fake does for one executed command.
 enum Exec {
-    Reply(Result<Option<Msg>, String>),
+    Reply(Result<Option<Msg>, CmdError>),
     /// Replies after this long.
-    Slow(Duration, Result<Option<Msg>, String>),
+    Slow(Duration, Result<Option<Msg>, CmdError>),
     Hang,
 }
 
@@ -168,7 +168,7 @@ impl DaemonApi for FakeApi {
         }
     }
 
-    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, String> {
+    async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, CmdError> {
         self.executed.lock().unwrap().push(cmd.clone());
         if cmd == Cmd::RestartDaemon {
             let next = self.after_restart.lock().unwrap().take();
@@ -452,9 +452,18 @@ async fn detail_fetched_on_tick() {
         ),
     );
     let (_tx, input) = input();
-    // The first tick is at 500 ms.
+    // Selecting it on connect fetches at once, before the first tick (500 ms).
     let (app, _) = run_for(&api, input, 0.4).await;
-    assert!(app.detail.is_none());
+    assert!(matches!(app.detail, Some((1, _))), "{:?}", app.detail);
+    let fetches = |api: &FakeApi| {
+        api.executed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == Cmd::FetchDetail(1))
+            .count()
+    };
+    assert_eq!(fetches(&api), 1);
     let (_tx, input2) = self::input();
     let api2 = Arc::new(
         FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Active)])]).with_exec(
@@ -472,7 +481,8 @@ async fn detail_fetched_on_tick() {
         "{:?}",
         app.detail
     );
-    assert!(api2.executed.lock().unwrap().contains(&Cmd::FetchDetail(1)));
+    // Then every tick polls it.
+    assert_eq!(fetches(&api2), 2);
     // A failing detail fetch is not a toast.
     let api3 = Arc::new(
         FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Active)])])
@@ -967,4 +977,79 @@ fn banner_sits_under_the_title_at_every_size() {
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| draw(&mut app, f)).unwrap();
     assert!(text(term.backend().buffer()).contains(Banner::INCOMPATIBLE));
+}
+
+// ---------------------------------------------------------------------------------
+// Final fix wave
+
+/// A fake whose settings change with `SetGlobalLimits`/`SetMaxActive` (unless
+/// `fail_max`) and whose `FetchSettings` reports them.
+fn settings_api(fail_max: bool) -> Arc<FakeApi> {
+    let current = Arc::new(Mutex::new(settings()));
+    Arc::new(
+        FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Completed)])]).with_exec(move |c| {
+            let mut s = current.lock().unwrap();
+            match c {
+                Cmd::SetGlobalLimits { down, up } => {
+                    s.global_down_limit = *down;
+                    s.global_up_limit = *up;
+                    Exec::Reply(Ok(None))
+                }
+                Cmd::SetMaxActive(_) if fail_max => Exec::Reply(Err("the daemon said no".into())),
+                Cmd::SetMaxActive(n) => {
+                    s.max_active = *n;
+                    Exec::Reply(Ok(None))
+                }
+                Cmd::FetchSettings => Exec::Reply(Ok(Some(Msg::Settings(s.clone())))),
+                _ => Exec::Reply(Ok(None)),
+            }
+        }),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_limits_refresh_the_footer() {
+    let api = settings_api(false);
+    let (tx, input) = input();
+    send_after(
+        &tx,
+        Duration::from_millis(200),
+        vec![
+            key('L'),
+            key('2'),
+            key('M'),
+            Msg::Key(KeyEvent::from(KeyCode::Enter)),
+        ],
+    );
+    let (app, frames) = run_for(&api, input, 1.0).await;
+    assert!(
+        last(&frames).contains("limit: ↓ 2.0 MiB/s"),
+        "{}",
+        last(&frames)
+    );
+    assert_eq!(
+        app.settings.as_ref().unwrap().global_down_limit,
+        Some(2 << 20)
+    );
+    let executed = api.executed.lock().unwrap().clone();
+    let set = executed
+        .iter()
+        .position(|c| matches!(c, Cmd::SetGlobalLimits { .. }))
+        .unwrap();
+    assert!(
+        executed[set..].contains(&Cmd::FetchSettings),
+        "{executed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_max_active_reverts_via_refresh() {
+    let api = settings_api(true);
+    let (tx, input) = input();
+    send_after(&tx, Duration::from_millis(200), vec![key('+')]);
+    let (app, frames) = run_for(&api, input, 1.0).await;
+    assert_eq!(app.settings.as_ref().unwrap().max_active, 3);
+    let f = last(&frames);
+    assert!(f.contains("max 3"), "{f}");
+    assert!(f.contains("max active: the daemon said no"), "{f}");
 }

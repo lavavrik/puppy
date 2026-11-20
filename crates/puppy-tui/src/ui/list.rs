@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Widget;
 
-use super::{centered, groups, panel, spans, state_icon, text, width};
+use super::{as_shown, centered, grey_out, groups, panel, spans, stale, state_icon, text, width};
 use crate::app::{App, Conn, HitTarget};
 use crate::format;
 use crate::theme::{Theme, Token};
@@ -103,10 +103,16 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     let partial = inner.height % ROW_LINES == 1 && offset + cap < count;
     let shown = cap + usize::from(partial);
     let mut hits = Vec::with_capacity(shown);
+    let stale = stale(app);
     for (k, d) in app.visible_iter().skip(offset).take(shown).enumerate() {
         let lines = if k == cap { 1 } else { ROW_LINES };
         let rect = Rect::new(inner.x, inner.y + k as u16 * ROW_LINES, inner.width, lines);
-        ctx.row(buf, rect, d, Some(offset + k) == sel_index);
+        ctx.row(
+            buf,
+            rect,
+            &as_shown(d, stale),
+            Some(offset + k) == sel_index,
+        );
         hits.push((rect, HitTarget::ListRow(d.id)));
     }
     app.hits.extend(hits);
@@ -114,7 +120,7 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     if count > cap {
         scrollbar(&t, buf, area, inner, offset, cap, count);
     }
-    if matches!(app.conn, Conn::Reconnecting { .. }) {
+    if stale {
         grey_out(&t, buf, inner);
     }
 }
@@ -183,21 +189,6 @@ fn scrollbar(
     for k in pos..pos + thumb {
         if let Some(cell) = buf.cell_mut((x, inner.y + k as u16)) {
             cell.set_symbol("┃").set_style(t.style(Token::BorderFocus));
-        }
-    }
-}
-
-/// The list while the daemon is away: everything in the dim colour.
-fn grey_out(t: &Theme, buf: &mut Buffer, inner: Rect) {
-    for y in inner.y..inner.bottom() {
-        for x in inner.x..inner.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                if t.mono {
-                    cell.modifier.insert(Modifier::DIM);
-                } else {
-                    cell.fg = t.p.dim;
-                }
-            }
         }
     }
 }

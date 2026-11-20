@@ -136,7 +136,11 @@ fn slow_or_different_row_clicks_are_not_double() {
     click(&mut a, r1.x, r1.y, now);
     assert!(click(&mut a, r1.x, r1.y, now + Duration::from_millis(500)).is_empty());
     click(&mut a, r1.x, r1.y, now + Duration::from_millis(600));
-    assert!(click(&mut a, r2.x, r2.y, now + Duration::from_millis(700)).is_empty());
+    // Selecting another row only fetches its detail.
+    assert_eq!(
+        click(&mut a, r2.x, r2.y, now + Duration::from_millis(700)),
+        vec![Cmd::FetchDetail(2)]
+    );
 }
 
 #[test]

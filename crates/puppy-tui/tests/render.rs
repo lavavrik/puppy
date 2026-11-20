@@ -720,7 +720,7 @@ fn narrow_detail_keeps_engine_section() {
     let mut a = app(vec![active(1, "ubuntu.iso")]);
     a.detail = Some((1, http_detail()));
     let r = render(&mut a, 90, 30);
-    assert!(find(&r, "Speed history").is_some(), "{r:#?}");
+    assert!(find(&r, "speed · last 60 s").is_some(), "{r:#?}");
 }
 
 /// The fg of the first full-block bar cell on the list row of `name`.
@@ -942,6 +942,7 @@ fn demo_render_print() {
         failed: 2,
     };
     let mut h = puppy_tui::app::History::default();
+    let t0 = Instant::now();
     for i in 0..80u64 {
         let mut d = a.downloads.clone();
         d[0].down_bps = (5 + (i * 7 % 13)) * MIB;
@@ -949,7 +950,7 @@ fn demo_render_print() {
             down_bps: (8 + i % 9) * MIB,
             ..Default::default()
         };
-        h.record(&d, &totals);
+        h.record(&d, &totals, t0 + std::time::Duration::from_secs(i));
     }
     a.history = h;
     for (w, hh) in [(120u16, 32u16), (90, 30), (80, 24)] {
@@ -1015,4 +1016,117 @@ fn filter_cursor_never_on_ellipsis() {
     assert!(pos.x < 80);
     assert_ne!(buf[(pos.x, 0)].symbol(), "…");
     assert_eq!(buf[(pos.x - 1, 0)].symbol(), "…");
+}
+
+// ---------------------------------------------------------------------------------
+// Final fix wave
+
+#[test]
+fn detail_placeholder_reserves_the_http_height() {
+    // The sections above the engine part do not move when the detail arrives.
+    let detail = EngineDetail::Http {
+        segments: Vec::new(),
+        connections: 1,
+        resumable: true,
+    };
+    for (w, h) in [(80u16, 24u16), (80, 30), (120, 24)] {
+        let mut a = app(vec![active(1, "ubuntu.iso")]);
+        let before = render(&mut a, w, h);
+        a.detail = Some((1, detail.clone()));
+        let after = render(&mut a, w, h);
+        let head = |r: &[String]| find(r, "speed · last 60 s");
+        if h >= 30 {
+            assert!(head(&before).is_some(), "{w}×{h}: {before:#?}");
+        }
+        assert_eq!(head(&before), head(&after), "{w}×{h}");
+        assert_eq!(
+            find(&before, "No detail yet"),
+            find(&after, "Segments"),
+            "{w}×{h}"
+        );
+    }
+}
+
+#[test]
+fn truecolor_paints_the_background_everywhere() {
+    for theme in [
+        truecolor(),
+        Theme::detect(ThemeChoice::Light, &|k| {
+            (k == "COLORTERM").then(|| "truecolor".to_string())
+        }),
+    ] {
+        // An empty dashboard: every cell but the title badge is on the palette's bg.
+        let mut a = app_with(theme, vec![]);
+        let buf = render_buf(&mut a, 100, 30);
+        let badge = theme.style(puppy_tui::theme::Token::Badge).bg;
+        for c in buf.content() {
+            assert!(c.bg == theme.p.bg || Some(c.bg) == badge, "{c:?}");
+        }
+        // With popups and toasts (which clear their area): no cell is left on the
+        // terminal's own background.
+        let mut a = app_with(theme, many(5));
+        a.mode = Mode::Popup(Popup::Help);
+        a.push_toast("hello", puppy_tui::app::ToastKind::Info, Instant::now());
+        for (w, h) in [(120, 32), (80, 24), (40, 10)] {
+            let buf = render_buf(&mut a, w, h);
+            for c in buf.content() {
+                assert_ne!(c.bg, Color::Reset, "{w}×{h} {c:?}");
+                assert_ne!(c.fg, Color::Reset, "{w}×{h} {c:?}");
+            }
+        }
+    }
+    // ANSI and mono keep the terminal's background.
+    let ansi = Theme::detect(ThemeChoice::Dark, &|_| None);
+    let mut a = app_with(ansi, vec![]);
+    let buf = render_buf(&mut a, 100, 30);
+    assert!(buf.content().iter().any(|c| c.bg == Color::Reset));
+}
+
+#[test]
+fn disconnected_dims_footer_and_detail_and_hides_speeds() {
+    let mut a = app(vec![active(1, "ubuntu.iso")]);
+    a.totals.down_bps = 5 * MIB;
+    a.conn = Conn::Reconnecting { attempt: 1 };
+    let buf = render_buf(&mut a, 120, 32);
+    let r = rows(&buf);
+    let stats = &r[r.len() - 2];
+    assert!(stats.contains("↓ —") && stats.contains("↑ —"), "{stats:?}");
+    assert!(!stats.contains("MiB/s"), "{stats:?}");
+    let dim = a.theme.p.dim;
+    let y = (r.len() - 2) as u16;
+    for x in 0..120 {
+        let c = &buf[(x, y)];
+        if c.symbol() != " " {
+            assert_eq!(c.fg, dim, "stats x={x} {c:?}");
+        }
+    }
+    // The detail pane: speed and ETA unknown, all dim.
+    let (dx, dy) = find_xy(&buf, "Downloaded").unwrap();
+    let speed_row = &r[usize::from(dy) + 1];
+    let eta_row = &r[usize::from(dy) + 2];
+    assert!(speed_row.contains("Speed      —"), "{speed_row:?}");
+    assert!(eta_row.contains("ETA        —"), "{eta_row:?}");
+    for y in dy..dy + 4 {
+        for x in dx..119 {
+            let c = &buf[(x, y)];
+            if c.symbol() != " " && c.symbol() != "│" && c.symbol() != "╯" {
+                assert_eq!(c.fg, dim, "detail ({x},{y}) {c:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn footer_offers_clearing_an_active_filter() {
+    let mut a = app(vec![active(1, "ubuntu.iso")]);
+    let hints = render(&mut a, 160, 40).pop().unwrap();
+    assert!(!hints.contains("Esc clear filter"), "{hints:?}");
+    a.filter = TextInput::with_value("ubu");
+    let hints = render(&mut a, 160, 40).pop().unwrap();
+    assert!(hints.contains("Esc clear filter"), "{hints:?}");
+    assert!(
+        a.hits
+            .iter()
+            .any(|(_, t)| *t == HitTarget::FooterKey('\u{1b}'))
+    );
 }
