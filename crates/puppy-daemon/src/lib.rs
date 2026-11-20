@@ -1,5 +1,6 @@
 //! Puppy daemon library: platform paths and configuration.
 
+pub mod budget;
 pub mod config;
 pub mod paths;
 pub mod store;
