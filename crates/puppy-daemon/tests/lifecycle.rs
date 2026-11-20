@@ -339,6 +339,21 @@ async fn directory_at_socket_path_is_not_removed() {
     std::fs::remove_dir_all(env.socket_path()).unwrap();
 }
 
+/// A state file written by a newer puppy is never touched: the daemon refuses to start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newer_state_refuses_to_start() {
+    let env = Env::new();
+    let paths = env.paths();
+    let text = r#"{"version": 2, "next_id": 9, "order": [], "downloads": []}"#;
+    std::fs::write(&paths.state_file, text).unwrap();
+    let r = tokio::time::timeout(TIMEOUT, run_daemon(env.opts(None)))
+        .await
+        .unwrap();
+    let e = r.expect_err("daemon must refuse to start");
+    assert!(format!("{e:#}").contains("newer puppy"), "{e:#}");
+    assert_eq!(std::fs::read_to_string(&paths.state_file).unwrap(), text);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unreadable_state_refuses_to_start() {
     let env = Env::new();

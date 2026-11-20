@@ -21,6 +21,18 @@ pub enum StoreError {
         #[source]
         source: std::io::Error,
     },
+    /// The file was written by a newer daemon (state format `found`; this one reads up
+    /// to `supported`). It is left untouched; the caller must not overwrite it.
+    #[error(
+        "state file {} is from a newer puppy (format {found}, this one supports {supported}); \
+         upgrade puppy",
+        path.display()
+    )]
+    TooNew {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 const CURRENT_VERSION: u32 = 1;
@@ -198,9 +210,11 @@ impl Store {
         self.inner.writes.load(Ordering::SeqCst)
     }
 
-    /// Missing => default. Corrupt or version != 1 => quarantined as
-    /// `state.json.corrupt-<unix-seconds>[-n]`, warned, default. Any other read error, or a
-    /// failed quarantine, is an error so the caller never overwrites the user's real list.
+    /// Missing => default. A newer format (`version` above the supported one, whatever
+    /// the rest looks like) => [`StoreError::TooNew`], file untouched. Corrupt or an
+    /// older version => quarantined as `state.json.corrupt-<unix-seconds>[-n]`, warned,
+    /// default. Any other read error, or a failed quarantine, is an error so the caller
+    /// never overwrites the user's real list.
     pub async fn load(&self) -> Result<PersistedState, StoreError> {
         let path = &self.inner.path;
         let unreadable = |source| StoreError::Unreadable {
@@ -214,6 +228,18 @@ impl Store {
             }
             Err(e) => return Err(unreadable(e)),
         };
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("version")?.as_u64());
+        if let Some(found) = version
+            && found > u64::from(CURRENT_VERSION)
+        {
+            return Err(StoreError::TooNew {
+                path: path.clone(),
+                found: u32::try_from(found).unwrap_or(u32::MAX),
+                supported: CURRENT_VERSION,
+            });
+        }
         match serde_json::from_slice::<PersistedState>(&bytes) {
             Ok(st) if st.version == CURRENT_VERSION => Ok(st),
             Ok(st) => {
@@ -395,11 +421,41 @@ mod tests {
         assert_eq!(corrupt_files(d.path()).len(), 2);
     }
 
+    /// A newer daemon's state file is refused, never quarantined or overwritten.
     #[tokio::test]
-    async fn future_version_is_quarantined() {
+    async fn future_version_is_refused() {
+        let (d, s) = store();
+        let f = d.path().join("state.json");
+        // Possibly with fields this version does not know.
+        let mut v = serde_json::to_value(sample(3)).unwrap();
+        v["version"] = (CURRENT_VERSION + 1).into();
+        v["new_field"] = true.into();
+        let bytes = serde_json::to_vec(&v).unwrap();
+        std::fs::write(&f, &bytes).unwrap();
+        match s.load().await {
+            Err(StoreError::TooNew {
+                found, supported, ..
+            }) => {
+                assert_eq!((found, supported), (CURRENT_VERSION + 1, CURRENT_VERSION));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(corrupt_files(d.path()).is_empty());
+        assert_eq!(std::fs::read(&f).unwrap(), bytes);
+        // Even a newer file this version cannot parse at all.
+        std::fs::write(&f, br#"{"version": 9, "downloads": "changed shape"}"#).unwrap();
+        assert!(matches!(
+            s.load().await,
+            Err(StoreError::TooNew { found: 9, .. })
+        ));
+        assert!(corrupt_files(d.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_version_is_quarantined() {
         let (d, s) = store();
         let mut st = sample(3);
-        st.version = 2;
+        st.version = 0;
         std::fs::write(
             d.path().join("state.json"),
             serde_json::to_vec(&st).unwrap(),
