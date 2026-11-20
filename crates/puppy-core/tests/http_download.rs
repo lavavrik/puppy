@@ -689,8 +689,20 @@ async fn probe_errors_are_classified() {
     assert!(!e.is_transient(), "{e}");
 }
 
-/// Progress under a low limit, sampled once per second for 4 s after the first byte.
-async fn progress_per_second(f: impl FnOnce(&mut ServerCfg)) -> Vec<u64> {
+/// How a download progresses under a 32 KiB/s limit, observed for 4 s after the first
+/// byte by sampling `done_bytes` every 50 ms.
+struct LowLimitProgress {
+    /// Bytes done over the whole observation.
+    total: u64,
+    /// Longest time without any progress.
+    longest_stall: Duration,
+    /// Bytes done in each 1 s sliding window (step 50 ms).
+    windows: Vec<u64>,
+}
+
+async fn observe_low_limit(f: impl FnOnce(&mut ServerCfg)) -> LowLimitProgress {
+    const SAMPLE: Duration = Duration::from_millis(50);
+    const PER_SECOND: usize = 20;
     let s = server(f).await;
     let dir = tempfile::tempdir().unwrap();
     let c = cfg(dir.path());
@@ -708,40 +720,69 @@ async fn progress_per_second(f: impl FnOnce(&mut ServerCfg)) -> Vec<u64> {
     )
     .await
     .unwrap();
-    let mut last = wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT)
+    let first = wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT)
         .await
         .done_bytes;
-    let mut deltas = Vec::new();
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let start = Instant::now();
+    let (mut last, mut last_change) = (first, start);
+    let mut longest_stall = Duration::ZERO;
+    let mut samples = vec![first];
+    // An interval rather than repeated sleeps, so late wake-ups do not add up.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + SAMPLE, SAMPLE);
+    for _ in 0..4 * PER_SECOND {
+        tick.tick().await;
         let done = dl.status().done_bytes;
-        deltas.push(done - last);
-        last = done;
+        let now = Instant::now();
+        if done != last {
+            longest_stall = longest_stall.max(now - last_change);
+            (last, last_change) = (done, now);
+        }
+        samples.push(done);
     }
+    longest_stall = longest_stall.max(Instant::now() - last_change);
     dl.cancel(true).await;
-    deltas
+    LowLimitProgress {
+        total: last - first,
+        longest_stall,
+        windows: samples
+            .windows(PER_SECOND + 1)
+            .map(|w| w[PER_SECOND] - w[0])
+            .collect(),
+    }
 }
 
-/// A low limit gives smooth progress (every second about the limit's worth), not
-/// stalls followed by bursts of whole network chunks.
+/// A low limit gives smooth progress, not stalls followed by bursts of whole network
+/// chunks (without slicing, a 64 KiB chunk at 32 KiB/s means 2 s of nothing, then 64 KiB).
+///
+/// The limiter grants 16 KiB slices here, two per second, so progress normally pauses for
+/// about 0.5 s and a 1 s window holds one to three grants depending on phase. The bounds
+/// leave room for one late wake-up on a loaded CI runner (macOS-Intel once showed a whole
+/// sampled second without a grant, while instrumented runs there measured writes under
+/// 1 ms and sidecar fsyncs of a few ms, and never reproduced it), without letting the
+/// stall-then-burst pattern through.
 #[tokio::test]
 async fn low_limit_progresses_smoothly() {
-    for (what, deltas) in [
-        ("segmented", progress_per_second(|c| c.len = 4 * MIB).await),
+    for (what, p) in [
+        ("segmented", observe_low_limit(|c| c.len = 4 * MIB).await),
         (
             "single stream",
-            progress_per_second(|c| {
+            observe_low_limit(|c| {
                 c.len = 4 * MIB;
                 c.ranges = false;
             })
             .await,
         ),
     ] {
-        for d in &deltas {
-            assert!(
-                (16 * KIB..=64 * KIB).contains(d),
-                "{what}: per-second progress {deltas:?}"
-            );
-        }
+        let mut sorted = p.windows.clone();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        let detail = format!(
+            "{what}: {} bytes in 4 s, longest stall {:?}, median 1 s window {median}, \
+             windows {:?}",
+            p.total, p.longest_stall, p.windows
+        );
+        assert!(p.longest_stall < Duration::from_millis(1500), "{detail}");
+        assert!((16 * KIB..=48 * KIB).contains(&median), "{detail}");
+        assert!((64 * KIB..=192 * KIB).contains(&p.total), "{detail}");
     }
 }
