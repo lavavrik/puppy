@@ -287,10 +287,17 @@ impl Inner {
         };
         let ctl = e.job.take().unwrap_or_default();
         let want_pause = ctl.pause;
+        // Chosen before the restart: queued at the front (as right after the choice).
+        let mut to_front = false;
         let next = match outcome {
             Outcome::Restored => {
                 let engine = e.engine.expect("a job has an engine");
                 match self.engines[engine].status(id) {
+                    // Nothing seeds a seeding download the engine does not hold.
+                    None if matches!(e.state, DownloadState::Seeding { .. }) => {
+                        e.held = false;
+                        DownloadState::Completed
+                    }
                     None => {
                         e.held = false;
                         e.state.clone()
@@ -311,9 +318,12 @@ impl Inner {
                             // The engine no longer has it seeding (its counters were
                             // lost): resumed through the queue, which completes it.
                             DownloadState::Paused if seeding => DownloadState::Queued,
-                            // Its choice was lost: it downloads everything once resumed.
+                            // Stored while choosing, but the engine has the choice already
+                            // (made just before the daemon stopped): queued at the front,
+                            // as right after the choice.
                             DownloadState::Paused if e.state == DownloadState::ChoosingFiles => {
-                                DownloadState::Paused
+                                to_front = true;
+                                DownloadState::Queued
                             }
                             _ => e.state.clone(),
                         }
@@ -391,6 +401,10 @@ impl Inner {
             }
         };
         self.transition(id, e, next, &mut fx);
+        if to_front {
+            st.order.retain(|x| *x != id);
+            st.order.insert(0, id);
+        }
         fx
     }
 }

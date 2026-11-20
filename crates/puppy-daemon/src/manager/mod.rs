@@ -447,11 +447,7 @@ impl Inner {
                 if is_seeding(&e.state) {
                     self.seeding_finished(id, e);
                 } else {
-                    e.rec.finished_unix = Some(now_unix());
-                    self.emit(Event::Completed {
-                        id,
-                        name: e.rec.name.clone().unwrap_or_default(),
-                    });
+                    self.data_completed(id, e);
                 }
                 if e.held
                     && let Some(engine) = e.engine
@@ -461,11 +457,15 @@ impl Inner {
                 e.held = false;
             }
             DownloadState::Seeding { .. } => {
-                e.rec.finished_unix = Some(now_unix());
                 e.seeding_finished_sent = false;
-                self.emit(Event::Completed {
+                self.data_completed(id, e);
+            }
+            // Its data is downloaded again: completing then is news again.
+            DownloadState::NeedsAttention { reason } if reason.is_resumable() => {
+                e.rec.finished_unix = None;
+                self.emit(Event::NeedsAttention {
                     id,
-                    name: e.rec.name.clone().unwrap_or_default(),
+                    reason: reason.into(),
                 });
             }
             DownloadState::Failed { reason, transient } => self.emit(Event::Failed {
@@ -486,6 +486,18 @@ impl Inner {
             e.retry = None;
         }
         true
+    }
+
+    /// The data of `e` is complete: emits `Completed`, unless it was already (a restore
+    /// retried, or the daemon stopped before recording the seeding state).
+    fn data_completed(&self, id: DownloadId, e: &mut Entry) {
+        if e.rec.finished_unix.is_none() {
+            e.rec.finished_unix = Some(now_unix());
+            self.emit(Event::Completed {
+                id,
+                name: e.rec.name.clone().unwrap_or_default(),
+            });
+        }
     }
 
     /// Emits `SeedingFinished` for `e`, once per seeding.
@@ -584,6 +596,11 @@ impl Inner {
             return false;
         };
         let Some(status) = self.engines[engine].status(id) else {
+            // Nothing seeds a seeding download its engine lost.
+            if is_seeding(&e.state) {
+                e.held = false;
+                return self.transition(id, e, DownloadState::Completed, fx);
+            }
             return false;
         };
         Self::record_status(e, &status);
@@ -758,7 +775,19 @@ impl Inner {
             );
             calls.abort_all();
         }
-        self.persist(&self.lock());
+        {
+            // What the engines learned since the last look (e.g. a magnet's name from
+            // its metadata) is kept too.
+            let mut st = self.lock();
+            for (id, e) in st.entries.iter_mut() {
+                if let (Some(engine), true) = (e.engine, e.held)
+                    && let Some(status) = self.engines[engine].status(*id)
+                {
+                    Self::record_status(e, &status);
+                }
+            }
+            self.persist(&st);
+        }
         self.store.close().await;
     }
 }
@@ -970,6 +999,102 @@ mod tests {
                 Event::SeedingFinished { id: 2 }
             ]
         );
+        // Completed already (a restore retried): no second `Completed`.
+        let mut e = entry(DownloadState::Paused);
+        e.rec.finished_unix = Some(1);
+        assert!(inner.transition(3, &mut e, DownloadState::Completed, &mut fx));
+        let mut e = entry(DownloadState::Active);
+        e.rec.finished_unix = Some(1);
+        assert!(inner.transition(4, &mut e, seeding(0), &mut fx));
+        assert_eq!(drain(&mut rx), Vec::<Event>::new());
+        // A failed re-check clears it: completing again is news again.
+        assert!(inner.transition(
+            4,
+            &mut e,
+            DownloadState::NeedsAttention {
+                reason: puppy_core::types::AttentionReason::ValidationFailed {
+                    detail: puppy_core::types::RECHECK_FAILED.into()
+                }
+            },
+            &mut fx
+        ));
+        assert_eq!(e.rec.finished_unix, None);
+        assert!(matches!(
+            drain(&mut rx)[..],
+            [Event::NeedsAttention { id: 4, .. }]
+        ));
+    }
+
+    /// A torrent engine that holds nothing (it lost every download).
+    struct Empty;
+
+    #[async_trait::async_trait]
+    impl Engine for Empty {
+        fn kind(&self) -> puppy_core::engine::EngineKind {
+            puppy_core::engine::EngineKind::Torrent
+        }
+        fn accepts(&self, _: &Source) -> bool {
+            true
+        }
+        async fn add(
+            &self,
+            id: DownloadId,
+            _: puppy_core::types::AddRequest,
+            _: puppy_core::engine::StartMode,
+            _: puppy_core::engine::AddOptions,
+        ) -> Result<puppy_core::engine::Added, EngineError> {
+            Err(EngineError::NotFound(id))
+        }
+        async fn pause(&self, id: DownloadId) -> Result<(), EngineError> {
+            Err(EngineError::NotFound(id))
+        }
+        async fn resume(&self, id: DownloadId) -> Result<(), EngineError> {
+            Err(EngineError::NotFound(id))
+        }
+        async fn remove(&self, id: DownloadId, _: bool) -> Result<(), EngineError> {
+            Err(EngineError::NotFound(id))
+        }
+        fn status(&self, _: DownloadId) -> Option<puppy_core::types::DownloadStatus> {
+            None
+        }
+        fn detail(&self, _: DownloadId) -> Option<puppy_core::types::EngineDetail> {
+            None
+        }
+        fn set_download_limit(&self, _: DownloadId, _: Option<u64>) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn set_global_download_budget(&self, _: Option<u64>) {}
+        fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
+            broadcast::channel(1).1
+        }
+    }
+
+    /// A seeding download its engine does not hold is completed, never stuck seeding
+    /// (which would also keep the daemon from idling out).
+    #[tokio::test]
+    async fn seeding_without_its_engine_falls_back_to_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("state.json"));
+        let m = Manager::start(vec![Arc::new(Empty)], store, Config::default())
+            .await
+            .unwrap();
+        let inner = &m.inner;
+        // Held, but the engine lost it: the next look completes it.
+        let mut e = entry(seeding(0));
+        e.held = true;
+        e.rec.finished_unix = Some(1);
+        inner.lock().entries.insert(1, e);
+        assert!(!m.is_idle());
+        inner.on_engine_change(0, None);
+        assert_eq!(inner.lock().entries[&1].state, DownloadState::Completed);
+        assert!(!inner.lock().entries[&1].held);
+        // Not held at all: pausing it completes it.
+        let mut e = entry(seeding(0));
+        e.rec.finished_unix = Some(1);
+        inner.lock().entries.insert(2, e);
+        m.pause(2).await.unwrap();
+        assert_eq!(inner.lock().entries[&2].state, DownloadState::Completed);
+        assert!(m.is_idle());
     }
 
     #[test]

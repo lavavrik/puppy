@@ -75,6 +75,12 @@ impl Manager {
             .iter()
             .position(|e| e.accepts(&req.source))
             .ok_or_else(|| ManagerError::BadRequest("unsupported source".into()))?;
+        // What the engine can check now fails the add before it gets an id.
+        match inner.engines[engine].validate_add(&req).await {
+            Ok(()) => {}
+            Err(EngineError::Invalid(m)) => return Err(ManagerError::BadRequest(m)),
+            Err(e) => return Err(e.into()),
+        }
         let id = {
             let mut st = inner.lock();
             if st.shutting_down {
@@ -320,6 +326,7 @@ impl Manager {
                 e.rec.name = None;
                 e.rec.path = None;
                 e.rec.total_bytes = None;
+                e.rec.finished_unix = None;
                 e.state = DownloadState::Queued;
                 None
             };
@@ -488,9 +495,11 @@ impl Manager {
         Ok(())
     }
 
-    /// Sets a torrent's own seeding targets (`None` fields: the global ones), kept with
-    /// the download (restore uses them) and applied at once if its engine holds it. A
-    /// negative or non-finite ratio ⇒ `BadRequest`.
+    /// Sets a torrent's own seeding targets, replacing its whole policy: a `None` field
+    /// inherits the global value (read live). Applied at once if its engine holds it,
+    /// and kept with the download (restore uses it) once the engine took it. A negative
+    /// or non-finite ratio ⇒ `BadRequest`; a completed torrent (seeding is over) ⇒
+    /// `InvalidState`.
     pub async fn set_seed(&self, id: DownloadId, policy: SeedPolicy) -> Result<()> {
         if policy.ratio.is_some_and(|r| !r.is_finite() || r < 0.0) {
             return Err(ManagerError::BadRequest(
@@ -502,14 +511,19 @@ impl Manager {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
             let engine = torrent_engine(inner, e)?;
-            e.rec.request.seed = Some(policy.clone());
-            let held = e.held;
-            inner.persist(&st);
+            if e.state == DownloadState::Completed {
+                return Err(ManagerError::InvalidState("seeding has finished".into()));
+            }
             // Not held: used when it is added (an add in flight catches up).
-            held.then_some(engine)
+            e.held.then_some(engine)
         };
         if let Some(engine) = engine {
-            ignore_not_found(inner.engines[engine].set_seed(id, policy).await)?;
+            ignore_not_found(inner.engines[engine].set_seed(id, policy.clone()).await)?;
+        }
+        let mut st = inner.lock();
+        if let Some(e) = st.entries.get_mut(&id) {
+            e.rec.request.seed = Some(policy);
+            inner.persist(&st);
         }
         Ok(())
     }
@@ -538,16 +552,30 @@ impl Inner {
             let Some(e) = st.entries.get_mut(&id) else {
                 return;
             };
-            let (Some(engine), true, None, DownloadState::Active | DownloadState::Seeding { .. }) =
-                (e.engine, e.held, &e.job, &e.state)
-            else {
-                return;
+            let seeding = matches!(e.state, DownloadState::Seeding { .. });
+            let status = match (e.engine, e.held, &e.job, &e.state) {
+                (
+                    Some(engine),
+                    true,
+                    None,
+                    DownloadState::Active | DownloadState::Seeding { .. },
+                ) => self.engines[engine].status(id),
+                (_, _, None, DownloadState::Seeding { .. }) => None,
+                _ => return,
             };
-            let Some(status) = self.engines[engine].status(id) else {
+            let Some(status) = status else {
+                // Nothing seeds a seeding download its engine does not hold.
+                if seeding {
+                    e.held = false;
+                    if self.transition(id, e, DownloadState::Completed, &mut fx) {
+                        self.persist(&st);
+                    }
+                }
+                drop(st);
+                self.apply(fx);
                 return;
             };
             Self::record_status(e, &status);
-            let seeding = matches!(e.state, DownloadState::Seeding { .. });
             let next = match status.state {
                 DownloadState::Paused if seeding => return,
                 s @ (DownloadState::Paused

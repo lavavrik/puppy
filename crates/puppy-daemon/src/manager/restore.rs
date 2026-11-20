@@ -22,7 +22,8 @@ impl Inner {
     /// - Seeding (a torrent): restored into the engine by a job, which has it go on
     ///   seeding (live, holding no slot) unless its targets are met already (then
     ///   `Completed`) or its data fails the check (then `NeedsAttention`).
-    /// - ChoosingFiles (a torrent): restored by a job, still choosing.
+    /// - ChoosingFiles (a torrent): restored by a job, still choosing (queued at the
+    ///   front if its engine has its choice already); without a path: queued.
     /// - Active without a path (never got past the probe): queued.
     /// - Paused/Failed/NeedsAttention without a path: kept as they are.
     /// - No engine accepts the source: failed.
@@ -67,6 +68,8 @@ impl Inner {
                 (StoredState::Completed, _) => DownloadState::Completed,
                 // Nothing to seed from.
                 (StoredState::Seeding, _) if !restore => DownloadState::Completed,
+                // Never got its contents recorded: added again (and asked again).
+                (StoredState::ChoosingFiles, Some(_)) if !restore => DownloadState::Queued,
                 (_, None) => DownloadState::Failed {
                     reason: "unsupported source".into(),
                     transient: false,

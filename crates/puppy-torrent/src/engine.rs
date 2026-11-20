@@ -2616,6 +2616,27 @@ impl Engine for TorrentEngine {
         self.shared.events.subscribe()
     }
 
+    /// A `.torrent` with a pre-selection: the selection must fit the torrent's files
+    /// (`Invalid` naming the problem, files numbered from 1). A file that cannot be read
+    /// or parsed is left to `add`, which reports it as before; magnets are known only
+    /// after their metadata (an unusable choice then waits in `ChoosingFiles`).
+    async fn validate_add(&self, req: &AddRequest) -> Result<(), EngineError> {
+        let (Source::TorrentFile { path }, FileChoice::Select { selection }) =
+            (&req.source, &req.files)
+        else {
+            return Ok(());
+        };
+        let Ok(bytes) = source::read_torrent_file(path).await else {
+            return Ok(());
+        };
+        let Ok(info) = source::parse_torrent(&bytes) else {
+            return Ok(());
+        };
+        selection::resolve(&info.torrent_files(), selection)
+            .map(drop)
+            .map_err(EngineError::Invalid)
+    }
+
     /// The torrent's files, once its contents are known (a `.torrent` at once, a magnet
     /// once its metadata has been fetched).
     async fn list_files(&self, id: DownloadId) -> Result<Vec<TorrentFile>, EngineError> {

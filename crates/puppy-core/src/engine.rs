@@ -160,6 +160,13 @@ pub trait Engine: Send + Sync + 'static {
     /// removed for good (not held by the engine anymore). Default: nothing.
     async fn forget(&self, _id: DownloadId) {}
 
+    /// Checks up front, before the download gets an id, what can be checked locally
+    /// and quickly (e.g. a torrent file's pre-selection against its contents).
+    /// `Invalid` names the problem. Default: nothing to check.
+    async fn validate_add(&self, _req: &AddRequest) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     /// The files of a torrent. Default: unsupported.
     async fn list_files(&self, _id: DownloadId) -> Result<Vec<TorrentFile>, EngineError> {
         Err(EngineError::Unsupported("file listing"))

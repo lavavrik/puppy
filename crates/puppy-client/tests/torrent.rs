@@ -427,6 +427,7 @@ async fn http_only_daemon_never_starts_the_torrent_session() {
 /// Other multi-file torrents (different info hashes from `MULTI`).
 const MULTI_B: &[(&str, usize)] = &[("x/c.bin", 200 * KIB), ("d.bin", 100 * KIB + 7)];
 const MULTI_C: &[(&str, usize)] = &[("e.bin", 500 * KIB), ("f/g.bin", 500 * KIB + 3)];
+const MULTI_D: &[(&str, usize)] = &[("h.bin", 100 * KIB), ("i/j.bin", 100 * KIB + 5)];
 /// Seeding stops after a second; the ratio trigger is off.
 const SEED_1S: &str = "[torrent]\nseed_ratio = 0\nseed_time = \"1s\"\n";
 
@@ -686,6 +687,17 @@ async fn seeding_then_completed_via_daemon() {
         .position(|e| matches!(e, Event::SeedingFinished { .. }));
     assert!(completed_at < finished_at, "{evs:?}");
     assert_files(&env.dl_dir().join(MULTI_NAME));
+    assert_eq!(
+        call_err(
+            &c,
+            Request::SetSeed {
+                id,
+                policy: SeedPolicy::default(),
+            },
+        )
+        .await,
+        ErrorCode::InvalidState
+    );
     env.shutdown(d, c).await;
 }
 
@@ -755,7 +767,8 @@ async fn slots_ignore_choosing_and_seeding() {
     let a = Seeder::start(MULTI).await;
     let b = Seeder::start(MULTI_B).await;
     let cs = Seeder::start_with_limit(MULTI_C, SLOW).await;
-    let env = Env::with_seeders(&[&a, &b, &cs]);
+    let dd = Seeder::start(MULTI_D).await;
+    let env = Env::with_seeders(&[&a, &b, &cs, &dd]);
     let (d, c) = env.start().await;
     call_ok(&c, Request::SetMaxActive { n: 1 }).await;
 
@@ -798,7 +811,17 @@ async fn slots_ignore_choosing_and_seeding() {
     .await;
     assert!(is_seeding(&snapshot(&c, ida).await));
     assert_eq!(snapshot(&c, idb).await.state, WireState::ChoosingFiles);
-    // The choice queues it at the front; it waits for the slot.
+    // Waiting for the slot, added before the choice.
+    let idd = c
+        .add(
+            env.torrent_req_into(&dd, env.dl_dir().join("d")),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&c, idd).await.queue_position, Some(0));
+    // The choice queues it at the front, ahead of D; it waits for the slot.
     call_ok(&c, select(idb, &[0])).await;
     let sb = snapshot(&c, idb).await;
     assert!(
@@ -806,8 +829,20 @@ async fn slots_ignore_choosing_and_seeding() {
         "chosen while the slot is busy: {sb:?}"
     );
     assert_eq!(sb.queue_position, Some(0));
+    assert_eq!(snapshot(&c, idd).await.queue_position, Some(1));
     call_ok(&c, Request::Pause { id: idc }).await;
+    watch(&c, idb, "chosen torrent starting", |s| {
+        s.state != WireState::Queued
+    })
+    .await;
+    assert_eq!(
+        snapshot(&c, idd).await.state,
+        WireState::Queued,
+        "D overtook B"
+    );
     watch(&c, idb, "chosen torrent done", is_done).await;
+    // B seeds without its slot: D goes next.
+    watch(&c, idd, "D done", is_done).await;
     env.shutdown(d, c).await;
 }
 
@@ -961,5 +996,87 @@ async fn failed_recheck_resumes_through_a_slot() {
         matches!(s.state, WireState::Starting | WireState::Active)
     })
     .await;
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_preselection_of_a_torrent_file_fails_up_front() {
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(&seeder);
+    let (d, c) = env.start().await;
+    let mut req = env.torrent_req(&seeder);
+    req.files = FileChoice::Select {
+        selection: Selection {
+            indices: vec![98],
+            globs: Vec::new(),
+        },
+    };
+    match c.add(req, false, None).await {
+        Err(ClientError::Daemon { code, message }) => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert!(
+                message.contains("file 99 doesn't exist") && message.contains("2 files"),
+                "{message}"
+            );
+        }
+        other => panic!("added: {other:?}"),
+    }
+    let mut req = env.torrent_req(&seeder);
+    req.files = FileChoice::Select {
+        selection: Selection {
+            indices: Vec::new(),
+            globs: vec!["*.mkv".into()],
+        },
+    };
+    assert!(matches!(
+        c.add(req, false, None).await,
+        Err(ClientError::Daemon {
+            code: ErrorCode::BadRequest,
+            ..
+        })
+    ));
+    assert_eq!(c.list().await.unwrap(), Vec::new(), "no download created");
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_keeps_magnet_choosing() {
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(&seeder);
+    let (d, c) = env.start().await;
+    let req = AddRequest {
+        source: Source::Magnet {
+            uri: seeder.magnet.clone(),
+        },
+        output_dir: Some(env.dl_dir()),
+        filename: None,
+        context: RequestContext::default(),
+        files: FileChoice::Ask,
+        seed: None,
+    };
+    let id = c.add(req, false, None).await.unwrap();
+    watch(&c, id, "choosing files", |s| {
+        s.state == WireState::ChoosingFiles
+    })
+    .await;
+    env.shutdown(d, c).await;
+    assert_eq!(
+        env.state_json()["downloads"][0]["state"]["kind"],
+        "choosing_files"
+    );
+
+    // Its contents were kept: still choosing after the restart, files listed.
+    let (d, c) = env.start().await;
+    let seen = watch(&c, id, "restored choosing", |s| {
+        s.state == WireState::ChoosingFiles && s.total_bytes == Some(total(MULTI))
+    })
+    .await;
+    assert_eq!(seen.last().unwrap().name, MULTI_NAME);
+    let files = list_files(&c, id).await;
+    assert_eq!(files.len(), 2);
+    let ib = files.iter().position(|f| f.path == "sub/b.bin").unwrap();
+    call_ok(&c, select(id, &[ib])).await;
+    let seen = watch(&c, id, "chosen magnet done", is_done).await;
+    assert_eq!(seen.last().unwrap().done_bytes, MULTI[1].1 as u64);
     env.shutdown(d, c).await;
 }
