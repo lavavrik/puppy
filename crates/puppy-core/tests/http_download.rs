@@ -352,11 +352,11 @@ async fn filename_collision() {
 
 #[tokio::test]
 async fn work_stealing_splits_lagging_segment() {
-    // One connection drops early and lags behind; finished workers steal its tail.
+    // The first segment's connection is slow; the others finish and steal its tail.
     let s = server(|c| {
         c.len = 2 * MIB;
-        c.bytes_per_sec = Some(MIB);
-        c.fail_after_bytes_once = Some(16 * KIB);
+        c.slow_range_start = Some(0);
+        c.slow_bytes_per_sec = Some(128 * KIB);
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
@@ -586,4 +586,35 @@ async fn compressed_response_fails_without_writing() {
         assert_eq!(st.done_bytes, 0);
         assert!(!added.path.exists());
     }
+}
+
+#[tokio::test]
+async fn idle_transfer_does_not_rewrite_sidecar() {
+    // 1 KiB/s: the first 16 KiB chunk takes 16 s, so nothing changes for a while.
+    let s = server(|c| {
+        c.len = 64 * KIB;
+        c.bytes_per_sec = Some(KIB);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.flush_interval_ms = 20;
+    let (dl, added) = start(&s, dir.path(), c).await;
+    let sidecar = sidecar_path(&added.path);
+    let deadline = Instant::now() + TIMEOUT;
+    while !sidecar.exists() {
+        assert!(Instant::now() < deadline, "no sidecar written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let modified = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let before = modified(&sidecar);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(dl.status().done_bytes, 0);
+    assert_eq!(
+        modified(&sidecar),
+        before,
+        "sidecar rewritten without progress"
+    );
+    dl.cancel(true).await;
 }

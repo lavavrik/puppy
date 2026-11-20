@@ -36,6 +36,10 @@ pub struct ServerCfg {
     pub stall_headers: bool,
     /// `Content-Encoding` sent with GET responses (the body stays uncompressed).
     pub content_encoding: Option<String>,
+    /// Ranged responses starting exactly at this offset are throttled to
+    /// `slow_bytes_per_sec` instead of `bytes_per_sec` (makes one segment lag).
+    pub slow_range_start: Option<u64>,
+    pub slow_bytes_per_sec: Option<u64>,
 }
 
 impl Default for ServerCfg {
@@ -55,6 +59,8 @@ impl Default for ServerCfg {
             fail_after_bytes_once: None,
             stall_headers: false,
             content_encoding: None,
+            slow_range_start: None,
+            slow_bytes_per_sec: None,
         }
     }
 }
@@ -311,17 +317,17 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     if let Some(enc) = &cfg.content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, enc.as_str());
     }
+    let bps = match cfg.slow_range_start {
+        Some(at) if status == StatusCode::PARTIAL_CONTENT && start == at => cfg.slow_bytes_per_sec,
+        _ => cfg.bytes_per_sec,
+    };
     let fail_at = match cfg.fail_after_bytes_once {
         Some(n) if body_len > n && !sh.fail_used.swap(true, Ordering::SeqCst) => Some(n),
         _ => None,
     };
     builder
         .body(Body::from_stream(body_stream(
-            start,
-            body_len,
-            version,
-            cfg.bytes_per_sec,
-            fail_at,
+            start, body_len, version, bps, fail_at,
         )))
         .unwrap()
 }

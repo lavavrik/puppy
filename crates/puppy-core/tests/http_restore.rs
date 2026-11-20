@@ -7,7 +7,8 @@ use puppy_core::http::probe::build_client;
 use puppy_core::http::resume::{HttpResumeState, part_path, sidecar_path};
 use puppy_core::limiter::TokenBucket;
 use puppy_core::types::{
-    AddRequest, AttentionReason, DownloadState, DownloadStatus, RequestContext, Source,
+    AddRequest, AttentionReason, DownloadState, DownloadStatus, EngineDetail, RequestContext,
+    Source,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -759,4 +760,83 @@ async fn reresolve_to_different_file_needs_attention() {
     let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
     assert!(part_path(&added.path).exists());
+}
+
+#[tokio::test]
+async fn restore_after_kill_mid_steal() {
+    // Four 1 MiB segments; the first one's connection is slow, so the others finish
+    // and steal from it. The process is "killed" right after a steal.
+    let s = server(|c| {
+        c.bytes_per_sec = Some(512 * KIB);
+        c.slow_range_start = Some(0);
+        c.slow_bytes_per_sec = Some(32 * KIB);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = request(&s, dir.path());
+    let mut c = cfg(dir.path());
+    c.connections = 4;
+    c.min_segment_bytes = 64 * KIB;
+    let killed = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (dl, added, segs) = rt.block_on(async {
+            let (dl, added) = start(req, c).await;
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let EngineDetail::Http { segments, .. } = dl.detail() else {
+                    unreachable!()
+                };
+                if segments.len() > 4 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "no steal: {segments:?}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Let a periodic flush record the split.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let EngineDetail::Http { segments, .. } = dl.detail() else {
+                unreachable!()
+            };
+            (dl, added, segments)
+        });
+        let st = dl.status();
+        rt.shutdown_background();
+        drop(dl);
+        (added.path, st, segs)
+    });
+    let (final_path, st, segs) = tokio::task::spawn_blocking(move || killed.join().unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(st.state, DownloadState::Active), "{st:?}");
+    assert!(segs.len() > 4);
+
+    let state = HttpResumeState::load(&final_path).await.unwrap();
+    assert!(
+        state.segments.len() > 4,
+        "split not recorded: {:?}",
+        state.segments
+    );
+    let mut cursor = 0;
+    let part = std::fs::read(part_path(&final_path)).unwrap();
+    for seg in &state.segments {
+        assert_eq!(seg.start, cursor, "gap or overlap: {:?}", state.segments);
+        assert!(seg.done <= seg.end - seg.start);
+        for i in seg.start..seg.start + seg.done {
+            assert_eq!(part[i as usize], body_byte(i, 0), "unverified byte {i}");
+        }
+        cursor = seg.end;
+    }
+    assert_eq!(cursor, LEN);
+
+    s.set_cfg(|c| {
+        c.bytes_per_sec = None;
+        c.slow_range_start = None;
+    });
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
+    wait_completed(&dl).await;
+    assert_file(&final_path, LEN, 0);
+    assert_no_leftovers(&final_path);
 }

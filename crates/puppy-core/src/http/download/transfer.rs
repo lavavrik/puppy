@@ -4,6 +4,7 @@
 use super::files::{blocking, finalize, open_part};
 use super::{Inner, Plan, RunEnd, RunHandle, SPEED_SAMPLE, SegEntry};
 use crate::engine::{EngineError, EngineEvent};
+use crate::http::segments::Segment;
 use crate::http::single::run_single;
 use crate::http::worker::{SegmentShared, WorkerCtx, WorkerExit, run_segment};
 use crate::meter::SpeedMeter;
@@ -187,6 +188,9 @@ async fn drive(
     let mut speed_iv = tokio::time::interval(SPEED_SAMPLE);
     let mut meter = SpeedMeter::new();
     let mut last_done = inner.lock().plan.done_bytes();
+    // Segments as last flushed: an unchanged layout is not flushed again (an fsync is
+    // expensive, e.g. F_FULLFSYNC on macOS).
+    let mut flushed: Option<Vec<Segment>> = None;
 
     inner.schedule(ctx, pool);
     loop {
@@ -216,7 +220,7 @@ async fn drive(
                     WorkerExit::Fatal(reason) => return Outcome::Fatal(reason),
                 }
             }
-            _ = flush_iv.tick() => inner.flush(file).await,
+            _ = flush_iv.tick() => inner.flush_if_changed(file, &mut flushed).await,
             _ = speed_iv.tick() => {
                 let done = inner.lock().plan.done_bytes();
                 let now = std::time::Instant::now();

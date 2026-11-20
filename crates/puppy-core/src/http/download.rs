@@ -635,6 +635,18 @@ impl Inner {
         result
     }
 
+    /// [`Inner::flush`], unless the segments are unchanged since `last` was flushed.
+    async fn flush_if_changed(&self, file: &File, last: &mut Option<Vec<Segment>>) {
+        let state = self.resume_state();
+        if last.as_ref() == Some(&state.segments) {
+            return;
+        }
+        match state.flush(file).await {
+            Ok(()) => *last = Some(state.segments),
+            Err(e) => tracing::warn!(id = self.id, "resume sidecar flush failed: {e}"),
+        }
+    }
+
     /// Writes the sidecar (data fsync first). Failure is logged: an older sidecar only
     /// under-reports progress, which is safe.
     async fn flush(&self, file: &File) {
