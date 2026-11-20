@@ -91,6 +91,7 @@ impl Inner {
             source: source_display(&e.rec.request.source),
             name: status
                 .as_ref()
+                .filter(|s| !(e.is_placeholder_name(s.total_bytes) && e.rec.name.is_some()))
                 .map(|s| s.name.clone())
                 .or_else(|| e.rec.name.clone())
                 .unwrap_or_else(|| fallback_name(e)),

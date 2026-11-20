@@ -138,6 +138,7 @@ Torrents have their own section:
 [torrent]
 dht = true            # find peers through the DHT
 upnp = false          # ask the router to forward listen_port (UPnP)
+lsd = true            # find peers on the local network (local service discovery)
 listen_port = 42069   # incoming peer connections; an OS-assigned port if busy
 seed_ratio = 0.0      # reserved: v1 stops at completion (see below)
 ```
@@ -153,25 +154,35 @@ and the files in [packaging/](packaging/).
 Add a magnet link or the path of a `.torrent` file in the dashboard's add
 form (`a`). A `.torrent` is copied into the daemon's data directory
 (`torrents/<id>.torrent`) so the download can be restored after a restart
-even if the original is moved. A single-file torrent goes straight into the
-download directory; a multi-file torrent, or any magnet, into its own folder
-there. Things to know about v1:
+even if the original is moved; a magnet's metadata is kept there too once it
+has been fetched, so a restart needs no network to restore it. A single-file
+torrent goes straight into the download directory; a multi-file torrent, or
+any magnet, into its own folder there. Existing files are never overwritten:
+a taken folder name gets a counter (`Show (1)`), and a single file whose name
+is taken goes into a folder of its own (`file.iso (1)/file.iso`). The torrent
+engine starts (and opens its ports) only once the first torrent is added.
+Things to know about v1:
 
 - **No seeding after completion**: a finished torrent is stopped and shown as
   completed. `seed_ratio` is reserved for a later version.
 - **Piece map is an approximation**: the detail pane's piece map is derived
   from per-file progress (assuming each file fills in order), not from the
   exact set of verified pieces.
-- **Per-torrent speed limits** can only be set before the torrent starts,
-  i.e. while a magnet is still fetching its metadata (librqbit takes a
-  torrent's limit only when it is added); later the dashboard says so. The
-  global limits apply to torrents at any time.
-- **After a daemon restart** an unfinished torrent re-checks the data already
-  on disk before it goes on; its progress shows 0 until the check is done.
-- **Removing a torrent whose `.torrent` file is gone** (shown as "torrent file
+- **Per-torrent speed limits** can only be set while the torrent is queued,
+  before it starts (librqbit takes a torrent's limit only when it is added);
+  later the dashboard says so and the limit is not kept. The global limits
+  apply to torrents at any time.
+- **After a daemon restart** every unfinished torrent re-checks the data
+  already on disk before it goes on (there is no fast resume); its progress
+  shows 0 until the check is done, and a large library takes a while.
+- **Deleting a torrent's files** (also once it has completed) deletes exactly
+  the files the torrent lists, then its folders once empty; anything else in
+  them stays. A torrent whose `.torrent` file is gone (shown as "torrent file
   missing") leaves its files on disk, even when asked to delete them.
 - **DHT is on by default, UPnP is off.** Trackers and local peer discovery are
-  used too.
+  used too (`lsd = false` turns the latter off). If the torrent engine cannot
+  start, torrents fail with "torrent engine unavailable (see daemon log)" and
+  are retried automatically.
 
 State lives in the platform data directory (`~/.local/share/puppy`,
 `~/Library/Application Support/puppy` or `%APPDATA%\puppy`); the daemon's log

@@ -234,7 +234,7 @@ impl Inner {
             return;
         };
         e.held = true;
-        e.rec.name = Some(added.name.clone());
+        e.record_name(&added.name, added.total_bytes);
         e.rec.path = Some(added.path.clone());
         e.rec.total_bytes = added.total_bytes;
         if let Some(engine) = e.engine
@@ -285,8 +285,13 @@ impl Inner {
             Outcome::RestoreFailed(err) => {
                 tracing::warn!(id, "restoring failed: {err}");
                 e.held = false;
+                let reason = match &err {
+                    // Says it all (and the same as for a new add).
+                    EngineError::Unavailable(m) => m.clone(),
+                    _ => format!("restoring failed: {err}"),
+                };
                 DownloadState::Failed {
-                    reason: format!("restoring failed: {err}"),
+                    reason,
                     transient: err.is_transient(),
                 }
             }

@@ -193,10 +193,12 @@ impl Manager {
     }
 
     /// Removes the download from the engine (deleting its files with `delete_files`,
-    /// including a completed download's file) and from the list.
+    /// including a completed download's: the engine that downloaded it deletes them, see
+    /// `Engine::delete_completed`) and from the list. An engine that no longer holds the
+    /// download is told to forget it (`Engine::forget`).
     pub async fn remove(&self, id: DownloadId, delete_files: bool) -> Result<()> {
         let inner = &self.inner;
-        let (engine, final_file) = {
+        let (engine, final_files, forget) = {
             let mut st = inner.lock();
             entry_mut(&mut st, id)?;
             let e = st.entries.remove(&id).expect("checked above");
@@ -207,25 +209,30 @@ impl Manager {
                 // The job removes it from the engine once its engine call returns.
                 st.orphans.insert(id, (engine, delete_files));
             }
-            let engine = (e.held || e.job.is_some()).then_some(e.engine).flatten();
-            let final_file = (delete_files && e.state == DownloadState::Completed)
+            let in_engine = e.held || e.job.is_some();
+            let engine = in_engine.then_some(e.engine).flatten();
+            // Not held: the engine dropped it (completed) or never had it (or lost it).
+            let forget = (!in_engine).then_some(e.engine).flatten();
+            let final_files = (delete_files && e.state == DownloadState::Completed)
                 .then_some(e.rec.path)
-                .flatten();
+                .flatten()
+                .zip(forget);
             inner.persist(&st);
             inner.emit(Event::Removed { id });
-            (engine, final_file)
+            (engine, final_files, forget)
         };
         if let Some(engine) = engine
             && let Err(e) = ignore_not_found(inner.engines[engine].remove(id, delete_files).await)
         {
             tracing::warn!(id, "removing from the engine: {e}");
         }
-        if let Some(path) = final_file {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %path.display(), "cannot delete: {e}"),
-            }
+        if let Some((path, engine)) = final_files
+            && let Err(e) = inner.engines[engine].delete_completed(id, &path).await
+        {
+            tracing::warn!(path = %path.display(), "cannot delete: {e}");
+        }
+        if let Some(engine) = forget {
+            inner.engines[engine].forget(id).await;
         }
         inner.schedule();
         Ok(())
@@ -318,20 +325,26 @@ impl Manager {
     }
 
     /// Per-download limit in bytes/s (`None` or 0: unlimited); applied at once if the
-    /// engine holds the download. The limit is stored (and used from the next start)
-    /// even if the engine rejects it; the engine's error is returned.
+    /// engine holds the download. A limit the engine cannot take now
+    /// (`EngineError::Unsupported`, e.g. a running torrent) is not kept: the previous one
+    /// stays and the error is returned. Other engine errors are returned with the limit
+    /// stored (and used from the next start).
     pub fn set_limit(&self, id: DownloadId, bps: Option<u64>) -> Result<()> {
         let inner = &self.inner;
         let bps = normalize_limit(bps);
         let mut st = inner.lock();
         let e = entry_mut(&mut st, id)?;
-        e.rec.limit = bps;
-        let engine = e.held.then_some(e.engine).flatten();
-        inner.persist(&st);
-        match engine {
+        let previous = std::mem::replace(&mut e.rec.limit, bps);
+        let result = match e.held.then_some(e.engine).flatten() {
             Some(engine) => ignore_not_found(inner.engines[engine].set_download_limit(id, bps)),
             None => Ok(()),
+        };
+        if let Err(ManagerError::Engine(EngineError::Unsupported(_))) = &result {
+            e.rec.limit = previous;
+        } else {
+            inner.persist(&st);
         }
+        result
     }
 
     /// Global limits in bytes/s (`None` or 0: unlimited). The download limit is divided

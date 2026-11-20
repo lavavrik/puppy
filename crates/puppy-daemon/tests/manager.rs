@@ -848,7 +848,7 @@ fn stored_limit(env: &Env, id: DownloadId) -> Option<u64> {
 }
 
 #[tokio::test]
-async fn set_limit_is_stored_even_if_the_engine_rejects_it() {
+async fn set_limit_the_engine_cannot_take_is_not_kept() {
     let env = Env::new();
     let s = server(|c| {
         c.len = 4096 * KIB;
@@ -856,17 +856,26 @@ async fn set_limit_is_stored_even_if_the_engine_rejects_it() {
     })
     .await;
     let (m, gated, id) = gated_active(&env, &s).await;
-    gated.fail_limit.store(true, Ordering::SeqCst);
-    let err = m.set_limit(id, Some(100 * KIB)).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::Unsupported);
-    assert_eq!(snap(&m, id).limit, Some(100 * KIB));
-    // Persisted by `set_limit` itself (nothing else changes while it transfers, so
-    // nothing else would persist it within the store's debounce).
+    m.set_limit(id, Some(50 * KIB)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while stored_limit(&env, id) != Some(100 * KIB) {
+    while stored_limit(&env, id) != Some(50 * KIB) {
         assert!(Instant::now() < deadline, "the limit was not persisted");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    gated.fail_limit.store(true, Ordering::SeqCst);
+    let err = m.set_limit(id, Some(100 * KIB)).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::Unsupported);
+    assert_eq!(
+        snap(&m, id).limit,
+        Some(50 * KIB),
+        "the rejected limit was kept"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        stored_limit(&env, id),
+        Some(50 * KIB),
+        "the rejected limit was stored"
+    );
     m.shutdown().await;
 }
 

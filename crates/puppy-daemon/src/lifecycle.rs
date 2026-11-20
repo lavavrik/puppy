@@ -58,6 +58,28 @@ pub struct DaemonOptions {
 #[derive(Debug, Clone, Default)]
 pub struct TorrentTestOptions {
     pub initial_peers: Vec<SocketAddr>,
+    /// Filled with the daemon's torrent engine once it is built.
+    pub probe: TorrentProbe,
+}
+
+/// A look at the daemon's torrent engine (tests).
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct TorrentProbe(Arc<std::sync::OnceLock<Arc<TorrentEngine>>>);
+
+impl TorrentProbe {
+    /// Whether the engine's librqbit session has been started (`None`: no engine yet).
+    pub fn session_started(&self) -> Option<bool> {
+        self.0.get().map(|e| e.session_started())
+    }
+}
+
+impl std::fmt::Debug for TorrentProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TorrentProbe")
+            .field(&self.session_started())
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for DaemonOptions {
@@ -220,10 +242,19 @@ async fn start_torrent_engine(
         data_dir: paths.data_dir.clone(),
         default_dir: download_dir,
         test_mode: test.is_some(),
-        test_initial_peers: test.map(|t| t.initial_peers).unwrap_or_default(),
+        test_initial_peers: test
+            .as_ref()
+            .map(|t| t.initial_peers.clone())
+            .unwrap_or_default(),
     };
     match TorrentEngine::new(opts).await {
-        Ok(engine) => Some(Arc::new(engine)),
+        Ok(engine) => {
+            let engine = Arc::new(engine);
+            if let Some(t) = test {
+                let _ = t.probe.0.set(engine.clone());
+            }
+            Some(engine)
+        }
         Err(e) => {
             tracing::error!("cannot start the torrent engine, running without torrents: {e}");
             None

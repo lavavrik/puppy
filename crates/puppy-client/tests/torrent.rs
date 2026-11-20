@@ -9,7 +9,9 @@ mod support;
 use puppy_client::Client;
 use puppy_core::config::HttpConfig;
 use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
-use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run_daemon};
+use puppy_daemon::lifecycle::{
+    DaemonOptions, RunOutcome, TorrentProbe, TorrentTestOptions, run_daemon,
+};
 use puppy_daemon::{Paths, SocketName};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, ReplyData, Request, WireState};
 use std::net::SocketAddr;
@@ -44,6 +46,7 @@ struct Env {
     home: tempfile::TempDir,
     socket: SocketName,
     peers: Vec<SocketAddr>,
+    probe: TorrentProbe,
 }
 
 impl Env {
@@ -52,6 +55,7 @@ impl Env {
             home: tempfile::tempdir().unwrap(),
             socket: socket_name(),
             peers: vec![seeder.addr],
+            probe: TorrentProbe::default(),
         }
     }
 
@@ -70,6 +74,7 @@ impl Env {
             engine: None,
             torrent_test: Some(TorrentTestOptions {
                 initial_peers: self.peers.clone(),
+                probe: self.probe.clone(),
             }),
         }
     }
@@ -214,5 +219,135 @@ async fn daemon_restart_restores_torrent() {
     let seen = watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
     assert_eq!(seen.last().unwrap().kind, EngineKindTag::Torrent);
     assert_files(&env.dl_dir().join(MULTI_NAME));
+    env.shutdown(d, c).await;
+}
+
+const USER_DATA: &[u8] = b"the user's own data";
+
+async fn remove(c: &Client, id: DownloadId, delete_files: bool) {
+    assert_eq!(
+        c.call(Request::Remove { id, delete_files }).await.unwrap(),
+        ReplyData::Done
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_fresh_add_never_overwrites_user_files() {
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(&seeder);
+    let mine = env.dl_dir().join(MULTI_NAME);
+    std::fs::create_dir_all(mine.join("sub")).unwrap();
+    for (rel, _) in MULTI {
+        std::fs::write(mine.join(rel), USER_DATA).unwrap();
+    }
+    let (d, c) = env.start().await;
+
+    let id = c.add(env.torrent_req(&seeder), false, None).await.unwrap();
+    let seen = watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
+    let elsewhere = env.dl_dir().join(format!("{MULTI_NAME} (1)"));
+    assert_eq!(seen.last().unwrap().path.as_deref(), Some(&*elsewhere));
+    assert_files(&elsewhere);
+    remove(&c, id, true).await;
+    for (rel, _) in MULTI {
+        assert_eq!(std::fs::read(mine.join(rel)).unwrap(), USER_DATA, "{rel}");
+        assert!(!elsewhere.join(rel).exists(), "{rel} of the torrent left");
+    }
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_remove_completed_torrent_deletes_its_files() {
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(&seeder);
+    std::fs::create_dir_all(env.dl_dir()).unwrap();
+    std::fs::write(env.dl_dir().join("unrelated.txt"), USER_DATA).unwrap();
+    let (d, c) = env.start().await;
+
+    let id = c.add(env.torrent_req(&seeder), false, None).await.unwrap();
+    watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
+    let folder = env.dl_dir().join(MULTI_NAME);
+    assert_files(&folder);
+    // The manager drops completed downloads from the engine: wait for that.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    remove(&c, id, true).await;
+    for (rel, _) in MULTI {
+        assert!(!folder.join(rel).exists(), "{rel} not deleted");
+    }
+    assert!(!folder.exists(), "the torrent's (now empty) folder is left");
+    assert!(env.dl_dir().is_dir(), "the download dir itself is kept");
+    assert_eq!(
+        std::fs::read(env.dl_dir().join("unrelated.txt")).unwrap(),
+        USER_DATA
+    );
+    let stored = env
+        .home
+        .path()
+        .join("data/torrents")
+        .join(format!("{id}.torrent"));
+    assert!(!stored.exists(), "stored .torrent copy left after removal");
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_restart_restores_magnet_offline_with_its_name() {
+    let seeder = Seeder::start_with_limit(MULTI, SLOW).await;
+    let env = Env::new(&seeder);
+    let (d, c) = env.start().await;
+    let req = AddRequest {
+        source: Source::Magnet {
+            uri: format!("{}&dn=placeholder", seeder.magnet),
+        },
+        output_dir: Some(env.dl_dir()),
+        filename: None,
+        context: RequestContext::default(),
+    };
+    let id = c.add(req, false, None).await.unwrap();
+    let seen = watch(&c, id, "transferring", |s| {
+        s.state == WireState::Active && s.done_bytes > 0
+    })
+    .await;
+    assert_eq!(seen.last().unwrap().name, MULTI_NAME);
+    env.shutdown(d, c).await;
+    drop(seeder); // offline from now on
+
+    let (d, c) = env.start().await;
+    let seen = watch(&c, id, "verified data", |s| s.done_bytes > 0).await;
+    assert!(
+        seen.iter().all(|s| s.name == MULTI_NAME),
+        "the placeholder name came back: {seen:?}"
+    );
+    assert_ne!(seen.last().unwrap().state, WireState::Completed);
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_only_daemon_never_starts_the_torrent_session() {
+    let server = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        len: 64 * KIB as u64,
+        ..Default::default()
+    })
+    .await;
+    let env = Env {
+        home: tempfile::tempdir().unwrap(),
+        socket: socket_name(),
+        peers: Vec::new(),
+        probe: TorrentProbe::default(),
+    };
+    let (d, c) = env.start().await;
+    let req = AddRequest {
+        source: Source::Http {
+            url: server.url("/file.bin"),
+        },
+        output_dir: Some(env.dl_dir()),
+        filename: Some("f.bin".into()),
+        context: RequestContext::default(),
+    };
+    let id = c.add(req, false, None).await.unwrap();
+    watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
+    assert_eq!(
+        env.probe.session_started(),
+        Some(false),
+        "an HTTP-only daemon opened torrent sockets"
+    );
     env.shutdown(d, c).await;
 }

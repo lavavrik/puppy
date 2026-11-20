@@ -31,7 +31,7 @@ use crate::store::{
     PersistedState, RuntimeSettings, Store, StoreError, StoredDownload, StoredState,
 };
 use puppy_core::engine::{Engine, EngineError, EngineEvent};
-use puppy_core::types::{DownloadId, DownloadState};
+use puppy_core::types::{DownloadId, DownloadState, Source};
 use puppy_proto::{ErrorCode, Event};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -150,6 +150,22 @@ impl Entry {
         }
     }
 
+    /// Whether `name` (reported by the engine with `total_bytes`) is only a placeholder
+    /// that must not replace a name already known: a magnet's before its metadata is
+    /// known (`dn` or `magnet <hash>`, its size unknown), e.g. while it is restored
+    /// from its link.
+    fn is_placeholder_name(&self, total_bytes: Option<u64>) -> bool {
+        matches!(self.rec.request.source, Source::Magnet { .. }) && total_bytes.is_none()
+    }
+
+    /// Records the name the engine reports, unless it is a placeholder and a better one
+    /// is known.
+    fn record_name(&mut self, name: &str, total_bytes: Option<u64>) {
+        if self.rec.name.is_none() || !self.is_placeholder_name(total_bytes) {
+            self.rec.name = Some(name.to_owned());
+        }
+    }
+
     /// Forgets a pending retry and resets the backoff (a user resumed or restarted).
     fn reset_retry(&mut self) {
         self.retry = None;
@@ -181,7 +197,7 @@ struct JobCtl {
 /// Engine calls to make once the state lock is released.
 #[derive(Default)]
 struct Effects {
-    /// Completed downloads the engine should drop (`remove(id, false)`).
+    /// Completed downloads the engine should drop (`drop_completed`).
     drop_completed: Vec<(usize, DownloadId)>,
 }
 
@@ -457,7 +473,7 @@ impl Inner {
     /// Copies what the engine knows about name, path and size into the record, and
     /// resets the retry backoff once a retried download is active and making progress.
     fn record_status(e: &mut Entry, status: &puppy_core::types::DownloadStatus) {
-        e.rec.name = Some(status.name.clone());
+        e.record_name(&status.name, status.total_bytes);
         e.rec.path = Some(status.path.clone());
         if status.total_bytes.is_some() {
             e.rec.total_bytes = status.total_bytes;
@@ -540,7 +556,7 @@ impl Inner {
         for (engine, id) in fx.drop_completed {
             let engine = self.engines[engine].clone();
             tokio::spawn(async move {
-                if let Err(e) = engine.remove(id, false).await
+                if let Err(e) = engine.drop_completed(id).await
                     && !matches!(e, EngineError::NotFound(_))
                 {
                     tracing::warn!(id, "dropping a completed download from its engine: {e}");
@@ -821,5 +837,35 @@ mod tests {
         assert_eq!(e.backoff, Some(Duration::from_secs(2)));
         Inner::record_status(&mut e, &status(DownloadState::Active, 501));
         assert_eq!(e.backoff, None);
+    }
+
+    /// A magnet restored from its link reports its `dn` until the metadata is back: that
+    /// placeholder does not replace the real name already recorded.
+    #[test]
+    fn magnet_placeholder_names_do_not_replace_known_ones() {
+        let mut e = entry(DownloadState::Paused);
+        e.rec.request.source = puppy_core::types::Source::Magnet {
+            uri: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=dn".into(),
+        };
+        let mut st = status(DownloadState::Paused, 0);
+        st.name = "dn".into();
+        st.total_bytes = None;
+        // Nothing known yet: the placeholder is better than nothing.
+        Inner::record_status(&mut e, &st);
+        assert_eq!(e.rec.name.as_deref(), Some("dn"));
+        e.rec.name = Some("Real Name".into());
+        Inner::record_status(&mut e, &st);
+        assert_eq!(e.rec.name.as_deref(), Some("Real Name"));
+        // Once the metadata is known, the engine's name wins.
+        st.name = "Real Name 2".into();
+        st.total_bytes = Some(1);
+        Inner::record_status(&mut e, &st);
+        assert_eq!(e.rec.name.as_deref(), Some("Real Name 2"));
+        // Not a magnet: always taken.
+        let mut e = entry(DownloadState::Paused);
+        e.rec.name = Some("old".into());
+        st.total_bytes = None;
+        Inner::record_status(&mut e, &st);
+        assert_eq!(e.rec.name.as_deref(), Some("Real Name 2"));
     }
 }
