@@ -26,8 +26,18 @@ fn unknown_subcommand_exit_2() {
     assert!(out.is_empty(), "{out}");
 }
 
-/// `puppy ls | head -1`: the reader is gone before `puppy` writes; it must exit 0
-/// without noise.
+#[test]
+fn help_and_version_exit_0() {
+    let env = Env::new();
+    for args in [&["--help"][..], &["--version"], &["ls", "--help"]] {
+        let (status, out, err) = env.run(args);
+        assert_eq!(status.code(), Some(0), "{args:?}: {err}");
+        assert!(!out.is_empty(), "{args:?}");
+    }
+}
+
+/// `puppy ls | head -1`: the reader is gone before `puppy` writes; the command still
+/// finishes and exits 0 without noise.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stdout_broken_pipe_is_quiet() {

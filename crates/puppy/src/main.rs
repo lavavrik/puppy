@@ -76,15 +76,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.command.is_none() && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
     {
-        eprintln!(
-            "puppy's dashboard needs an interactive terminal (try `puppy daemon` to run the background service)"
+        err(
+            "puppy's dashboard needs an interactive terminal (try `puppy daemon` to run the background service)",
         );
         return ExitCode::from(2);
     }
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("puppy: cannot start the async runtime: {e}");
+            err(format_args!("puppy: cannot start the async runtime: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -124,7 +124,7 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
     match outcome {
         RunOutcome::Exited => Ok(()),
         RunOutcome::AlreadyRunning => {
-            eprintln!("puppy: a daemon is already running; nothing to do");
+            err("puppy: a daemon is already running; nothing to do");
             Ok(())
         }
         RunOutcome::Forced => {
@@ -140,7 +140,7 @@ async fn dashboard(theme: Option<ThemeArg>) -> anyhow::Result<()> {
     let choice = match theme {
         Some(t) => t.into(),
         None => config.theme.parse().unwrap_or_else(|e| {
-            eprintln!("puppy: {e} in config.toml; using \"auto\"");
+            err(format_args!("puppy: {e} in config.toml; using \"auto\""));
             ThemeChoice::Auto
         }),
     };

@@ -1,10 +1,11 @@
-//! Output that is safe to pipe: a closed pipe (`puppy ls | head -1`) ends the process
-//! quietly with exit 0, and tables are aligned by display width.
+//! Output that is safe to pipe: a closed pipe (`puppy ls | head -1`) is noted, not fatal,
+//! and tables are aligned by display width.
 
 use puppy_tui::format::{display_safe, truncate};
 use serde::Serialize;
 use std::fmt::Display;
 use std::io::{ErrorKind, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
 /// Width of the gap between table columns.
@@ -18,16 +19,31 @@ fn is_closed_pipe(e: &std::io::Error) -> bool {
     e.kind() == ErrorKind::BrokenPipe || (cfg!(windows) && e.raw_os_error() == Some(232))
 }
 
-/// Writes `line` and a newline to stdout; a closed pipe exits 0 quietly.
+/// Set once a write found stdout closed (`puppy ls | head -1`).
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether stdout has been closed by its reader. Long-running commands stop on it.
+#[allow(dead_code)] // used by `watch`
+pub fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(Ordering::Relaxed)
+}
+
+/// Writes `line` and a newline to stdout. A closed pipe is not an error: it sets
+/// [`stdout_closed`] and later output is dropped, so the command still finishes its
+/// side effects and exits with its real code.
 pub fn out(line: impl Display) {
+    if stdout_closed() {
+        return;
+    }
     let mut stdout = std::io::stdout().lock();
     if let Err(e) = writeln!(stdout, "{line}") {
         if is_closed_pipe(&e) {
-            std::process::exit(0);
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+            return;
         }
         // Another stdout failure (e.g. disk full): nothing useful can be printed
         // there; say so on stderr and fail.
-        eprintln!("puppy: cannot write to stdout: {e}");
+        err(format_args!("puppy: cannot write to stdout: {e}"));
         std::process::exit(1);
     }
 }
