@@ -920,9 +920,12 @@ dependencies = [
  "dirs",
  "puppy-core",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
+ "tracing",
  "url",
 ]
 
