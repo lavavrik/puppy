@@ -18,6 +18,7 @@ tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
+humantime.workspace = true
 
 [dev-dependencies]
 puppy-daemon = { path = "../puppy-daemon" }

@@ -1055,3 +1055,56 @@ async fn failed_max_active_reverts_via_refresh() {
     assert!(f.contains("max 3"), "{f}");
     assert!(f.contains("max active: the daemon said no"), "{f}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn picker_commands_report_back_to_the_picker() {
+    let mut t = snap(1, "Show", WireState::ChoosingFiles);
+    t.kind = EngineKindTag::Torrent;
+    let files = vec![
+        puppy_core::types::TorrentFile {
+            index: 0,
+            path: "Show/a.mkv".into(),
+            size: 10,
+        },
+        puppy_core::types::TorrentFile {
+            index: 1,
+            path: "Show/b.mkv".into(),
+            size: 20,
+        },
+    ];
+    let api = Arc::new(FakeApi::new(vec![ok(vec![t])]).with_exec(move |c| match c {
+        Cmd::FetchFiles(id) => Exec::Reply(Ok(Some(Msg::Files(*id, files.clone())))),
+        Cmd::SelectFiles { .. } => Exec::Reply(Err(
+            "refusing to overwrite: a file of this torrent already exists".into(),
+        )),
+        _ => Exec::Reply(Ok(None)),
+    }));
+    let (tx, input) = input();
+    // The picker opens by itself; Enter on the first file sends the selection.
+    send_after(
+        &tx,
+        Duration::from_millis(300),
+        vec![Msg::Key(KeyEvent::from(KeyCode::Enter))],
+    );
+    let (app, frames) = run_for(&api, input, 1.0).await;
+    let actions = api.actions();
+    assert_eq!(actions[0], Cmd::FetchFiles(1));
+    assert!(
+        matches!(actions.get(1), Some(Cmd::SelectFiles { id: 1, .. })),
+        "{actions:?}"
+    );
+    // The refusal shows in the picker, not as a toast.
+    match &app.mode {
+        puppy_tui::app::Mode::Popup(puppy_tui::app::Popup::Picker(p)) => {
+            assert!(!p.submitting);
+            assert!(
+                p.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("already exists"))
+            );
+        }
+        m => panic!("{m:?}"),
+    }
+    assert!(app.toasts.is_empty(), "{:?}", app.toasts);
+    assert!(last(&frames).contains("refusing to overwrite"));
+}

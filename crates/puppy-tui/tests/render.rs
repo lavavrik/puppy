@@ -946,6 +946,30 @@ fn demo_render_print() {
             },
         ),
         snap(7, "notes.pdf", WireState::Paused),
+        {
+            let mut s = snap(
+                8,
+                "debian-13.1.0-amd64-netinst.iso",
+                WireState::Seeding {
+                    uploaded: 430 * MIB,
+                    ratio: 0.42,
+                    seeded_secs: 2880,
+                    ratio_target: Some(1.0),
+                    time_target_secs: Some(7200),
+                },
+            );
+            s.kind = EngineKindTag::Torrent;
+            s.up_bps = 12 * MIB / 10;
+            s.peers = Some(7);
+            s
+        },
+        {
+            let mut c = snap(9, "Big.Show.S01.1080p", WireState::ChoosingFiles);
+            c.kind = EngineKindTag::Torrent;
+            c.total_bytes = Some(12 * GIB);
+            c.done_bytes = 0;
+            c
+        },
     ];
     list[0].limit = Some(20 * MIB);
     let mut a = app(list);
@@ -1009,6 +1033,67 @@ fn demo_render_print() {
         puppy_tui::app::ToastKind::Error,
         now,
     );
+    let files: Vec<puppy_core::types::TorrentFile> = [
+        (
+            "Big.Show.S01.1080p/Season 01/Big.Show.S01E01.Pilot.1080p.mkv",
+            1480 * MIB,
+        ),
+        (
+            "Big.Show.S01.1080p/Season 01/Big.Show.S01E02.The.Second.One.1080p.mkv",
+            1350 * MIB,
+        ),
+        (
+            "Big.Show.S01.1080p/Season 01/Big.Show.S01E03.1080p.mkv",
+            1410 * MIB,
+        ),
+        ("Big.Show.S01.1080p/Season 01/Subs/en.srt", 80 * 1024),
+        ("Big.Show.S01.1080p/Season 01/Subs/de.srt", 78 * 1024),
+        ("Big.Show.S01.1080p/Extras/Behind.The.Scenes.mkv", 620 * MIB),
+        ("Big.Show.S01.1080p/Extras/Bloopers.mkv", 210 * MIB),
+        ("Big.Show.S01.1080p/Big.Show.S01.nfo", 3 * 1024),
+        ("Big.Show.S01.1080p/poster.jpg", 2 * MIB),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, (path, size))| puppy_core::types::TorrentFile {
+        index,
+        path: (*path).into(),
+        size: *size,
+    })
+    .collect();
+    let mut picker = puppy_tui::app::Picker::with_files(9, "Big.Show.S01.1080p", files);
+    // Subs and Bloopers off, the cursor on Extras/Bloopers.
+    picker.checked[3] = false;
+    picker.checked[4] = false;
+    picker.checked[6] = false;
+    picker.cursor = picker
+        .rows()
+        .iter()
+        .position(|&i| picker.nodes[i].name == "Bloopers.mkv")
+        .unwrap();
+    let mut filtered = picker.clone();
+    filtered.filtering = true;
+    filtered.filter = TextInput::with_value("mkv");
+    filtered.cursor = 0;
+    let mut refused = picker.clone();
+    refused.refused("refusing to overwrite: a file of this torrent already exists");
+    let mut seed = puppy_tui::app::SeedForm::new(
+        8,
+        &WireState::Seeding {
+            uploaded: 0,
+            ratio: 0.42,
+            seeded_secs: 2880,
+            ratio_target: Some(1.0),
+            time_target_secs: Some(7200),
+        },
+    );
+    seed.focus = 1;
+    let popups = popups.into_iter().chain([
+        ("file picker", Popup::Picker(Box::new(picker))),
+        ("file picker filtered", Popup::Picker(Box::new(filtered))),
+        ("file picker refused", Popup::Picker(Box::new(refused))),
+        ("seeding", Popup::Seed(seed)),
+    ]);
     for (what, p) in popups {
         a.mode = Mode::Popup(p);
         println!("--- 100×30 {what}");
@@ -1148,4 +1233,102 @@ fn footer_offers_clearing_an_active_filter() {
             .iter()
             .any(|(_, t)| *t == HitTarget::FooterKey('\u{1b}'))
     );
+}
+
+#[test]
+fn render_seeding_and_choosing_rows() {
+    let mut choosing = snap(1, "Show.S01", WireState::ChoosingFiles);
+    choosing.kind = EngineKindTag::Torrent;
+    choosing.note = Some("no file matched --files".into());
+    let mut seeding = snap(
+        2,
+        "debian.iso",
+        WireState::Seeding {
+            uploaded: 430 * MIB,
+            ratio: 0.42,
+            seeded_secs: 2880,
+            ratio_target: Some(1.0),
+            time_target_secs: Some(7200),
+        },
+    );
+    seeding.kind = EngineKindTag::Torrent;
+    seeding.up_bps = 12 * MIB / 10;
+    let mut open = snap(
+        3,
+        "open.iso",
+        WireState::Seeding {
+            uploaded: 0,
+            ratio: 0.5,
+            seeded_secs: 10,
+            ratio_target: None,
+            time_target_secs: None,
+        },
+    );
+    open.kind = EngineKindTag::Torrent;
+    let mut a = app(vec![choosing, seeding, open]);
+    let buf = render_buf(&mut a, 160, 40);
+    let r = rows(&buf);
+    let line = |name: &str| find(&r, name).unwrap_or_else(|| panic!("{name}: {r:#?}"));
+    let t = truecolor();
+    // Choosing files: ☐ in the warning colour, what to do on line 2 (+ the note).
+    let c = line("Show.S01");
+    assert!(r[c].contains('☐'), "{:?}", r[c]);
+    let (x, y) = find_xy(&buf, "Show.S01").unwrap();
+    let icon = (1..x).find(|&xx| buf[(xx, y)].symbol() == "☐").unwrap();
+    assert_eq!(buf[(icon, y)].fg, t.p.warn);
+    assert!(
+        r[c + 1].contains("choose files · press c"),
+        "{:?}",
+        r[c + 1]
+    );
+    assert!(
+        r[c + 1].contains("no file matched --files"),
+        "{:?}",
+        r[c + 1]
+    );
+    // Seeding: ⇅ in the ok colour, full bar and 100%, upload, ratio and time left.
+    let s = line("debian.iso");
+    assert!(r[s].contains('⇅') && r[s].contains("100%"), "{:?}", r[s]);
+    let (x, y) = find_xy(&buf, "debian.iso").unwrap();
+    let icon = (1..x).find(|&xx| buf[(xx, y)].symbol() == "⇅").unwrap();
+    assert_eq!(buf[(icon, y)].fg, t.p.ok);
+    assert!(
+        r[s + 1].contains("↑ 1.2 MiB/s · ratio 0.42/1.0 · 1:12:00 left"),
+        "{:?}",
+        r[s + 1]
+    );
+    assert_eq!(bar_fg(&buf, "debian.iso"), t.p.ok);
+    // No targets: just the ratio, nothing "left".
+    let o = line("open.iso");
+    assert!(r[o + 1].contains("ratio 0.50"), "{:?}", r[o + 1]);
+    assert!(
+        !r[o + 1].contains("left") && !r[o + 1].contains("/"),
+        "{:?}",
+        r[o + 1]
+    );
+    // Footer: `c choose files` for the choosing torrent, `s seeding` too.
+    let hints = r.last().unwrap();
+    assert!(
+        hints.contains("c choose files") && hints.contains("s seeding"),
+        "{hints:?}"
+    );
+    assert!(!hints.contains("p pause"), "{hints:?}");
+    // Detail pane: the note for the choosing torrent.
+    assert!(find(&r, "Note").is_some(), "{r:#?}");
+    // The seeding torrent: pause (stops seeding) and its seeding line in the detail.
+    a.selected = Some(2);
+    let r = render(&mut a, 160, 40);
+    let hints = r.last().unwrap();
+    assert!(
+        hints.contains("p pause") && hints.contains("s seeding"),
+        "{hints:?}"
+    );
+    assert!(!hints.contains("c choose files"), "{hints:?}");
+    let d = find(&r, "Seeding    ").unwrap_or_else(|| panic!("{r:#?}"));
+    assert!(
+        r[d].contains("ratio 0.42 / 1.0") && r[d].contains("48:00 / 2:00:00"),
+        "{:?}",
+        r[d]
+    );
+    assert!(r[d].contains("↑ 430.0 MiB"), "{:?}", r[d]);
 }

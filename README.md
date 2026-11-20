@@ -113,6 +113,8 @@ the dashboard only disconnects; the daemon and its downloads keep running.
 | `d` / `Delete`                    | Delete (asks to confirm) |
 | `R`                               | Restart (failed or needs-attention only) |
 | `l`                               | Speed limit for the selected download |
+| `c`                               | Choose a torrent's files (when it waits in `choosing`) |
+| `s`                               | Seeding ratio / time for a torrent |
 | `L`                               | Global speed limits |
 | `+` / `-`                         | Raise / lower the number of active downloads |
 | `Shift+↑` / `Shift+↓` (`K` / `J`) | Move in the queue |
@@ -279,7 +281,13 @@ Things to know about v1:
   occupy one of the `max_active` download slots.
 - **Choosing files**: `puppy add --files SPEC` downloads only some files of a
   torrent; `--choose` (or the file picker) waits for you in the `choosing`
-  state first. See "Command line".
+  state first. See "Command line". Torrents added from the dashboard always
+  ask: once a multi-file torrent's contents are known the file picker opens
+  (a folder tree with checkboxes; `Space` toggles, `a`/`n` all/none, `/`
+  filters, `←`/`→` fold, `Enter` on a file or `y` confirms). `Esc` leaves it
+  waiting; `c` reopens it. The folder layout is fixed when the torrent starts
+  waiting: if a file of it appears on disk meanwhile, choosing fails and the
+  torrent must be removed and added again.
 - **Piece map is an approximation**: the detail pane's piece map is derived
   from per-file progress (assuming each file fills in order), not from the
   exact set of verified pieces.

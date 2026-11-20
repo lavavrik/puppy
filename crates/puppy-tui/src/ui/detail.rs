@@ -73,7 +73,7 @@ pub(super) fn draw(app: &App, buf: &mut Buffer, area: Rect) {
         .map(|(_, e)| e);
     let engine = Engine::of(d, detail);
     let two_col = body.width >= TWO_COLUMNS;
-    let plan = Plan::new(body.height, two_col, &engine, body.width);
+    let plan = Plan::new(body.height, two_col, &engine, body.width, d);
     let mut c = Cursor {
         area: body,
         y: body.y,
@@ -130,8 +130,8 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(height: u16, two_col: bool, engine: &Engine, width: u16) -> Self {
-        let grid = if two_col { 4 } else { 6 };
+    fn new(height: u16, two_col: bool, engine: &Engine, width: u16, d: &DownloadSnapshot) -> Self {
+        let grid = if two_col { 4 } else { 6 } + extra_rows(d);
         let engine_min = match engine {
             Engine::Nothing => 0,
             Engine::Placeholder(_) | Engine::Http { .. } => HTTP_MIN,
@@ -375,7 +375,7 @@ fn header(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, pat
 
 fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two_col: bool) {
     let downloaded = match format::percent(d.done_bytes, d.total_bytes) {
-        Some(r) if !matches!(d.state, WireState::Completed) => {
+        Some(r) if !matches!(d.state, WireState::Completed | WireState::Seeding { .. }) => {
             format!("{} ({}%)", size_text(d), (r * 100.0).floor() as u32)
         }
         _ => size_text(d),
@@ -403,6 +403,7 @@ fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two
         ("Source", &source, Token::Text),
     ];
     let w = c.area.width;
+    let extra = extra_fields(d);
     if two_col {
         // Downloaded and Source get whole rows; the short values pair up.
         let col = w / 2;
@@ -426,6 +427,48 @@ fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two
             field(t, buf, r.x, r.y, r.width, key, value, tok);
         }
     }
+    // Seeding progress, or why the download is in its state: whole rows.
+    for (key, value, tok) in extra {
+        let Some(r) = c.line() else { return };
+        field(t, buf, r.x, r.y, w, key, &value, tok);
+    }
+}
+
+/// Rows [`extra_fields`] adds to the grid.
+fn extra_rows(d: &DownloadSnapshot) -> u16 {
+    u16::from(matches!(d.state, WireState::Seeding { .. })) + u16::from(d.note.is_some())
+}
+
+/// `Seeding  ratio 0.42 / 1.0 · 48:00 / 2:00:00 · ↑ 430.0 MiB` and the state's note.
+fn extra_fields(d: &DownloadSnapshot) -> Vec<(&'static str, String, Token)> {
+    let mut v = Vec::new();
+    if let WireState::Seeding {
+        uploaded,
+        ratio,
+        seeded_secs,
+        ratio_target,
+        time_target_secs,
+    } = &d.state
+    {
+        let ratio = match ratio_target {
+            Some(t) => format!("ratio {ratio:.2} / {}", crate::app::forms::ratio_text(*t)),
+            None => format!("ratio {ratio:.2}"),
+        };
+        let time = match time_target_secs {
+            Some(t) => format!(
+                "{} / {}",
+                format::eta(Some(*seeded_secs)),
+                format::eta(Some(*t))
+            ),
+            None => format!("{} seeded", format::eta(Some(*seeded_secs))),
+        };
+        let up = format!("↑ {}", format::bytes(*uploaded));
+        v.push(("Seeding", format!("{ratio} · {time} · {up}"), Token::Text));
+    }
+    if let Some(note) = &d.note {
+        v.push(("Note", format::display_safe(note).into_owned(), Token::Warn));
+    }
+    v
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -6,19 +6,21 @@ pub mod forms;
 pub mod history;
 pub mod input;
 pub mod keys;
+pub mod picker;
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use puppy_core::types::{AddRequest, DownloadId, EngineDetail};
+use puppy_core::types::{AddRequest, DownloadId, EngineDetail, SeedPolicy, Selection, TorrentFile};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Event, Settings, Totals, WireState};
 use ratatui::layout::{Position, Rect};
 
-pub use forms::{AddField, AddForm, GlobalLimitsForm, LimitForm};
+pub use forms::{AddField, AddForm, GlobalLimitsForm, LimitForm, SeedForm};
 pub use history::History;
 pub use input::TextInput;
 pub use keys::KeyAction;
+pub use picker::{Picker, PickerOutcome};
 
 use crate::theme::Theme;
 
@@ -96,6 +98,10 @@ pub enum Popup {
         delete_files: bool,
     },
     Help,
+    /// Choosing a torrent's files (`c`, or opened when a torrent starts waiting).
+    Picker(Box<Picker>),
+    /// A torrent's seeding policy (`s`).
+    Seed(SeedForm),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +122,12 @@ pub enum HitTarget {
     List,
     PopupInside,
     PopupCheckbox,
+    /// A popup's confirm button.
+    PopupButton,
+    /// A picker row (index in [`Picker::rows`]): a click toggles it.
+    PickerRow(usize),
+    /// A picker folder's fold arrow (row index).
+    PickerFold(usize),
 }
 
 pub type HitMap = Vec<(Rect, HitTarget)>;
@@ -194,6 +206,12 @@ pub enum Msg {
     Detail(DownloadId, Option<EngineDetail>),
     /// The daemon's settings, fetched again after changing them.
     Settings(Settings),
+    /// A torrent's file list ([`Cmd::FetchFiles`]).
+    Files(DownloadId, Vec<TorrentFile>),
+    /// [`Cmd::FetchFiles`] failed.
+    FilesFailed(DownloadId, CmdError),
+    /// The answer to [`Cmd::SelectFiles`].
+    Selected(DownloadId, Result<(), CmdError>),
     /// Quit (a termination signal).
     Quit,
 }
@@ -227,6 +245,18 @@ pub enum Cmd {
     },
     SetMaxActive(u16),
     FetchDetail(DownloadId),
+    /// Answered with [`Msg::Files`] (or [`Msg::FilesFailed`]).
+    FetchFiles(DownloadId),
+    /// Answered with [`Msg::Selected`]. Indices are 0-based (the wire's).
+    SelectFiles {
+        id: DownloadId,
+        selection: Selection,
+    },
+    /// Replaces a torrent's seeding policy.
+    SetSeed {
+        id: DownloadId,
+        policy: SeedPolicy,
+    },
     /// Answered with [`Msg::Settings`]; the runtime issues it after changing settings.
     FetchSettings,
     /// Stop the incompatible daemon (`U`); the runtime then reconnects, which starts
@@ -245,6 +275,10 @@ pub enum Action {
     Limit,
     MoveUp,
     MoveDown,
+    /// Open the file picker of a torrent waiting in "choosing files".
+    ChooseFiles,
+    /// Set a torrent's seeding policy.
+    Seed,
 }
 
 impl Action {
@@ -256,6 +290,8 @@ impl Action {
             Action::Restart => "restart",
             Action::Limit => "limit",
             Action::MoveUp | Action::MoveDown => "move",
+            Action::ChooseFiles => "choose files for",
+            Action::Seed => "set seeding for",
         }
     }
 }
@@ -317,6 +353,11 @@ pub struct App {
     last_click: Option<(DownloadId, Instant)>,
     /// When a popup was last submitted (paste burst guard, [`PASTE_BURST`]).
     submitted_at: Option<Instant>,
+    /// Torrents whose picker opened by itself this session (it does so once per
+    /// torrent; `c` reopens it).
+    asked: HashSet<DownloadId>,
+    /// The torrent whose file list was fetched to open its picker by itself.
+    auto_pending: Option<DownloadId>,
 }
 
 impl App {
@@ -345,6 +386,8 @@ impl App {
             banner: None,
             last_click: None,
             submitted_at: None,
+            asked: HashSet::new(),
+            auto_pending: None,
         }
     }
 
@@ -389,9 +432,13 @@ impl App {
         }
         match action {
             Action::Delete => true,
+            // Pausing a seeding torrent stops its seeding.
             Action::Pause => matches!(
                 d.state,
-                WireState::Queued | WireState::Starting | WireState::Active
+                WireState::Queued
+                    | WireState::Starting
+                    | WireState::Active
+                    | WireState::Seeding { .. }
             ),
             Action::Resume => matches!(d.state, WireState::Paused | WireState::Failed { .. }),
             Action::Restart => matches!(
@@ -405,6 +452,20 @@ impl App {
             Action::Limit => !matches!(d.state, WireState::Completed),
             Action::MoveUp => d.queue_position.is_some_and(|p| p > 0),
             Action::MoveDown => d.queue_position.is_some_and(|p| p + 1 < self.queue_len()),
+            Action::ChooseFiles => Self::choosing(d),
+            // While seeding, or ahead of it while the torrent still downloads.
+            Action::Seed => {
+                d.kind == EngineKindTag::Torrent
+                    && matches!(
+                        d.state,
+                        WireState::Seeding { .. }
+                            | WireState::Queued
+                            | WireState::Starting
+                            | WireState::Active
+                            | WireState::Paused
+                            | WireState::ChoosingFiles
+                    )
+            }
         }
     }
 
@@ -414,7 +475,10 @@ impl App {
         matches!(d.kind, EngineKindTag::Http | EngineKindTag::Torrent)
             && matches!(
                 d.state,
-                WireState::Active | WireState::Starting | WireState::Paused
+                WireState::Active
+                    | WireState::Starting
+                    | WireState::Paused
+                    | WireState::Seeding { .. }
             )
     }
 
@@ -505,7 +569,7 @@ impl App {
             Msg::Tick => self.on_tick(now),
             Msg::Daemon(event) => {
                 self.on_event(event, now);
-                Vec::new()
+                self.auto_open()
             }
             Msg::Connected {
                 version,
@@ -519,7 +583,7 @@ impl App {
                 self.totals = totals_of(&downloads, self.totals.down_bps, self.totals.up_bps);
                 self.history.prune(&downloads);
                 self.replace_downloads(downloads);
-                Vec::new()
+                self.auto_open()
             }
             Msg::Disconnected => {
                 self.conn = match self.conn {
@@ -543,19 +607,39 @@ impl App {
                 Vec::new()
             }
             Msg::CmdResult(outcome) => {
-                match outcome.result {
-                    Ok(()) => {}
-                    Err(CmdError::Unsupported(m)) => {
-                        self.push_toast(format!("{UNSUPPORTED_PREFIX}{m}"), ToastKind::Info, now);
-                    }
-                    Err(CmdError::Failed(e)) => {
-                        self.push_toast(format!("{}: {e}", outcome.label), ToastKind::Error, now);
-                    }
+                if let Err(e) = outcome.result {
+                    self.cmd_error(&outcome.label, e, now);
                 }
                 Vec::new()
             }
             Msg::Settings(settings) => {
                 self.settings = Some(settings);
+                Vec::new()
+            }
+            Msg::Files(id, files) => {
+                self.on_files(id, files);
+                Vec::new()
+            }
+            Msg::FilesFailed(id, e) => {
+                if self.auto_pending == Some(id) {
+                    self.auto_pending = None;
+                }
+                if matches!(&self.mode, Mode::Popup(Popup::Picker(p)) if p.id == id) {
+                    self.mode = Mode::Normal;
+                }
+                self.cmd_error("files", e, now);
+                Vec::new()
+            }
+            Msg::Selected(id, result) => {
+                let open = matches!(&self.mode, Mode::Popup(Popup::Picker(p)) if p.id == id);
+                match result {
+                    Ok(()) if open => self.mode = Mode::Normal,
+                    Ok(()) => {}
+                    Err(e) => match &mut self.mode {
+                        Mode::Popup(Popup::Picker(p)) if p.id == id => p.refused(&e.to_string()),
+                        _ => self.cmd_error("choose files", e, now),
+                    },
+                }
                 Vec::new()
             }
             Msg::Quit => self.quit(),
@@ -577,6 +661,72 @@ impl App {
                 }
                 Vec::new()
             }
+        }
+    }
+
+    /// The toast for a failed command.
+    fn cmd_error(&mut self, label: &str, e: CmdError, now: Instant) {
+        match e {
+            CmdError::Unsupported(m) => {
+                self.push_toast(format!("{UNSUPPORTED_PREFIX}{m}"), ToastKind::Info, now);
+            }
+            CmdError::Failed(e) => {
+                self.push_toast(format!("{label}: {e}"), ToastKind::Error, now);
+            }
+        }
+    }
+
+    /// Whether `d` waits in "choosing files".
+    fn choosing(d: &DownloadSnapshot) -> bool {
+        d.kind == EngineKindTag::Torrent && matches!(d.state, WireState::ChoosingFiles)
+    }
+
+    /// Fetches the file list of a torrent that started waiting for a file choice, to
+    /// open its picker — once per torrent, only while no popup is open; the selection
+    /// goes first.
+    fn auto_open(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Normal || self.auto_pending.is_some() {
+            return Vec::new();
+        }
+        let waiting = |d: &&DownloadSnapshot| Self::choosing(d) && !self.asked.contains(&d.id);
+        let Some(id) = self
+            .selection()
+            .filter(waiting)
+            .or_else(|| self.downloads.iter().find(waiting))
+            .map(|d| d.id)
+        else {
+            return Vec::new();
+        };
+        self.asked.insert(id);
+        self.auto_pending = Some(id);
+        vec![Cmd::FetchFiles(id)]
+    }
+
+    /// A file list arrived: fills the picker waiting for it, or opens one by itself.
+    fn on_files(&mut self, id: DownloadId, files: Vec<TorrentFile>) {
+        let auto = self.auto_pending == Some(id);
+        if auto {
+            self.auto_pending = None;
+        }
+        let name = self
+            .downloads
+            .iter()
+            .find(|d| d.id == id && Self::choosing(d))
+            .map(|d| d.name.clone());
+        match &mut self.mode {
+            Mode::Popup(Popup::Picker(p)) if p.id == id && p.loading => p.set_files(files),
+            Mode::Normal if auto => {
+                if let Some(name) = name {
+                    self.mode = Mode::Popup(Popup::Picker(Box::new(Picker::with_files(
+                        id, &name, files,
+                    ))));
+                }
+            }
+            // The user is busy elsewhere: asked again once the popup closes.
+            _ if auto => {
+                self.asked.remove(&id);
+            }
+            _ => {}
         }
     }
 
@@ -647,6 +797,15 @@ impl App {
             self.detail = None;
         }
         self.fix_selection(old_index);
+        // Chosen elsewhere (the CLI) or removed: the picker has nothing left to do.
+        if let Mode::Popup(Popup::Picker(p)) = &self.mode
+            && !self
+                .downloads
+                .iter()
+                .any(|d| d.id == p.id && Self::choosing(d))
+        {
+            self.mode = Mode::Normal;
+        }
     }
 
     fn fix_selection(&mut self, fallback: Option<usize>) {
@@ -702,6 +861,8 @@ impl App {
             Mode::Popup(Popup::Add(form)) => form.paste(text),
             Mode::Popup(Popup::Limit(form)) => form.paste(text),
             Mode::Popup(Popup::GlobalLimits(form)) => form.paste(text),
+            Mode::Popup(Popup::Picker(p)) => p.paste(text),
+            Mode::Popup(Popup::Seed(form)) => form.paste(text),
             Mode::Popup(Popup::ConfirmDelete { .. } | Popup::Help) => {}
         }
     }
@@ -790,16 +951,32 @@ impl App {
                 }
                 if popup {
                     self.last_click = None;
-                    if self
-                        .hit_at(x, y, |t| *t == HitTarget::PopupCheckbox)
-                        .is_some()
-                    {
-                        self.click_checkbox();
-                    } else if self
+                    let hit = self.hit_at(x, y, |t| {
+                        matches!(
+                            t,
+                            HitTarget::PopupCheckbox
+                                | HitTarget::PopupButton
+                                | HitTarget::PickerRow(_)
+                                | HitTarget::PickerFold(_)
+                        )
+                    });
+                    let inside = self
                         .hit_at(x, y, |t| *t == HitTarget::PopupInside)
-                        .is_none()
-                    {
-                        self.mode = Mode::Normal;
+                        .is_some();
+                    match (hit, &mut self.mode) {
+                        (Some(HitTarget::PickerRow(row)), Mode::Popup(Popup::Picker(p))) => {
+                            p.cursor = row;
+                            p.toggle_row(row);
+                        }
+                        (Some(HitTarget::PickerFold(row)), Mode::Popup(Popup::Picker(p))) => {
+                            p.toggle_fold(row);
+                        }
+                        (Some(HitTarget::PopupButton), Mode::Popup(Popup::Picker(p))) => {
+                            return p.submit().into_iter().collect();
+                        }
+                        (Some(HitTarget::PopupCheckbox), _) => self.click_checkbox(),
+                        _ if !inside => self.mode = Mode::Normal,
+                        _ => {}
                     }
                     return Vec::new();
                 }
@@ -836,7 +1013,9 @@ impl App {
                 } else {
                     1
                 };
-                if let Mode::Popup(Popup::Help) = self.mode {
+                if let Mode::Popup(Popup::Picker(p)) = &mut self.mode {
+                    p.scroll(if up { -3 } else { 3 });
+                } else if let Mode::Popup(Popup::Help) = self.mode {
                     let s = &mut self.help_scroll;
                     *s = if up {
                         s.saturating_sub(3)
@@ -889,6 +1068,12 @@ impl App {
             return Some(d);
         }
         let text = match (action, d.queue_position) {
+            (Action::ChooseFiles, _) if d.kind != EngineKindTag::Torrent => {
+                "only torrents have files to choose".to_string()
+            }
+            (Action::Seed, _) if d.kind != EngineKindTag::Torrent => {
+                "only torrents seed".to_string()
+            }
             (Action::Limit, _)
                 if d.kind == EngineKindTag::Torrent
                     && !matches!(d.state, WireState::Completed | WireState::Unknown) =>
@@ -953,6 +1138,18 @@ impl App {
                     return vec![Cmd::Move { id: d.id, position }];
                 }
             }
+            KeyAction::ChooseFiles => {
+                if let Some(d) = self.target(Action::ChooseFiles, now) {
+                    self.asked.insert(d.id);
+                    self.mode = Mode::Popup(Popup::Picker(Box::new(Picker::new(d.id, &d.name))));
+                    return vec![Cmd::FetchFiles(d.id)];
+                }
+            }
+            KeyAction::Seed => {
+                if let Some(d) = self.target(Action::Seed, now) {
+                    self.mode = Mode::Popup(Popup::Seed(SeedForm::new(d.id, &d.state)));
+                }
+            }
             KeyAction::GlobalLimits => {
                 let (down, up) = self
                     .settings
@@ -990,6 +1187,17 @@ impl App {
         let Mode::Popup(popup) = &mut self.mode else {
             return Vec::new();
         };
+        // The picker stays open while its selection is sent (a refusal shows in it).
+        if let Popup::Picker(p) = popup {
+            return match p.handle_key(&key) {
+                Some(PickerOutcome::Close) => {
+                    self.mode = Mode::Normal;
+                    Vec::new()
+                }
+                Some(PickerOutcome::Submit(cmd)) => vec![cmd],
+                None => Vec::new(),
+            };
+        }
         // Popups without a text input take no Ctrl/Alt combinations (Ctrl+C quit
         // before getting here).
         if matches!(popup, Popup::ConfirmDelete { .. } | Popup::Help)
@@ -1062,6 +1270,16 @@ impl App {
                     None
                 }
             }
+            Popup::Seed(form) => {
+                if key.code == KeyCode::Enter {
+                    form.submit()
+                } else {
+                    form.handle_key(&key);
+                    None
+                }
+            }
+            // Handled above.
+            Popup::Picker(_) => None,
         };
         let Some(cmd) = submitted else {
             return Vec::new();
@@ -1112,7 +1330,7 @@ fn totals_of(downloads: &[DownloadSnapshot], down_bps: u64, up_bps: u64) -> Tota
         active: count(|s| matches!(s, WireState::Active | WireState::Starting)),
         queued: count(|s| matches!(s, WireState::Queued)),
         paused: count(|s| matches!(s, WireState::Paused)),
-        completed: count(|s| matches!(s, WireState::Completed)),
+        completed: count(|s| matches!(s, WireState::Completed | WireState::Seeding { .. })),
         failed: count(|s| {
             matches!(
                 s,

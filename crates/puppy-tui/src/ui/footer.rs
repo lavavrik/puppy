@@ -202,6 +202,8 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         (Action::Delete, "d", "delete", 'd'),
         (Action::Restart, "R", "restart", 'R'),
         (Action::Limit, "l", "limit", 'l'),
+        (Action::ChooseFiles, "c", "choose files", 'c'),
+        (Action::Seed, "s", "seeding", 's'),
     ] {
         if can(action) {
             v.push(hint(key, label, Some(c)));
@@ -242,5 +244,35 @@ fn popup_hints(p: &Popup) -> Vec<Hint> {
             cancel,
         ],
         Popup::Help => vec![hint("j/k", "scroll", None), hint("Esc", "close", Some(ESC))],
+        Popup::Seed(_) => vec![
+            hint("Tab", "next", None),
+            hint("Enter", "set", None),
+            cancel,
+        ],
+        Popup::Picker(p) if p.loading => vec![hint("Esc", "close", Some(ESC))],
+        Popup::Picker(p) if p.filtering => vec![
+            hint("↑↓", "move", None),
+            hint("Enter", "keep filter", None),
+            hint("Esc", "clear filter", Some(ESC)),
+        ],
+        Popup::Picker(p) => {
+            let mut v = vec![hint("Space", "toggle", Some(' '))];
+            if p.on_folder() {
+                v.extend([
+                    hint("Enter", "fold", None),
+                    hint("y", "download", Some('y')),
+                ]);
+            } else {
+                v.push(hint("Enter", "download", None));
+            }
+            v.extend([
+                hint("a", "all", Some('a')),
+                hint("n", "none", Some('n')),
+                hint("/", "filter", Some('/')),
+                hint("←→", "fold", None),
+                hint("Esc", "close", Some(ESC)),
+            ]);
+            v
+        }
     }
 }

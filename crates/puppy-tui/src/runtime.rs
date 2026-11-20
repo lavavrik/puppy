@@ -293,6 +293,15 @@ fn spawn_cmd(
     // The daemon may adjust or refuse new settings: the footer and the `L` popup show
     // what it really has (this also undoes the app's optimistic update on failure).
     let refresh = matches!(cmd, Cmd::SetGlobalLimits { .. } | Cmd::SetMaxActive(_));
+    // The picker hears about its own commands (a refusal shows in it).
+    let files_of = match cmd {
+        Cmd::FetchFiles(id) => Some(id),
+        _ => None,
+    };
+    let select_of = match cmd {
+        Cmd::SelectFiles { id, .. } => Some(id),
+        _ => None,
+    };
     tasks.spawn(async move {
         let r = api.exec(cmd).await;
         if restart {
@@ -301,6 +310,9 @@ fn spawn_cmd(
         }
         let msg = match r {
             Ok(Some(msg)) => Some(msg),
+            Err(e) if files_of.is_some() => files_of.map(|id| Msg::FilesFailed(id, e)),
+            Ok(None) if files_of.is_some() => None,
+            r if select_of.is_some() => select_of.map(|id| Msg::Selected(id, r.map(|_| ()))),
             Ok(None) | Err(_) if detail => None,
             Ok(None) => Some(Msg::CmdResult(CmdOutcome {
                 label: label.into(),
@@ -337,6 +349,9 @@ fn label(cmd: &Cmd) -> &'static str {
         Cmd::SetGlobalLimits { .. } => "global limits",
         Cmd::SetMaxActive(_) => "max active",
         Cmd::FetchDetail(_) => "details",
+        Cmd::FetchFiles(_) => "files",
+        Cmd::SelectFiles { .. } => "choose files",
+        Cmd::SetSeed { .. } => "seeding",
         Cmd::FetchSettings => "settings",
         Cmd::RestartDaemon => "restart daemon",
         Cmd::Quit => "quit",

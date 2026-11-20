@@ -49,8 +49,8 @@ pub trait DaemonApi: Send + Sync + 'static {
     async fn connect(&self) -> Result<Connected, ApiError>;
     /// The next event of the current connection; `None` once it is closed.
     async fn next_event(&self) -> Option<Event>;
-    /// Runs a command: [`Cmd::FetchDetail`] answers `Some(Msg::Detail)`, the others
-    /// `None`. Never called with [`Cmd::Quit`].
+    /// Runs a command: [`Cmd::FetchDetail`] answers `Some(Msg::Detail)`,
+    /// [`Cmd::FetchFiles`] `Some(Msg::Files)`, the others `None`. Never called with [`Cmd::Quit`].
     async fn exec(&self, cmd: Cmd) -> Result<Option<Msg>, CmdError>;
 }
 
@@ -165,6 +165,15 @@ impl DaemonApi for ClientApi {
             Cmd::SetLimit { id, bps } => Request::SetLimit { id, bps },
             Cmd::SetGlobalLimits { down, up } => Request::SetGlobalLimits { down, up },
             Cmd::SetMaxActive(n) => Request::SetMaxActive { n },
+            Cmd::SelectFiles { id, selection } => Request::SelectFiles { id, selection },
+            Cmd::SetSeed { id, policy } => Request::SetSeed { id, policy },
+            Cmd::FetchFiles(id) => {
+                return match client.call(Request::ListFiles { id }).await {
+                    Ok(ReplyData::Files { files }) => Ok(Some(Msg::Files(id, files))),
+                    Ok(d) => Err(CmdError::Failed(format!("unexpected reply: {d:?}"))),
+                    Err(e) => Err(call_error(e)),
+                };
+            }
             Cmd::FetchDetail(id) => {
                 return match client.call(Request::Get { id }).await {
                     Ok(ReplyData::Download { detail, .. }) => Ok(Some(Msg::Detail(id, detail))),

@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
+use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, SeedPolicy, Source};
+use puppy_proto::WireState;
 
 use super::Cmd;
 use super::input::TextInput;
@@ -211,13 +212,18 @@ impl AddForm {
             Ok(d) => d,
             Err(e) => return self.fail(AddField::Dir, e),
         };
+        // The dashboard asks which files of a multi-file torrent to download.
+        let files = match source {
+            Source::Magnet { .. } | Source::TorrentFile { .. } => FileChoice::Ask,
+            _ => FileChoice::All,
+        };
         Some(Cmd::Add {
             request: AddRequest {
                 source,
                 output_dir,
                 filename: None,
                 context: RequestContext::default(),
-                files: Default::default(),
+                files,
                 seed: None,
             },
             start_paused: self.start_paused,
@@ -329,6 +335,136 @@ impl GlobalLimitsForm {
     }
 }
 
+pub const SEED_BAD_RATIO: &str = "not a ratio: use a number like 1.5, 0 = off, or leave it empty";
+pub const SEED_BAD_TIME: &str = "not a duration: use e.g. 2h, 30m, 0 = off, or leave it empty";
+
+/// A seed ratio as typed and shown: `1.0`, `1.5`, `0.25`.
+pub fn ratio_text(r: f32) -> String {
+    if r.fract() == 0.0 {
+        format!("{r:.1}")
+    } else {
+        format!("{r}")
+    }
+}
+
+/// A duration as the seeding popup takes it: `2h`, `1h 30m`, `0`.
+pub fn duration_text(secs: u64) -> String {
+    if secs == 0 {
+        return "0".into();
+    }
+    humantime::format_duration(std::time::Duration::from_secs(secs)).to_string()
+}
+
+/// A typed seed ratio: empty ⇒ `None` (the daemon's default); `0` disables.
+pub fn parse_ratio(s: &str) -> Result<Option<f32>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match s.parse::<f32>() {
+        Ok(r) if r.is_finite() && r >= 0.0 => Ok(Some(r)),
+        _ => Err(SEED_BAD_RATIO.into()),
+    }
+}
+
+/// A typed seed time (`2h`, `90m`, `1h 30m`): empty ⇒ `None` (the default); `0`
+/// disables.
+pub fn parse_duration(s: &str) -> Result<Option<u64>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s.chars().all(|c| c == '0') {
+        return Ok(Some(0));
+    }
+    humantime::parse_duration(s)
+        .map(|d| Some(d.as_secs()))
+        .map_err(|_| SEED_BAD_TIME.into())
+}
+
+/// The seeding popup (`s`): ratio and time triggers; Enter replaces the torrent's whole
+/// policy (an empty field inherits the daemon's default).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SeedForm {
+    pub id: DownloadId,
+    pub ratio: TextInput,
+    pub time: TextInput,
+    /// 0 = ratio, 1 = time.
+    pub focus: usize,
+    pub error: Option<String>,
+    /// The field `error` is about (0 = ratio, 1 = time).
+    pub error_field: usize,
+}
+
+impl SeedForm {
+    /// Prefilled from a seeding torrent's targets (a trigger that is off shows `0`);
+    /// empty for a torrent still downloading.
+    pub fn new(id: DownloadId, state: &WireState) -> Self {
+        let (ratio, time) = match state {
+            WireState::Seeding {
+                ratio_target,
+                time_target_secs,
+                ..
+            } => (
+                ratio_target.map_or_else(|| "0".into(), ratio_text),
+                time_target_secs.map_or_else(|| "0".into(), duration_text),
+            ),
+            _ => (String::new(), String::new()),
+        };
+        Self {
+            id,
+            ratio: TextInput::with_value(&ratio),
+            time: TextInput::with_value(&time),
+            ..Self::default()
+        }
+    }
+
+    fn focused(&mut self) -> &mut TextInput {
+        if self.focus == 0 {
+            &mut self.ratio
+        } else {
+            &mut self.time
+        }
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        self.focused().paste(text);
+        self.error = None;
+    }
+
+    pub fn handle_key(&mut self, key: &KeyEvent) {
+        if focus_key(key).is_some() {
+            self.focus = 1 - self.focus.min(1);
+            return;
+        }
+        if self.focused().handle_key(key) {
+            self.error = None;
+        }
+    }
+
+    pub fn submit(&mut self) -> Option<Cmd> {
+        let parsed = parse_ratio(&self.ratio.value)
+            .map_err(|e| (0, e))
+            .and_then(|ratio| {
+                parse_duration(&self.time.value)
+                    .map(|time| (ratio, time))
+                    .map_err(|e| (1, e))
+            });
+        match parsed {
+            Ok((ratio, time_secs)) => Some(Cmd::SetSeed {
+                id: self.id,
+                policy: SeedPolicy { ratio, time_secs },
+            }),
+            Err((field, e)) => {
+                self.focus = field;
+                self.error_field = field;
+                self.error = Some(e);
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +517,19 @@ mod tests {
         f.source = TextInput::with_value("nonsense");
         assert_eq!(f.submit(), None);
         assert_eq!(f.error.as_deref(), Some(ADD_BAD_SOURCE));
+    }
+
+    #[test]
+    fn seed_values() {
+        assert_eq!(ratio_text(1.0), "1.0");
+        assert_eq!(ratio_text(0.25), "0.25");
+        assert_eq!(duration_text(7200), "2h");
+        assert_eq!(parse_duration(&duration_text(5400)), Ok(Some(5400)));
+        assert_eq!(parse_duration(" "), Ok(None));
+        assert_eq!(parse_duration("00"), Ok(Some(0)));
+        assert!(parse_duration("90").is_err());
+        assert_eq!(parse_ratio("2"), Ok(Some(2.0)));
+        assert!(parse_ratio("-1").is_err());
+        assert!(parse_ratio("inf").is_err());
     }
 }

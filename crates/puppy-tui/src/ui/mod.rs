@@ -6,6 +6,7 @@
 mod detail;
 mod footer;
 mod list;
+mod picker;
 mod popup;
 mod toast;
 
@@ -477,8 +478,9 @@ pub(crate) fn state_icon(state: &WireState) -> (&'static str, Token) {
         WireState::Active => ("▶", Token::Ok),
         WireState::Paused => ("⏸", Token::Dim),
         WireState::Queued => ("…", Token::Dim),
-        WireState::Completed | WireState::Seeding { .. } => ("✓", Token::Ok),
-        WireState::ChoosingFiles => ("?", Token::Warn),
+        WireState::Completed => ("✓", Token::Ok),
+        WireState::Seeding { .. } => ("⇅", Token::Ok),
+        WireState::ChoosingFiles => ("☐", Token::Warn),
         WireState::Failed {
             transient: true, ..
         } => ("↻", Token::Warn),

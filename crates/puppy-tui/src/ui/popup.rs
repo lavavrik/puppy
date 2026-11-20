@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{FOOTER_ROWS, panel, spans, text, width, wrap};
 use crate::app::{
-    AddField, AddForm, App, GlobalLimitsForm, HitTarget, LimitForm, Popup, TextInput,
+    AddField, AddForm, App, GlobalLimitsForm, HitTarget, LimitForm, Popup, SeedForm, TextInput,
 };
 use crate::format;
 use crate::theme::{Theme, Token};
@@ -26,6 +26,8 @@ const PAD: u16 = 2;
 /// Lines an inline error may wrap to.
 const ERROR_LINES: usize = 3;
 pub const RATE_EXAMPLES: &str = "e.g. 2M, 500k, none";
+pub const RATIO_EXAMPLES: &str = "e.g. 1.5, 0 = off, empty = default";
+pub const TIME_EXAMPLES: &str = "e.g. 2h, 30m, 0 = off";
 
 /// The help table: a section title (empty keys) or keys and what they do.
 const HELP: &[(&str, &str)] = &[
@@ -43,6 +45,8 @@ const HELP: &[(&str, &str)] = &[
     ("d, Delete", "delete (asks first)"),
     ("R", "restart (failed / needs attention)"),
     ("l", "speed limit for the selection"),
+    ("c", "choose a torrent's files"),
+    ("s", "seeding: ratio and time limits"),
     ("", "Queue & limits"),
     ("K, Shift+↑", "move up in the queue"),
     ("J, Shift+↓", "move down in the queue"),
@@ -126,7 +130,24 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Positi
             .find(|d| d.id == id)
             .map(|d| d.name.clone())
     };
+    if matches!(popup, Popup::Picker(_)) {
+        return super::picker::draw(app, buf, region, area);
+    }
+    let seed_state = match popup {
+        Popup::Seed(f) => app
+            .downloads
+            .iter()
+            .find(|d| d.id == f.id)
+            .map(|d| d.state.clone()),
+        _ => None,
+    };
     let (title, danger, rows) = match popup {
+        Popup::Picker(_) => return None,
+        Popup::Seed(f) => (
+            "Seeding",
+            false,
+            seed_rows(&t, f, name_of(f.id), seed_state.as_ref(), content_w),
+        ),
         Popup::Add(f) => (
             "Add download",
             false,
@@ -185,7 +206,7 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Positi
 }
 
 /// A `w`×`h` rect centered in `region` (clamped to it), horizontally in `area`.
-fn frame(region: Rect, area: Rect, w: u16, h: u16) -> Rect {
+pub(super) fn frame(region: Rect, area: Rect, w: u16, h: u16) -> Rect {
     let h = h.min(region.height);
     Rect::new(
         area.x + (area.width - w) / 2,
@@ -331,6 +352,61 @@ fn global_rows<'a>(t: &Theme, f: &'a GlobalLimitsForm, w: u16) -> Vec<Row<'a>> {
             format!("{RATE_EXAMPLES} (empty = no limit)"),
             t.style(Token::Dim),
         )]),
+        Row::Blank,
+        Row::Buttons(vec![("[ Set ]", t.style(Token::Badge))]),
+        Row::Blank,
+    ]);
+    rows
+}
+
+fn seed_rows<'a>(
+    t: &Theme,
+    f: &'a SeedForm,
+    name: Option<String>,
+    state: Option<&puppy_proto::WireState>,
+    w: u16,
+) -> Vec<Row<'a>> {
+    let name = name.unwrap_or_else(|| format!("download {}", f.id));
+    let mut rows = vec![
+        Row::Blank,
+        Row::Text(vec![(
+            format::truncate_middle(&format::display_safe(&name), usize::from(w)),
+            t.style(Token::Text).add_modifier(Modifier::BOLD),
+        )]),
+    ];
+    // Where it stands now.
+    let now = match state {
+        Some(puppy_proto::WireState::Seeding {
+            ratio, seeded_secs, ..
+        }) => format!(
+            "seeding · ratio {ratio:.2} · seeded {}",
+            format::eta(Some(*seeded_secs))
+        ),
+        _ => "applies once the download completes".to_string(),
+    };
+    rows.push(Row::Text(vec![(now, t.style(Token::Dim))]));
+    for (i, label, input, examples) in [
+        (0, "Ratio", &f.ratio, RATIO_EXAMPLES),
+        (1, "Time", &f.time, TIME_EXAMPLES),
+    ] {
+        rows.push(Row::Blank);
+        rows.push(Row::Label {
+            text: label,
+            focused: f.focus == i,
+        });
+        rows.push(Row::Input {
+            input,
+            placeholder: Some("default".into()),
+            focused: f.focus == i,
+        });
+        error_rows(
+            &mut rows,
+            f.error.as_deref().filter(|_| f.error_field == i),
+            w,
+        );
+        rows.push(Row::Text(vec![(examples.to_string(), t.style(Token::Dim))]));
+    }
+    rows.extend([
         Row::Blank,
         Row::Buttons(vec![("[ Set ]", t.style(Token::Badge))]),
         Row::Blank,

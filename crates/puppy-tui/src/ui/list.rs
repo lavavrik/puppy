@@ -319,11 +319,12 @@ impl RowCtx<'_> {
             WireState::Active | WireState::Starting => p.bar_done,
             WireState::Failed { .. } => p.err,
             WireState::NeedsAttention { .. } => p.warn,
+            // Complete, and still sharing.
+            WireState::Seeding { .. } => p.ok,
             WireState::Paused
             | WireState::Queued
             | WireState::Completed
             | WireState::ChoosingFiles
-            | WireState::Seeding { .. }
             | WireState::Unknown => muted,
         };
         if selected {
@@ -380,12 +381,30 @@ impl RowCtx<'_> {
                 push("paused".into(), Token::Dim);
                 push(size, Token::Dim);
             }
-            WireState::Completed | WireState::Seeding { .. } => {
+            WireState::Completed => {
                 push("completed".into(), Token::Dim);
                 push(size, Token::Dim);
             }
+            WireState::Seeding {
+                ratio,
+                seeded_secs,
+                ratio_target,
+                time_target_secs,
+                ..
+            } => {
+                push(format!("↑ {}", format::speed(d.up_bps)), Token::Dim);
+                push(seed_ratio(*ratio, *ratio_target), Token::Dim);
+                if let Some(t) = time_target_secs {
+                    let left = t.saturating_sub(*seeded_secs);
+                    push(format!("{} left", format::eta(Some(left))), Token::Dim);
+                }
+                push(size, Token::Dim);
+            }
             WireState::ChoosingFiles => {
-                push("choosing files".into(), Token::Dim);
+                push("choose files · press c".into(), Token::Warn);
+                if let Some(note) = &d.note {
+                    push(note.clone(), Token::Dim);
+                }
                 push(size, Token::Dim);
             }
             WireState::Failed {
@@ -410,13 +429,13 @@ impl RowCtx<'_> {
             WireState::Unknown => push("unknown state (newer daemon?)".into(), Token::Dim),
         }
         if torrent
-            && is_moving(&d.state)
+            && (is_moving(&d.state) || matches!(d.state, WireState::Seeding { .. }))
             && let Some(p) = d.peers
         {
             push(format!("{p} peers"), Token::Dim);
         }
         if let Some(l) = d.limit
-            && !matches!(d.state, WireState::Completed)
+            && !matches!(d.state, WireState::Completed | WireState::Seeding { .. })
         {
             push(format!("limit {}", format::speed(l)), Token::Dim);
         }
@@ -432,7 +451,7 @@ fn is_moving(state: &WireState) -> bool {
 /// before the end; `—` when the total is unknown).
 fn progress(d: &DownloadSnapshot) -> (Option<f64>, String) {
     let ratio = match d.state {
-        WireState::Completed => Some(1.0),
+        WireState::Completed | WireState::Seeding { .. } => Some(1.0),
         _ => format::percent(d.done_bytes, d.total_bytes),
     };
     let pct = match ratio {
@@ -446,13 +465,21 @@ fn progress(d: &DownloadSnapshot) -> (Option<f64>, String) {
 /// is unknown.
 pub(super) fn size_text(d: &DownloadSnapshot) -> String {
     match (d.total_bytes, &d.state) {
-        (Some(total), WireState::Completed) => format::bytes(total),
+        (Some(total), WireState::Completed | WireState::Seeding { .. }) => format::bytes(total),
         (Some(total), _) => format!(
             "{} / {}",
             format::bytes(d.done_bytes.min(total)),
             format::bytes(total)
         ),
         (None, _) => format::bytes(d.done_bytes),
+    }
+}
+
+/// `ratio 0.42/1.0`, or just `ratio 0.42` without a ratio target.
+pub(super) fn seed_ratio(ratio: f32, target: Option<f32>) -> String {
+    match target {
+        Some(t) => format!("ratio {ratio:.2}/{}", crate::app::forms::ratio_text(t)),
+        None => format!("ratio {ratio:.2}"),
     }
 }
 
