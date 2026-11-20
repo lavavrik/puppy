@@ -97,14 +97,11 @@ pub fn is_ctrl_c(key: &KeyEvent) -> bool {
 /// they report it for `G`, `+`, `?`); Ctrl/Alt combinations are not actions.
 pub fn normal_key(key: &KeyEvent) -> Option<KeyAction> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Ctrl+Alt is AltGr on Windows: the char it produced counts as typed.
-    let altgr = key
+    // Ctrl+Alt is AltGr on Windows: its characters are typed text, not commands, so
+    // only text inputs take them; here no Ctrl/Alt combination is an action.
+    if key
         .modifiers
-        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
-    if !altgr
-        && key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return None;
     }
@@ -144,7 +141,7 @@ mod tests {
                 KeyCode::Char('/'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT
             ),
-            Some(KeyAction::Filter)
+            None
         );
         assert_eq!(k(KeyCode::Char('x'), none), None);
         for a in [

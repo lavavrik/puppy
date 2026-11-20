@@ -61,6 +61,7 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
         );
     }
     block.render(area, buf);
+    app.hits.push((area, HitTarget::List));
     if inner.width == 0 || inner.height == 0 {
         return;
     }

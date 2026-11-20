@@ -10,10 +10,10 @@ pub mod keys;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use puppy_core::types::{AddRequest, DownloadId, EngineDetail};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Event, Settings, Totals, WireState};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 pub use forms::{AddField, AddForm, GlobalLimitsForm, LimitForm};
 pub use history::History;
@@ -62,6 +62,8 @@ pub enum HitTarget {
     ListRow(DownloadId),
     /// A footer hint; non-char keys use their primary char (`Delete` ⇒ `'d'`).
     FooterKey(char),
+    /// The whole list panel (wheel scrolling).
+    List,
     PopupInside,
     PopupCheckbox,
 }
@@ -209,6 +211,8 @@ pub struct App {
     pub ticks: u64,
     /// First visible row of the help popup (clamped by drawing).
     pub help_scroll: u16,
+    /// The last left click on a list row, for double-click detection.
+    last_click: Option<(DownloadId, Instant)>,
 }
 
 impl App {
@@ -233,6 +237,7 @@ impl App {
             now_unix: 0,
             ticks: 0,
             help_scroll: 0,
+            last_click: None,
         }
     }
 
@@ -319,8 +324,7 @@ impl App {
     pub fn update(&mut self, msg: Msg, now: Instant) -> Vec<Cmd> {
         match msg {
             Msg::Key(key) => self.on_key(key, now),
-            // Mouse handling arrives with the hit map (drawing).
-            Msg::Mouse(_) => Vec::new(),
+            Msg::Mouse(m) => self.on_mouse(m, now),
             Msg::Paste(text) => {
                 self.on_paste(&text);
                 Vec::new()
@@ -512,6 +516,123 @@ impl App {
                 Vec::new()
             }
             Mode::Popup(_) => self.on_popup_key(key),
+        }
+    }
+
+    /// The hit region (topmost last) under `(x, y)` matching `pred`.
+    fn hit_at(&self, x: u16, y: u16, pred: impl Fn(&HitTarget) -> bool) -> Option<HitTarget> {
+        let p = Position::new(x, y);
+        self.hits
+            .iter()
+            .rev()
+            .find(|(r, t)| r.contains(p) && pred(t))
+            .map(|(_, t)| *t)
+    }
+
+    /// Mouse input goes through the same paths as keys: hint clicks synthesise the
+    /// key, wheel notches are `j`/`k`, a popup click outside is `Esc`.
+    fn on_mouse(&mut self, m: MouseEvent, now: Instant) -> Vec<Cmd> {
+        const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+        let (x, y) = (m.column, m.row);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let popup = matches!(self.mode, Mode::Popup(_));
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(HitTarget::FooterKey(c)) =
+                    self.hit_at(x, y, |t| matches!(t, HitTarget::FooterKey(_)))
+                {
+                    self.last_click = None;
+                    let code = if c == '\u{1b}' {
+                        KeyCode::Esc
+                    } else {
+                        KeyCode::Char(c)
+                    };
+                    return self.on_key(press(code), now);
+                }
+                if popup {
+                    self.last_click = None;
+                    if self
+                        .hit_at(x, y, |t| *t == HitTarget::PopupCheckbox)
+                        .is_some()
+                    {
+                        self.click_checkbox();
+                    } else if self
+                        .hit_at(x, y, |t| *t == HitTarget::PopupInside)
+                        .is_none()
+                    {
+                        self.mode = Mode::Normal;
+                    }
+                    return Vec::new();
+                }
+                let Some(HitTarget::ListRow(id)) =
+                    self.hit_at(x, y, |t| matches!(t, HitTarget::ListRow(_)))
+                else {
+                    self.last_click = None;
+                    return Vec::new();
+                };
+                self.selected = Some(id);
+                self.fix_selection(None);
+                let double = matches!(self.last_click,
+                    Some((last, at)) if last == id && now.saturating_duration_since(at) <= DOUBLE_CLICK);
+                if !double {
+                    self.last_click = Some((id, now));
+                    return Vec::new();
+                }
+                self.last_click = None;
+                let Some(d) = self.selection().cloned() else {
+                    return Vec::new();
+                };
+                if self.can(Action::Pause, &d) {
+                    self.on_action(KeyAction::Pause, now)
+                } else if self.can(Action::Resume, &d) {
+                    self.on_action(KeyAction::Resume, now)
+                } else {
+                    Vec::new()
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                let step = if m.modifiers.contains(KeyModifiers::SHIFT) {
+                    3
+                } else {
+                    1
+                };
+                if let Mode::Popup(Popup::Help) = self.mode {
+                    let s = &mut self.help_scroll;
+                    *s = if up {
+                        s.saturating_sub(3)
+                    } else {
+                        s.saturating_add(3)
+                    };
+                } else if !popup
+                    && self
+                        .hit_at(x, y, |t| {
+                            matches!(t, HitTarget::List | HitTarget::ListRow(_))
+                        })
+                        .is_some()
+                {
+                    let action = if up { KeyAction::Up } else { KeyAction::Down };
+                    for _ in 0..step {
+                        self.on_action(action, now);
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A click on a popup checkbox: focuses and toggles it.
+    fn click_checkbox(&mut self) {
+        match &mut self.mode {
+            Mode::Popup(Popup::Add(form)) => {
+                form.focus = AddField::Paused;
+                form.handle_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+            }
+            Mode::Popup(Popup::ConfirmDelete { delete_files, .. }) => {
+                *delete_files = !*delete_files
+            }
+            _ => {}
         }
     }
 
