@@ -5,6 +5,7 @@
 //!
 //! This is the only module that does terminal I/O.
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::panic::{self, PanicHookInfo};
 use std::sync::Arc;
@@ -23,9 +24,11 @@ use crossterm::{cursor, execute};
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until, timeout};
+
+use puppy_core::types::DownloadId;
 
 use crate::api::{ApiError, DaemonApi};
 use crate::app::{App, Cmd, CmdOutcome, Msg};
@@ -39,6 +42,9 @@ pub const FRAME: Duration = Duration::from_millis(33);
 /// Reconnect backoff: the first delay, doubling up to the last.
 pub const BACKOFF_FIRST: Duration = Duration::from_millis(250);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// After a daemon restart: this many retries this far apart before the backoff.
+pub const FAST_RETRIES: u32 = 5;
+pub const FAST_RETRY: Duration = Duration::from_millis(200);
 /// On quit, commands still running (e.g. an add just submitted) get this long to finish.
 const QUIT_GRACE: Duration = Duration::from_millis(500);
 /// Daemon messages waiting for the loop.
@@ -55,14 +61,28 @@ pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
     let guard = TerminalGuard::enter().context("cannot set up the terminal")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     terminal.clear()?;
-    // A failing terminal ends the input, which ends the dashboard.
+    // A failing terminal ends the input (which ends the loop) and is the error.
+    let read_error: Arc<std::sync::Mutex<Option<std::io::Error>>> = Arc::default();
+    let slot = read_error.clone();
     let input = EventStream::new()
-        .take_while(|e| std::future::ready(e.is_ok()))
+        .take_while(move |e| {
+            let ok = e.is_ok();
+            if let Err(e) = e {
+                let e = std::io::Error::new(e.kind(), e.to_string());
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            }
+            std::future::ready(ok)
+        })
         .filter_map(|e| std::future::ready(e.ok().and_then(input_msg)));
     let result = run_with(api, theme, &mut terminal, Box::pin(input), None).await;
     drop(terminal);
     drop(guard);
-    result.map(drop)
+    let read_error = read_error.lock().unwrap_or_else(|p| p.into_inner()).take();
+    match (result, read_error) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Some(e)) => Err(anyhow::Error::new(e).context("cannot read from the terminal")),
+        (Ok(_), None) => Ok(()),
+    }
 }
 
 /// The message for a terminal event; `None` for what the app ignores (key releases,
@@ -98,17 +118,21 @@ pub async fn run_with<B: Backend>(
     let start = Instant::now();
     let deadline = stop_after.map(|d| start + d);
     let mut app = App::new(theme);
+    app.now_unix = unix_now();
     let size = terminal.size().map_err(term_err)?;
     app.update(Msg::Resize(size.width, size.height), start.into_std());
 
     let (daemon_tx, mut daemon_rx) = mpsc::channel(DAEMON_QUEUE);
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel();
-    let reconnect_now = Arc::new(Notify::new());
-    let connection = AbortOnDrop(tokio::spawn(connection(
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<Done>();
+    let (restarts, restarts_rx) = watch::channel(0u64);
+    let restarts = Arc::new(restarts);
+    let mut connection = AbortOnDrop(tokio::spawn(connection(
         api.clone(),
         daemon_tx,
-        reconnect_now.clone(),
+        restarts_rx,
     )));
+    // Detail fetches in flight: one per download at a time.
+    let mut fetching: HashSet<DownloadId> = HashSet::new();
     let mut tasks = JoinSet::new();
     let mut tick = interval_at(start + TICK, TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -130,8 +154,17 @@ pub async fn run_with<B: Backend>(
                 }
             },
             Some(m) = daemon_rx.recv() => Some(m),
-            Some(m) = result_rx.recv() => Some(m),
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => None,
+            Some(done) = result_rx.recv() => {
+                if let Some(id) = done.detail {
+                    fetching.remove(&id);
+                }
+                done.msg
+            }
+            Some(r) = tasks.join_next(), if !tasks.is_empty() => match r {
+                Err(e) if e.is_panic() => bail!("internal error: a background task panicked"),
+                _ => None,
+            },
+            _ = &mut connection.0 => bail!("internal error: the daemon connection task ended"),
             _ = tick.tick() => {
                 app.now_unix = unix_now();
                 Some(Msg::Tick)
@@ -147,12 +180,17 @@ pub async fn run_with<B: Backend>(
         let Some(msg) = msg else { continue };
         dirty = true;
         for cmd in app.update(msg, Instant::now().into_std()) {
+            if let Cmd::FetchDetail(id) = cmd
+                && !fetching.insert(id)
+            {
+                continue;
+            }
             if cmd != Cmd::Quit {
                 spawn_cmd(
                     &mut tasks,
                     api.clone(),
                     result_tx.clone(),
-                    reconnect_now.clone(),
+                    restarts.clone(),
                     cmd,
                 );
             }
@@ -173,23 +211,33 @@ pub async fn run_with<B: Backend>(
     Ok(app)
 }
 
+/// A finished command: the detail fetch it was (if one) and what to tell the app.
+struct Done {
+    detail: Option<DownloadId>,
+    msg: Option<Msg>,
+}
+
 /// Runs `cmd` on its own task; its outcome comes back on `results`. Detail fetches
 /// report only what they fetched (a failure just leaves the pane as it is).
 fn spawn_cmd(
     tasks: &mut JoinSet<()>,
     api: Arc<dyn DaemonApi>,
-    results: mpsc::UnboundedSender<Msg>,
-    reconnect_now: Arc<Notify>,
+    results: mpsc::UnboundedSender<Done>,
+    restarts: Arc<watch::Sender<u64>>,
     cmd: Cmd,
 ) {
     let label = label(&cmd);
-    let detail = matches!(cmd, Cmd::FetchDetail(_));
+    let detail_id = match cmd {
+        Cmd::FetchDetail(id) => Some(id),
+        _ => None,
+    };
+    let detail = detail_id.is_some();
     let restart = cmd == Cmd::RestartDaemon;
     tasks.spawn(async move {
         let r = api.exec(cmd).await;
         if restart {
             // Connect now: that starts this version's daemon.
-            reconnect_now.notify_one();
+            restarts.send_modify(|n| *n += 1);
         }
         let msg = match r {
             Ok(Some(msg)) => Some(msg),
@@ -203,9 +251,10 @@ fn spawn_cmd(
                 result: Err(e),
             })),
         };
-        if let Some(msg) = msg {
-            let _ = results.send(msg);
-        }
+        let _ = results.send(Done {
+            detail: detail_id,
+            msg,
+        });
     });
 }
 
@@ -228,15 +277,28 @@ fn label(cmd: &Cmd) -> &'static str {
 }
 
 /// Keeps a connection: connects, forwards its events, and after it ends (or a failed
-/// attempt) waits with backoff — or until `reconnect_now` — and connects again. Every
-/// failed attempt and every lost connection sends one [`Msg::Disconnected`]. Returns
-/// when the loop stops listening.
-async fn connection(api: Arc<dyn DaemonApi>, tx: mpsc::Sender<Msg>, reconnect_now: Arc<Notify>) {
+/// attempt) waits with backoff and connects again. Every failed attempt and every lost
+/// connection sends one [`Msg::Disconnected`].
+///
+/// A daemon restart (`restarts` changes) reconnects at once with fresh backoff and a few
+/// fast retries (the old daemon may still be on its way out); their failures, and those
+/// of attempts begun before the restart, leave the "restarting" banner alone — only the
+/// last fast retry reports. Returns when the loop stops listening.
+async fn connection(
+    api: Arc<dyn DaemonApi>,
+    tx: mpsc::Sender<Msg>,
+    mut restarts: watch::Receiver<u64>,
+) {
     let mut delay = BACKOFF_FIRST;
+    let mut fast = 0u32;
     loop {
-        let msgs = match api.connect().await {
+        let generation = *restarts.borrow_and_update();
+        let result = api.connect().await;
+        let stale = *restarts.borrow() != generation;
+        let msgs = match result {
             Ok((version, settings, downloads)) => {
                 delay = BACKOFF_FIRST;
+                fast = 0;
                 let connected = Msg::Connected {
                     version,
                     settings,
@@ -252,25 +314,46 @@ async fn connection(api: Arc<dyn DaemonApi>, tx: mpsc::Sender<Msg>, reconnect_no
                 }
                 vec![Msg::Disconnected]
             }
-            Err(e) => vec![
-                Msg::Disconnected,
-                match e {
-                    ApiError::Incompatible(s) => Msg::Incompatible(s),
-                    ApiError::NoDaemon(s) => Msg::NoDaemon(s),
-                    ApiError::Other(s) => Msg::ConnectError(s),
-                },
-            ],
+            // Begun before the restart: says nothing about the new daemon.
+            Err(_) if stale => Vec::new(),
+            Err(e) => {
+                let mut msgs = vec![Msg::Disconnected];
+                if fast <= 1 {
+                    msgs.push(match e {
+                        ApiError::Incompatible(s) => Msg::Incompatible(s),
+                        ApiError::NoDaemon(s) => Msg::NoDaemon(s),
+                        ApiError::Other(s) => Msg::ConnectError(s),
+                    });
+                }
+                msgs
+            }
         };
         for msg in msgs {
             if tx.send(msg).await.is_err() {
                 return;
             }
         }
-        tokio::select! {
-            _ = sleep(delay) => {}
-            _ = reconnect_now.notified() => {}
+        let pause = if fast > 0 {
+            fast -= 1;
+            FAST_RETRY
+        } else {
+            let d = delay;
+            delay = (delay * 2).min(BACKOFF_MAX);
+            d
+        };
+        let restarted = stale
+            || tokio::select! {
+                _ = sleep(pause) => false,
+                r = restarts.changed() => match r {
+                    Ok(()) => true,
+                    // The runtime is gone.
+                    Err(_) => return,
+                },
+            };
+        if restarted {
+            delay = BACKOFF_FIRST;
+            fast = FAST_RETRIES;
         }
-        delay = (delay * 2).min(BACKOFF_MAX);
     }
 }
 

@@ -50,6 +50,30 @@ pub enum Banner {
 
 impl Banner {
     pub const INCOMPATIBLE: &str = "daemon is a different puppy version — press U to restart it";
+    /// The key named in [`INCOMPATIBLE`](Self::INCOMPATIBLE) (drawn highlighted).
+    pub const RESTART_KEY: &str = "U";
+    pub const RESTARTING: &str = "restarting the daemon…";
+    pub const ERROR_PREFIX: &str = "cannot connect to the daemon: ";
+
+    /// The banner's text, as drawn.
+    pub fn text(&self) -> String {
+        match self {
+            Banner::Incompatible(_) => Self::INCOMPATIBLE.to_string(),
+            Banner::NoDaemon(hint) => hint.clone(),
+            Banner::Error(e) => format!("{}{e}", Self::ERROR_PREFIX),
+            Banner::Restarting => Self::RESTARTING.to_string(),
+        }
+    }
+}
+
+/// The first line of `s`, trimmed and safe to draw (a banner is one row).
+fn one_line(s: &str) -> String {
+    let first = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    crate::format::display_safe(first).into_owned()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -406,15 +430,15 @@ impl App {
                 Vec::new()
             }
             Msg::Incompatible(detail) => {
-                self.banner = Some(Banner::Incompatible(detail));
+                self.banner = Some(Banner::Incompatible(one_line(&detail)));
                 Vec::new()
             }
             Msg::NoDaemon(hint) => {
-                self.banner = Some(Banner::NoDaemon(hint));
+                self.banner = Some(Banner::NoDaemon(one_line(&hint)));
                 Vec::new()
             }
             Msg::ConnectError(e) => {
-                self.banner = Some(Banner::Error(e));
+                self.banner = Some(Banner::Error(one_line(&e)));
                 Vec::new()
             }
             Msg::CmdResult(outcome) => {

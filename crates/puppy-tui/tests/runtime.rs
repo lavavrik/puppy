@@ -91,6 +91,11 @@ struct FakeApi {
     fallback: Mutex<Option<Result<Connected, ApiError>>>,
     /// Becomes the fallback when `RestartDaemon` runs.
     after_restart: Mutex<Option<Result<Connected, ApiError>>>,
+    /// Script loaded into `connects` when `RestartDaemon` runs.
+    after_restart_script: Mutex<Vec<Result<Connected, ApiError>>>,
+    /// How long each connect takes (its result is decided when it starts).
+    connect_delay: Duration,
+    connect_panics: bool,
     connect_count: AtomicUsize,
     events_tx: mpsc::UnboundedSender<Option<Event>>,
     events_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Event>>>,
@@ -105,6 +110,9 @@ impl FakeApi {
             connects: Mutex::new(connects.into()),
             fallback: Mutex::new(None),
             after_restart: Mutex::new(None),
+            after_restart_script: Mutex::new(Vec::new()),
+            connect_delay: Duration::ZERO,
+            connect_panics: false,
             connect_count: AtomicUsize::new(0),
             events_tx,
             events_rx: tokio::sync::Mutex::new(events_rx),
@@ -143,8 +151,10 @@ impl FakeApi {
 impl DaemonApi for FakeApi {
     async fn connect(&self) -> Result<Connected, ApiError> {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
+        assert!(!self.connect_panics, "connect panics");
         let next = self.connects.lock().unwrap().pop_front();
         let next = next.or_else(|| self.fallback.lock().unwrap().clone());
+        sleep(self.connect_delay).await;
         match next {
             Some(r) => r,
             None => std::future::pending().await,
@@ -165,6 +175,8 @@ impl DaemonApi for FakeApi {
             if next.is_some() {
                 *self.fallback.lock().unwrap() = next;
             }
+            let script = std::mem::take(&mut *self.after_restart_script.lock().unwrap());
+            self.connects.lock().unwrap().extend(script);
         }
         match (self.exec)(&cmd) {
             Exec::Reply(r) => r,
@@ -598,6 +610,151 @@ async fn input_end_stops_without_deadline() {
     assert!(!app.should_quit);
 }
 
+#[tokio::test(start_paused = true)]
+async fn restart_ignores_stale_failures_and_retries_fast() {
+    // Connects take 1 s; a restart lands while one (doomed to fail) is in flight.
+    let mut api = FakeApi::new(Vec::new())
+        .with_fallback(Err(ApiError::Incompatible("old".into())))
+        .with_exec(|_| Exec::Slow(Duration::from_millis(100), Ok(None)));
+    api.connect_delay = Duration::from_secs(1);
+    *api.after_restart.lock().unwrap() = Some(ok(vec![snap(1, "a.bin", WireState::Paused)]));
+    let api = Arc::new(api);
+    let (tx, input) = input();
+    // Attempt 1: 0–1 s; attempt 2: 1.25–2.25 s; U at 2.1 s, restarted at 2.2 s.
+    send_after(&tx, Duration::from_millis(2100), vec![key('U')]);
+    let (app, frames) = run_for(&api, input, 4.0).await;
+    assert_eq!(app.conn, Conn::Connected);
+    {
+        let frames = frames.lock().unwrap();
+        let restarting = frames
+            .iter()
+            .position(|f| f.contains(Banner::RESTARTING))
+            .expect("no restarting frame");
+        assert!(
+            frames[restarting..]
+                .iter()
+                .all(|f| !f.contains("different puppy version")),
+            "a stale failure brought the banner back"
+        );
+    }
+
+    // The old daemon takes a moment to go: two more mismatches, then the new one.
+    let api = FakeApi::new(Vec::new())
+        .with_fallback(Err(ApiError::Incompatible("old".into())))
+        .with_exec(|_| Exec::Slow(Duration::from_millis(100), Ok(None)));
+    *api.after_restart_script.lock().unwrap() = vec![
+        Err(ApiError::Incompatible("old".into())),
+        Err(ApiError::Incompatible("old".into())),
+    ];
+    *api.after_restart.lock().unwrap() = Some(ok(Vec::new()));
+    let api = Arc::new(api);
+    let (tx, input) = self::input();
+    send_after(&tx, Duration::from_secs(1), vec![key('U')]);
+    // Restart done at 1.1 s; retries at 1.1, 1.3, 1.5 s (normal backoff: 1.85 s).
+    let (app, frames) = run_for(&api, input, 1.7).await;
+    assert_eq!(app.conn, Conn::Connected);
+    let frames = frames.lock().unwrap();
+    let restarting = frames
+        .iter()
+        .position(|f| f.contains(Banner::RESTARTING))
+        .expect("no restarting frame");
+    assert!(
+        frames[restarting..]
+            .iter()
+            .all(|f| !f.contains("different puppy version"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_detail_fetch_in_flight_per_download() {
+    let api = Arc::new(
+        FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Active)])]).with_exec(|_| Exec::Hang),
+    );
+    let (_tx, input) = input();
+    run_for(&api, input, 3.0).await;
+    let fetches = api
+        .executed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| **c == Cmd::FetchDetail(1))
+        .count();
+    assert_eq!(fetches, 1);
+
+    // Once answered, the next tick fetches again.
+    let api = Arc::new(
+        FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Active)])])
+            .with_exec(|_| Exec::Slow(Duration::from_millis(700), Err("slow".into()))),
+    );
+    let (_tx, input) = self::input();
+    // Ticks at .5 (fetch until 1.2), 1.0 (skipped), 1.5 (fetch), 2.0 (skipped), 2.5 (fetch).
+    run_for(&api, input, 2.7).await;
+    assert_eq!(api.executed.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_task_panic_is_fatal() {
+    let api = Arc::new(
+        FakeApi::new(vec![ok(vec![snap(1, "a.bin", WireState::Active)])])
+            .with_exec(|_| panic!("exec blew up")),
+    );
+    let (tx, input) = input();
+    send_after(&tx, Duration::from_millis(100), vec![key('p')]);
+    let (mut term, _) = Recorder::terminal(120, 40);
+    let started = Instant::now();
+    let e = run_with(
+        api,
+        theme(),
+        &mut term,
+        input,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("panicked"), "{e}");
+    assert!(started.elapsed() < Duration::from_millis(200));
+
+    // The connection task too.
+    let mut api = FakeApi::new(Vec::new());
+    api.connect_panics = true;
+    let (_tx, input) = self::input();
+    let e = run_with(
+        Arc::new(api),
+        theme(),
+        &mut term,
+        input,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("internal error"), "{e}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_clock_set_before_the_first_frame() {
+    let api = Arc::new(FakeApi::new(Vec::new()));
+    let (_tx, input) = input();
+    let (app, frames) = run_for(&api, input, 0.1).await;
+    assert!(app.now_unix > 1_700_000_000);
+    assert!(!frames.lock().unwrap().is_empty());
+}
+
+#[test]
+fn banner_messages_are_one_line() {
+    let mut app = App::new(theme());
+    let now = std::time::Instant::now();
+    app.update(
+        Msg::ConnectError("\n  permission denied\nsecond line\x1b[31m".into()),
+        now,
+    );
+    assert_eq!(app.banner, Some(Banner::Error("permission denied".into())));
+    app.update(Msg::NoDaemon("see\tlog\nmore".into()), now);
+    let Some(Banner::NoDaemon(t)) = &app.banner else {
+        panic!()
+    };
+    assert!(!t.contains('\t') && !t.contains("more"), "{t:?}");
+}
+
 // ---------------------------------------------------------------------------------
 // Real daemon
 
@@ -611,19 +768,29 @@ mod real {
     use puppy_tui::api::ClientApi;
     use std::path::PathBuf;
 
-    fn socket_name() -> SocketName {
-        let pid = std::process::id();
+    /// The socket inside `home` (removed with it); `home` is under `/tmp` so the path
+    /// stays well within `sun_path` (~104 bytes on macOS).
+    fn socket_name(home: &std::path::Path) -> SocketName {
         if cfg!(windows) {
-            SocketName::Pipe(format!("puppy-tui-{pid}"))
+            SocketName::Pipe(format!("puppy-tui-{}", std::process::id()))
         } else {
-            SocketName::Path(PathBuf::from(format!("/tmp/pz-{pid}-tui.sock")))
+            let p = home.join("d.sock");
+            assert!(p.as_os_str().len() < 100, "{}", p.display());
+            SocketName::Path(p)
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_daemon_smoke() {
-        let home = tempfile::tempdir().unwrap();
-        let socket = socket_name();
+        let home = if cfg!(windows) {
+            tempfile::tempdir().unwrap()
+        } else {
+            tempfile::Builder::new()
+                .prefix("pz")
+                .tempdir_in("/tmp")
+                .unwrap()
+        };
+        let socket = socket_name(home.path());
         let paths = Paths::with_home(home.path(), socket.clone()).unwrap();
         let dl = home.path().join("dl");
         let daemon = tokio::spawn(run_daemon(DaemonOptions {
@@ -699,9 +866,6 @@ mod real {
             .unwrap();
         c.call(Request::Shutdown).await.unwrap();
         daemon.await.unwrap().unwrap();
-        if let SocketName::Path(p) = &socket {
-            let _ = std::fs::remove_file(p);
-        }
     }
 }
 

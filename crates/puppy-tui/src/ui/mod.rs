@@ -154,26 +154,28 @@ fn banner(app: &App, buf: &mut Buffer, area: Rect) {
     let Some(banner) = &app.banner else {
         return;
     };
-    let warn = t.style(Token::Warn);
-    let err = t.style(Token::Err);
-    let parts: Vec<(&str, Style)> = match banner {
-        Banner::Incompatible(_) => vec![
-            (" ! ", warn),
-            ("daemon is a different puppy version — press ", warn),
-            ("U", t.style(Token::Key)),
-            (" to restart it", warn),
-        ],
-        Banner::NoDaemon(hint) => vec![(" ✗ ", err), (hint, err)],
-        Banner::Error(e) => vec![
-            (" ✗ ", err),
-            ("cannot connect to the daemon: ", err),
-            (e, err),
-        ],
-        Banner::Restarting => vec![
-            (" ◌ ", t.style(Token::Info)),
-            ("restarting the daemon…", t.style(Token::Info)),
-        ],
+    let (mark, token) = match banner {
+        Banner::Incompatible(_) => (" ! ", Token::Warn),
+        Banner::NoDaemon(_) | Banner::Error(_) => (" ✗ ", Token::Err),
+        Banner::Restarting => (" ◌ ", Token::Info),
     };
+    let style = t.style(token);
+    let text = banner.text();
+    let key = format!(" {} ", Banner::RESTART_KEY);
+    let mut parts: Vec<(&str, Style)> = vec![(mark, style)];
+    match (banner, text.split_once(&key)) {
+        // The key to press stands out.
+        (Banner::Incompatible(_), Some((before, after))) => {
+            parts.extend([
+                (before, style),
+                (" ", style),
+                (Banner::RESTART_KEY, t.style(Token::Key)),
+                (" ", style),
+                (after, style),
+            ]);
+        }
+        _ => parts.push((&text, style)),
+    }
     spans(buf, area.x, area.y, area.width, &parts);
 }
 
