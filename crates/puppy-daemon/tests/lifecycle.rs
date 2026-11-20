@@ -13,7 +13,7 @@ use puppy_proto::{
     Envelope, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg, write_msg,
 };
 use puppy_testserver::{ServerCfg, TestServer};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{BufReader, ReadHalf, WriteHalf};
@@ -143,7 +143,7 @@ impl Env {
     }
 
     #[cfg(unix)]
-    fn socket_path(&self) -> &Path {
+    fn socket_path(&self) -> &std::path::Path {
         match &self.socket {
             SocketName::Path(p) => p,
             SocketName::Pipe(_) => unreachable!(),
