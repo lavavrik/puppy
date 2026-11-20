@@ -339,17 +339,27 @@ async fn global_limit_divided() {
 
 #[tokio::test]
 async fn per_download_limit_is_applied_and_stored() {
+    // The token bucket admits a chunk once a burst (limit/4) is available and takes the
+    // rest as debt that is never waited out for the *last* chunk, so a transfer of `len`
+    // bytes takes at least `(len - last_chunk) / limit`. Chunks are whatever hyper's read
+    // buffer holds, which grows up to ~408 KiB under load; with a 1 MiB file at 512 KiB/s
+    // (nominally 2 s) that still leaves >= 1.2 s, while an unlimited local transfer takes
+    // a few milliseconds.
+    const LEN: u64 = 1024 * KIB;
+    const LIMIT: u64 = 512 * KIB;
+    const MAX_CHUNK: u64 = 408 * KIB;
     let env = Env::new();
-    let s = server(|c| c.len = 256 * KIB).await;
+    let s = server(|c| c.len = LEN).await;
     let m = env.manager(3).await;
     let t0 = Instant::now();
     let a = m
-        .add(env.req(&s, "a.bin"), false, Some(128 * KIB))
+        .add(env.req(&s, "a.bin"), false, Some(LIMIT))
         .await
         .unwrap();
-    assert_eq!(snap(&m, a).limit, Some(128 * KIB));
+    assert_eq!(snap(&m, a).limit, Some(LIMIT));
     wait_completed(&m, a).await;
-    assert!(t0.elapsed() >= Duration::from_millis(1500));
+    let min = Duration::from_secs_f64((LEN - MAX_CHUNK) as f64 / LIMIT as f64);
+    assert!(t0.elapsed() >= min, "{:?} < {min:?}", t0.elapsed());
     m.set_limit(a, Some(0)).unwrap();
     assert_eq!(snap(&m, a).limit, None);
     assert!(matches!(
