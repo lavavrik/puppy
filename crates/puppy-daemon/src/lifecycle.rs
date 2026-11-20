@@ -23,6 +23,10 @@ use tracing::{info, warn};
 
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
+/// How long a probe of an existing Unix socket may take before whatever listens there
+/// is considered alive.
+#[cfg(unix)]
+const STALE_PROBE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct DaemonOptions {
@@ -45,8 +49,8 @@ pub enum RunOutcome {
 
 /// Resolves the paths (unless given), sets up logging to `log_dir/puppyd.log` (plus
 /// stderr when it is a terminal), takes an exclusive non-blocking lock on `lock_file`
-/// (held by another daemon ⇒ `AlreadyRunning`), removes a stale Unix socket file, loads
-/// config and state, builds the engine, manager and server, and runs until a `Shutdown`
+/// (held by another daemon ⇒ `AlreadyRunning`), removes a dead Unix socket file (failing
+/// instead if something listens on it or it is not a socket), loads config and state, builds the engine, manager and server, and runs until a `Shutdown`
 /// request, Ctrl-C, SIGTERM (Unix) or — with `idle_exit` — that long without work or
 /// clients. Then it stops the server (removing the socket file), shuts the manager
 /// down (pausing downloads, persisting state) and releases the lock.
@@ -65,7 +69,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         return Ok(RunOutcome::AlreadyRunning);
     };
     // Only the lock holder may touch the socket.
-    remove_stale_socket(&paths.socket)?;
+    remove_stale_socket(&paths.socket).await?;
 
     let cfg = Config::load(&paths.config_file())?;
     let http = opts.http.unwrap_or_else(|| cfg.http_config());
@@ -148,39 +152,53 @@ fn acquire_lock(path: &Path) -> anyhow::Result<Option<File>> {
     }
 }
 
-/// Removes a leftover socket (or regular) file at the Unix socket path, e.g. from a
-/// daemon that was killed. Anything else there (a directory, a symlink) is an error.
+/// Removes a dead socket left at the Unix socket path, e.g. by a daemon that was
+/// killed. Refuses (without touching it) a socket something is still listening on
+/// (another daemon, e.g. one with a different home, owns it) and anything that is not
+/// a socket (a user's file or directory, a symlink).
 #[cfg(unix)]
-fn remove_stale_socket(name: &SocketName) -> anyhow::Result<()> {
+async fn remove_stale_socket(name: &SocketName) -> anyhow::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let SocketName::Path(p) = name else {
         return Ok(());
     };
     match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_socket() || m.file_type().is_file() => {
-            match std::fs::remove_file(p) {
-                Ok(()) => {
-                    info!(path = %p.display(), "removed a stale socket file");
-                    Ok(())
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(e) => {
-                    Err(e).with_context(|| format!("cannot remove stale socket {}", p.display()))
-                }
-            }
-        }
+        Ok(m) if m.file_type().is_socket() => {}
         Ok(_) => anyhow::bail!(
             "{} exists and is not a socket; remove it or set PUPPY_SOCKET",
             p.display()
         ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", p.display())),
+    }
+    match tokio::time::timeout(STALE_PROBE, tokio::net::UnixStream::connect(p)).await {
+        // Answered, or alive but too busy to answer in time.
+        Ok(Ok(_)) | Err(_) => anyhow::bail!(
+            "another process is already listening on {}; stop it or set PUPPY_SOCKET",
+            p.display()
+        ),
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) => {}
+        Ok(Err(e)) => {
+            return Err(e).with_context(|| format!("cannot probe the socket {}", p.display()));
+        }
+    }
+    match std::fs::remove_file(p) {
+        Ok(()) => {
+            info!(path = %p.display(), "removed a stale socket file");
+            Ok(())
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("cannot inspect {}", p.display())),
+        Err(e) => Err(e).with_context(|| format!("cannot remove stale socket {}", p.display())),
     }
 }
 
 /// Named pipes vanish with their last handle; nothing can be stale.
 #[cfg(not(unix))]
-fn remove_stale_socket(_name: &SocketName) -> anyhow::Result<()> {
+async fn remove_stale_socket(_name: &SocketName) -> anyhow::Result<()> {
     Ok(())
 }
 

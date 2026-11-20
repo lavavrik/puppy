@@ -264,14 +264,39 @@ async fn second_daemon_exits_when_locked() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn regular_file_at_socket_path_is_not_removed() {
+    let env = Env::new();
+    std::fs::write(env.socket_path(), b"user data").unwrap();
+    let r = tokio::time::timeout(TIMEOUT, run_daemon(env.opts(None)))
+        .await
+        .unwrap();
+    let e = r.expect_err("daemon must refuse a regular file at the socket path");
+    assert!(format!("{e:#}").contains("not a socket"), "{e:#}");
+    assert_eq!(std::fs::read(env.socket_path()).unwrap(), b"user data");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_socket_not_stolen() {
+    let env = Env::new();
+    // Something else (e.g. a daemon with another home) is listening there.
+    let live = std::os::unix::net::UnixListener::bind(env.socket_path()).unwrap();
+    let r = tokio::time::timeout(TIMEOUT, run_daemon(env.opts(None)))
+        .await
+        .unwrap();
+    let e = r.expect_err("daemon must refuse a socket someone is listening on");
+    assert!(format!("{e:#}").contains("already listening"), "{e:#}");
+    assert!(env.socket_path().exists(), "the live socket was left alone");
+    // The listener still works.
+    let _c = std::os::unix::net::UnixStream::connect(env.socket_path()).unwrap();
+    live.accept().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_socket_is_replaced() {
     let env = Env::new();
-    std::fs::write(env.socket_path(), b"stale").unwrap();
-    let d = env.start(None).await;
-    env.client().await;
-    shutdown(&env, d).await;
-
-    // A stale socket (left by a killed daemon) is replaced too.
+    // A stale socket (left by a killed daemon) is replaced.
     let stale = std::os::unix::net::UnixListener::bind(env.socket_path()).unwrap();
     drop(stale);
     assert!(env.socket_path().exists());
