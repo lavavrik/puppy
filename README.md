@@ -1,15 +1,15 @@
 # puppy
 
 A modern terminal download manager written in Rust, meant as a fresh successor
-to [aria2](https://aria2.github.io/). It downloads over HTTP(S) today, with a
-full-screen dashboard; BitTorrent is in progress. A background daemon
+to [aria2](https://aria2.github.io/). It downloads over HTTP(S) and BitTorrent
+(magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
 owns every download and the queue, so downloads keep going when no client is
 open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
 
 ## Status
 
-Early development. Done so far:
+Early development, but the first four milestones are done:
 
 - **HTTP(S) engine**: segmented multi-connection downloads (8 connections by
   default) with robust resume. A resumed file is revalidated against the
@@ -24,10 +24,14 @@ Early development. Done so far:
 - **Dashboard**: a full-screen terminal UI (`puppy`) to add, pause, resume,
   reorder, limit and delete downloads, with a live detail pane, dark and light
   themes, and monochrome / 16-color fallbacks.
+- **BitTorrent**: magnet links and `.torrent` files (via
+  [librqbit](https://github.com/ikatson/rqbit)), queued alongside HTTP
+  downloads, with peers, ratio and a piece map in the detail pane, and resume
+  across daemon restarts (existing data is re-checked). See
+  [Torrents](#torrents) for what v1 does and does not do.
 
-In progress: BitTorrent support (.torrent files and magnet links).
-Scriptable subcommands (`puppy add`, `puppy ls`, …) and browser integration
-come later.
+Tested locally on Linux; CI for Windows and macOS is pending. Scriptable
+subcommands (`puppy add`, `puppy ls`, …) and browser integration come later.
 
 ## Demo
 
@@ -128,11 +132,42 @@ Settings go in `config.toml` (where it lives: see below). Keys:
 `proxy`. `NO_COLOR` switches to monochrome; without `COLORTERM=truecolor` the
 16 ANSI colors are used. `--theme` overrides the file.
 
+Torrents have their own section:
+
+```toml
+[torrent]
+dht = true            # find peers through the DHT
+upnp = false          # ask the router to forward listen_port (UPnP)
+listen_port = 42069   # incoming peer connections; an OS-assigned port if busy
+seed_ratio = 0.0      # reserved: v1 stops at completion (see below)
+```
+
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening
 puppy, run the daemon as a login service (a systemd user unit, a launchd
 LaunchAgent, or a Windows log-on task): see [docs/service.md](docs/service.md)
 and the files in [packaging/](packaging/).
+
+### Torrents
+
+Add a magnet link or the path of a `.torrent` file in the dashboard's add
+form (`a`). A `.torrent` is copied into the daemon's data directory
+(`torrents/<id>.torrent`) so the download can be restored after a restart
+even if the original is moved. A single-file torrent goes straight into the
+download directory; a multi-file torrent, or any magnet, into its own folder
+there. Things to know about v1:
+
+- **No seeding after completion**: a finished torrent is stopped and shown as
+  completed. `seed_ratio` is reserved for a later version.
+- **Piece map is an approximation**: the detail pane's piece map is derived
+  from per-file progress (assuming each file fills in order), not from the
+  exact set of verified pieces.
+- **Per-torrent speed limits** can only be set before the torrent starts,
+  i.e. while a magnet is still fetching its metadata (librqbit takes a
+  torrent's limit only when it is added); later the dashboard says so. The
+  global limits apply to torrents at any time.
+- **DHT is on by default, UPnP is off.** Trackers and local peer discovery are
+  used too.
 
 State lives in the platform data directory (`~/.local/share/puppy`,
 `~/Library/Application Support/puppy` or `%APPDATA%\puppy`); the daemon's log
@@ -146,7 +181,8 @@ is `logs/puppyd.log` there. `config.toml` lives in the config directory
 |---------------------------|-----------------------------------------------------------------|
 | `crates/puppy`            | The `puppy` binary: dashboard, `status` and `daemon`.           |
 | `crates/puppy-tui`        | The full-screen dashboard (ratatui).                            |
-| `crates/puppy-core`       | Download engines (HTTP so far) behind a common `Engine` trait.  |
+| `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S) engine.        |
+| `crates/puppy-torrent`    | The BitTorrent engine (librqbit behind the `Engine` trait).     |
 | `crates/puppy-daemon`     | The daemon: paths, config, queue manager, state store, server.  |
 | `crates/puppy-proto`      | The daemon ↔ client protocol types and framing.                 |
 | `crates/puppy-client`     | Client library: connecting, requests, events, auto-spawning.    |

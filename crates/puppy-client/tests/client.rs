@@ -75,6 +75,7 @@ impl Env {
                 ..HttpConfig::default()
             }),
             engine: None,
+            torrent_test: Some(Default::default()),
         }
     }
 

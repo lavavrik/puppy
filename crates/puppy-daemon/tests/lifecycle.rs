@@ -73,6 +73,7 @@ impl Env {
                 ..HttpConfig::default()
             }),
             engine: None,
+            torrent_test: Some(Default::default()),
         }
     }
 
@@ -578,6 +579,49 @@ async fn slow_restore_does_not_block_the_socket() {
     assert!(waited < Duration::from_millis(500), "hello took {waited:?}");
     // Shown with its stored state while the restore runs.
     assert_eq!(c.get(id).await.0, WireState::Paused);
+    drop(c);
+    shutdown(&env, d).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torrent_engine_failure_runs_without_torrents() {
+    let env = Env::new();
+    // The torrent engine cannot create its state dir: a regular file is in the way.
+    std::fs::write(env.paths().data_dir.join("torrent"), b"in the way").unwrap();
+    let d = env.start(None).await;
+    let mut c = env.client().await;
+    let r = c
+        .request(Request::Add {
+            request: AddRequest {
+                source: Source::Magnet {
+                    uri: format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)),
+                },
+                output_dir: Some(env.dl_dir()),
+                filename: None,
+                context: RequestContext::default(),
+            },
+            start_paused: true,
+            limit: None,
+        })
+        .await;
+    assert!(matches!(r, Reply::Err { .. }), "magnet accepted: {r:?}");
+    // HTTP downloads still work.
+    let s = server(|_| {}).await;
+    let id = c
+        .add(AddRequest {
+            source: Source::Http {
+                url: s.url("/file.bin"),
+            },
+            output_dir: Some(env.dl_dir()),
+            filename: Some("h.bin".into()),
+            context: RequestContext::default(),
+        })
+        .await;
+    let deadline = Instant::now() + TIMEOUT;
+    while c.get(id).await.0 != WireState::Completed {
+        assert!(Instant::now() < deadline, "http download never completed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drop(c);
     shutdown(&env, d).await;
 }

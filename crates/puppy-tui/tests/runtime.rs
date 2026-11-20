@@ -814,6 +814,7 @@ mod real {
                 ..HttpConfig::default()
             }),
             engine: None,
+            torrent_test: Some(Default::default()),
         }));
         let server = TestServer::start(ServerCfg {
             len: 256 * 1024,

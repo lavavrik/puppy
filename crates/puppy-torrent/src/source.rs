@@ -209,6 +209,20 @@ impl Layout {
     pub fn for_magnet(base: &Path, m: &MagnetInfo) -> Self {
         Self::folder(base, &m.folder_name())
     }
+
+    /// The layout of a torrent restored from `path` (what [`Layout::path`] was when it
+    /// was added), so its files land where they were: a single file's output folder is
+    /// its parent; otherwise the folder is `path` itself.
+    pub fn restored(path: &Path, single_file: bool) -> Self {
+        Layout {
+            output_folder: match path.parent() {
+                Some(parent) if single_file => parent.to_owned(),
+                _ => path.to_owned(),
+            },
+            path: path.to_owned(),
+            single_file,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +319,14 @@ mod tests {
         assert_eq!(multi.path, base.join("bundle"));
         let m = parse_magnet(&format!("magnet:?xt=urn:btih:{HASH}")).unwrap();
         assert_eq!(Layout::for_magnet(base, &m).output_folder, base.join(HASH));
+    }
+
+    #[test]
+    fn restored_layouts_match_the_original() {
+        let base = Path::new("/dl");
+        let single = Layout::single(base, Path::new("a.iso"));
+        assert_eq!(Layout::restored(&single.path, true), single);
+        let multi = Layout::folder(base, "bundle");
+        assert_eq!(Layout::restored(&multi.path, false), multi);
     }
 }

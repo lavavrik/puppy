@@ -8,7 +8,7 @@ use puppy_core::engine::EngineEvent;
 use puppy_core::types::DownloadState;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::{Shared, Slot};
+use crate::engine::{Shared, Slot, View};
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -36,6 +36,18 @@ pub(crate) async fn poll_once(shared: &Shared) {
         .iter()
         .filter_map(|(&id, e)| Shared::view(e).map(|v| (id, v)))
         .collect();
+    let handles: Vec<_> = views
+        .iter()
+        .filter_map(|(id, v)| match v {
+            View::Managed { handle, .. } => Some((*id, handle.clone())),
+            View::Pending(_) => None,
+        })
+        .collect();
+    for (id, h) in handles {
+        if let Err(e) = shared.unstick(&h).await {
+            tracing::warn!(id, "restarting a resumed torrent: {e}");
+        }
+    }
     let statuses: Vec<_> = views.into_iter().map(|(id, v)| (id, v.status())).collect();
 
     let mut events = Vec::new();

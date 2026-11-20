@@ -11,8 +11,10 @@ use anyhow::Context;
 use puppy_core::config::HttpConfig;
 use puppy_core::engine::Engine;
 use puppy_core::http::engine::HttpEngine;
+use puppy_torrent::{TorrentEngine, TorrentEngineOptions};
 use std::fs::File;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +26,8 @@ use tracing::{info, warn};
 /// After a second shutdown signal, how long the state may take to be saved before the
 /// daemon exits anyway.
 const FORCED_FLUSH: Duration = Duration::from_secs(1);
+/// How long the torrent session may take to stop (it normally takes about 1 s).
+const TORRENT_SHUTDOWN: Duration = Duration::from_secs(3);
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -42,6 +46,17 @@ pub struct DaemonOptions {
     pub http: Option<HttpConfig>,
     /// Use this engine instead of building an HTTP engine (tests).
     pub engine: Option<Arc<dyn Engine>>,
+    /// Tests: run the torrent engine network-free (no DHT, trackers, LSD or UPnP;
+    /// listening on 127.0.0.1) with these peers given to every torrent.
+    #[doc(hidden)]
+    pub torrent_test: Option<TorrentTestOptions>,
+}
+
+/// See [`DaemonOptions::torrent_test`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct TorrentTestOptions {
+    pub initial_peers: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for DaemonOptions {
@@ -51,6 +66,7 @@ impl std::fmt::Debug for DaemonOptions {
             .field("paths", &self.paths)
             .field("http", &self.http)
             .field("engine", &self.engine.as_ref().map(|e| e.kind()))
+            .field("torrent_test", &self.torrent_test)
             .finish()
     }
 }
@@ -70,12 +86,14 @@ pub enum RunOutcome {
 /// stderr when it is a terminal), takes an exclusive non-blocking lock on `lock_file`
 /// (held by another daemon ⇒ `AlreadyRunning`), writes its pid to `pid_file` (removed
 /// on exit), removes a dead Unix socket file (failing
-/// instead if something listens on it or it is not a socket), loads config and state, builds the engine, manager and server, and runs until a `Shutdown`
+/// instead if something listens on it or it is not a socket), loads config and state,
+/// builds the engines (HTTP, and torrent unless its engine fails to start: then the
+/// daemon runs without torrents), manager and server, and runs until a `Shutdown`
 /// request, a signal (Ctrl-C/SIGINT, SIGTERM, SIGHUP on Unix; Ctrl-C, console close,
 /// logoff and system shutdown on Windows) or — with `idle_exit` — that long without
 /// work or clients. Then it stops the server (removing the socket file), shuts the
-/// manager down (pausing downloads, at most 10 s, then persisting state) and releases
-/// the lock. Another signal during that shutdown makes it save the state for at most
+/// manager down (pausing downloads, at most 10 s, then persisting state), stops the
+/// torrent session (about 1 s, at most 3 s) and releases the lock. Another signal during that shutdown makes it save the state for at most
 /// 1 s and return [`RunOutcome::Forced`] at once.
 ///
 /// Fails without touching it if the state file exists but cannot be read.
@@ -97,21 +115,30 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     remove_stale_socket(&paths.socket).await?;
 
     let cfg = Config::load(&paths.config_file())?;
+    let http = opts.http.unwrap_or_else(|| cfg.http_config());
+    let download_dir = http.default_dir.clone();
     let engine: Arc<dyn Engine> = match opts.engine {
         Some(engine) => engine,
-        None => {
-            let http = opts.http.unwrap_or_else(|| cfg.http_config());
-            Arc::new(HttpEngine::new(http).context("cannot create the HTTP engine")?)
+        None => Arc::new(HttpEngine::new(http).context("cannot create the HTTP engine")?),
+    };
+    let torrent = start_torrent_engine(&cfg, &paths, download_dir, opts.torrent_test).await;
+    let mut engines = vec![engine];
+    if let Some(t) = &torrent {
+        engines.push(t.clone());
+    }
+    let store = Store::new(paths.state_file.clone());
+    let manager = match Manager::start(engines, store, cfg).await {
+        Ok(m) => m,
+        Err(e) => {
+            shutdown_torrent(torrent.as_deref()).await;
+            return Err(e).context("refusing to start");
         }
     };
-    let store = Store::new(paths.state_file.clone());
-    let manager = Manager::start(vec![engine], store, cfg)
-        .await
-        .context("refusing to start")?;
     let server = match Server::bind(&paths.socket, manager.clone()).await {
         Ok(s) => s,
         Err(e) => {
             manager.shutdown().await;
+            shutdown_torrent(torrent.as_deref()).await;
             return Err(e)
                 .with_context(|| format!("cannot listen on {}", socket_display(&paths.socket)));
         }
@@ -151,6 +178,8 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
             warn!("the server task failed: {e}");
         }
         manager.shutdown().await;
+        // After the manager paused its torrents: stops the session (listener, DHT).
+        shutdown_torrent(torrent.as_deref()).await;
     };
     tokio::select! {
         _ = graceful => {}
@@ -166,6 +195,46 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     }
     info!("daemon stopped");
     Ok(RunOutcome::Exited)
+}
+
+/// Starts the torrent engine from the `[torrent]` config (network-free with
+/// `test`). A failure (e.g. its state dir cannot be created) is logged and the daemon
+/// runs without torrents instead of refusing to start.
+async fn start_torrent_engine(
+    cfg: &Config,
+    paths: &Paths,
+    download_dir: PathBuf,
+    test: Option<TorrentTestOptions>,
+) -> Option<Arc<TorrentEngine>> {
+    let t = &cfg.torrent;
+    let opts = TorrentEngineOptions {
+        dht: t.dht,
+        upnp: t.upnp,
+        listen_port: t.listen_port,
+        seed_ratio: t.seed_ratio,
+        data_dir: paths.data_dir.clone(),
+        default_dir: download_dir,
+        test_mode: test.is_some(),
+        test_initial_peers: test.map(|t| t.initial_peers).unwrap_or_default(),
+    };
+    match TorrentEngine::new(opts).await {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(e) => {
+            tracing::error!("cannot start the torrent engine, running without torrents: {e}");
+            None
+        }
+    }
+}
+
+/// Stops the torrent session, waiting at most [`TORRENT_SHUTDOWN`].
+async fn shutdown_torrent(torrent: Option<&TorrentEngine>) {
+    if let Some(t) = torrent
+        && tokio::time::timeout(TORRENT_SHUTDOWN, t.shutdown())
+            .await
+            .is_err()
+    {
+        warn!("the torrent session did not stop in time");
+    }
 }
 
 fn socket_display(s: &SocketName) -> String {

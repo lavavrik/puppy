@@ -19,7 +19,7 @@ use puppy_core::engine::{
     AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode,
 };
 use puppy_core::types::{
-    AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source,
+    AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source,
 };
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -74,10 +74,13 @@ pub struct TorrentEngine {
 
 /// Shown when a torrent (same info hash) is added twice.
 const DUPLICATE: &str = "already downloading this torrent";
+/// Restore found neither the stored `.torrent` copy nor the original file.
+const TORRENT_MISSING: &str = "torrent file missing";
 
 /// What the engine knows about one torrent besides librqbit's handle.
 pub(crate) struct Entry {
-    /// Lowercase hex info hash (duplicates are refused).
+    /// Lowercase hex info hash (duplicates are refused); empty if unknown (a restored
+    /// torrent whose `.torrent` is gone).
     info_hash: String,
     /// The name until librqbit knows the torrent's own (magnet: `dn` or `magnet <hash>`).
     name: String,
@@ -132,6 +135,9 @@ pub(crate) enum Slot {
     PendingFailed { reason: String, transient: bool },
     /// In librqbit.
     Managed(ManagedTorrentHandle),
+    /// Restored without its `.torrent` (stored copy and original both gone): nothing in
+    /// librqbit; it cannot be resumed, only removed.
+    Attention(AttentionReason),
 }
 
 type Torrents = HashMap<DownloadId, Entry>;
@@ -192,6 +198,9 @@ impl Shared {
                 reason: reason.clone(),
                 transient: *transient,
             }),
+            Slot::Attention(reason) => pending(DownloadState::NeedsAttention {
+                reason: reason.clone(),
+            }),
             Slot::Managed(h) => Some(View::Managed {
                 handle: h.clone(),
                 name: e.name.clone(),
@@ -213,6 +222,18 @@ impl Shared {
             return Ok(());
         }
         self.session.pause(h).await.map_err(lib_error)
+    }
+
+    /// Restarts a torrent left stopped against our wishes: one resumed while librqbit
+    /// was still checking its data after a paused add. librqbit then clears its paused
+    /// flag but its check task still ends in `Paused`, where it would stay.
+    pub(crate) async fn unstick(&self, h: &ManagedTorrentHandle) -> Result<(), EngineError> {
+        let stuck =
+            || !h.is_paused() && h.with_state(|s| matches!(s, ManagedTorrentState::Paused(_)));
+        if !stuck() || h.stats().finished {
+            return Ok(());
+        }
+        self.session.unpause(h).await.map_err(lib_error)
     }
 
     /// librqbit add options for a torrent going to `layout`.
@@ -456,12 +477,12 @@ fn lib_error(e: anyhow::Error) -> EngineError {
     }
 }
 
-/// Releases a reserved id (and the stored `.torrent` copy) if `add` fails or its future
-/// is dropped mid-await.
+/// Releases a reserved id (and the stored `.torrent` copy, if `stored`) if `add` fails
+/// or its future is dropped mid-await.
 struct Reservation<'a> {
     shared: &'a Shared,
     id: DownloadId,
-    stored: PathBuf,
+    stored: Option<PathBuf>,
     armed: bool,
 }
 
@@ -469,9 +490,40 @@ impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.shared.lock().remove(&self.id);
-            let _ = std::fs::remove_file(&self.stored);
+            if let Some(stored) = &self.stored {
+                let _ = std::fs::remove_file(stored);
+            }
         }
     }
+}
+
+/// Where an added torrent's files go.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    /// A new download: into this output dir (its own folder unless single-file).
+    Fresh(&'a Path),
+    /// A restored download: back where its files were (its `Added::path`).
+    Restore(&'a Path),
+}
+
+impl Target<'_> {
+    fn layout(self, info: &source::TorrentInfo) -> Layout {
+        match self {
+            Target::Fresh(base) => Layout::for_torrent(base, info),
+            Target::Restore(path) => Layout::restored(path, info.single_file.is_some()),
+        }
+    }
+}
+
+/// What `add` does with the stored `.torrent` copy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoredCopy {
+    /// Write it; delete it again if the add fails (a fresh add).
+    Write,
+    /// Write it (restored from the original: the copy was gone); keep it on failure.
+    Rewrite,
+    /// Restored from the copy: leave it as it is.
+    Keep,
 }
 
 impl TorrentEngine {
@@ -524,11 +576,12 @@ impl TorrentEngine {
         &self,
         id: DownloadId,
         bytes: Vec<u8>,
-        base: &Path,
+        target: Target<'_>,
+        copy: StoredCopy,
         opts: &AddOptions,
     ) -> Result<Added, EngineError> {
         let info = source::parse_torrent(&bytes)?;
-        let layout = Layout::for_torrent(base, &info);
+        let layout = target.layout(&info);
         let add_opts = self
             .shared
             .add_options(&layout, opts.start_paused, opts.limit)?;
@@ -556,10 +609,12 @@ impl TorrentEngine {
         let mut guard = Reservation {
             shared: &self.shared,
             id,
-            stored: stored.clone(),
+            stored: (copy == StoredCopy::Write).then(|| stored.clone()),
             armed: true,
         };
-        tokio::fs::write(&stored, &bytes).await?;
+        if copy != StoredCopy::Keep {
+            tokio::fs::write(&stored, &bytes).await?;
+        }
         let res = self
             .shared
             .session
@@ -593,11 +648,14 @@ impl TorrentEngine {
         &self,
         id: DownloadId,
         uri: String,
-        base: &Path,
+        target: Target<'_>,
         opts: &AddOptions,
     ) -> Result<Added, EngineError> {
         let info = source::parse_magnet(&uri)?;
-        let layout = Layout::for_magnet(base, &info);
+        let layout = match target {
+            Target::Fresh(base) => Layout::for_magnet(base, &info),
+            Target::Restore(path) => Layout::restored(path, false),
+        };
         let add_opts = self.shared.add_options(&layout, false, opts.limit)?;
         let name = info.display_name();
         let mut map = self.shared.lock();
@@ -633,12 +691,84 @@ impl TorrentEngine {
     }
 }
 
-/// Refuses a taken id or an info hash already in the engine.
+impl TorrentEngine {
+    /// Restores a download added before a restart, its files at `path`: a `.torrent`
+    /// from its stored copy (else the original file, if still there), a magnet from its
+    /// link (the metadata is fetched again). librqbit checks the existing data before
+    /// the torrent goes on. With neither copy nor original, the download is registered
+    /// as needing attention.
+    async fn restore(
+        &self,
+        id: DownloadId,
+        source: Source,
+        path: &Path,
+        opts: &AddOptions,
+    ) -> Result<Added, EngineError> {
+        let target = Target::Restore(path);
+        let original = match source {
+            Source::Magnet { uri } => return self.add_magnet(id, uri, target, opts),
+            Source::TorrentFile { path } => path,
+            Source::Http { .. } => return Err(EngineError::Unsupported("not a torrent source")),
+        };
+        let stored = self.shared.stored_torrent(id);
+        if tokio::fs::try_exists(&stored).await.unwrap_or(false) {
+            let bytes = source::read_torrent_file(&stored).await?;
+            return self
+                .add_torrent_file(id, bytes, target, StoredCopy::Keep, opts)
+                .await;
+        }
+        if tokio::fs::try_exists(&original).await.unwrap_or(false) {
+            tracing::info!(
+                id,
+                "stored .torrent copy missing; restoring from {}",
+                original.display()
+            );
+            let bytes = source::read_torrent_file(&original).await?;
+            return self
+                .add_torrent_file(id, bytes, target, StoredCopy::Rewrite, opts)
+                .await;
+        }
+        tracing::warn!(id, "cannot restore: the .torrent file is gone");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let layout = Layout::restored(path, false);
+        let mut map = self.shared.lock();
+        check_free(&map, id, "")?;
+        map.insert(
+            id,
+            Entry {
+                info_hash: String::new(),
+                name: name.clone(),
+                layout,
+                magnet: None,
+                limit: opts.limit,
+                limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
+                detail: None,
+                uploaded: 0,
+                slot: Slot::Attention(AttentionReason::ValidationFailed {
+                    detail: TORRENT_MISSING.into(),
+                }),
+                last_state: None,
+                completed_sent: false,
+            },
+        );
+        Ok(Added {
+            name,
+            path: path.to_owned(),
+            total_bytes: None,
+        })
+    }
+}
+
+/// Refuses a taken id or an info hash already in the engine (an empty, unknown hash
+/// only the id).
 fn check_free(map: &Torrents, id: DownloadId, info_hash: &str) -> Result<(), EngineError> {
     if map.contains_key(&id) {
         return Err(EngineError::Invalid(format!("duplicate download id {id}")));
     }
-    if map.values().any(|e| e.info_hash == info_hash) {
+    if !info_hash.is_empty() && map.values().any(|e| e.info_hash == info_hash) {
         return Err(EngineError::Invalid(DUPLICATE.into()));
     }
     Ok(())
@@ -803,6 +933,10 @@ impl Engine for TorrentEngine {
 
     /// Returns without waiting for the network (see [`TorrentEngine`]). A `.torrent` is
     /// copied to `<data_dir>/torrents/<id>.torrent` for restore.
+    ///
+    /// `Restore { path }` re-adds the torrent so its files stay at `path` (see
+    /// [`TorrentEngine::restore`]); a torrent whose `.torrent` is gone is `Ok`, needing
+    /// attention.
     async fn add(
         &self,
         id: DownloadId,
@@ -810,21 +944,21 @@ impl Engine for TorrentEngine {
         mode: StartMode,
         opts: AddOptions,
     ) -> Result<Added, EngineError> {
-        if let StartMode::Restore { .. } = mode {
-            return Err(EngineError::Unsupported(
-                "restoring torrents is not implemented yet",
-            ));
+        if let StartMode::Restore { path } = mode {
+            return self.restore(id, req.source, &path, &opts).await;
         }
         let base = req
             .output_dir
             .clone()
             .unwrap_or_else(|| self.shared.opts.default_dir.clone());
+        let target = Target::Fresh(&base);
         match req.source {
             Source::TorrentFile { path } => {
                 let bytes = source::read_torrent_file(&path).await?;
-                self.add_torrent_file(id, bytes, &base, &opts).await
+                self.add_torrent_file(id, bytes, target, StoredCopy::Write, &opts)
+                    .await
             }
-            Source::Magnet { uri } => self.add_magnet(id, uri, &base, &opts),
+            Source::Magnet { uri } => self.add_magnet(id, uri, target, &opts),
             Source::Http { .. } => Err(EngineError::Unsupported("not a torrent source")),
         }
     }
@@ -843,7 +977,10 @@ impl Engine for TorrentEngine {
                 }
                 Slot::Resolving { task, .. } => Err(task),
                 // A failed magnet stays failed (with its reason); nothing runs.
-                other @ (Slot::Held | Slot::PendingFailed { .. } | Slot::Adding) => {
+                other @ (Slot::Held
+                | Slot::PendingFailed { .. }
+                | Slot::Attention(_)
+                | Slot::Adding) => {
                     e.slot = other;
                     return Ok(());
                 }
@@ -893,12 +1030,17 @@ impl Engine for TorrentEngine {
                         .spawn_resolve(id, uri, opts, e.limit_cell.clone());
                     return Ok(());
                 }
+                Slot::Attention(_) => {
+                    return Err(EngineError::Invalid(
+                        "download needs attention and cannot be resumed as is".into(),
+                    ));
+                }
                 Slot::Adding => return Err(EngineError::NotFound(id)),
             }
         };
         let st = map::Stats::from(&h.stats());
         // Finished: stays stopped (no seeding). Running or starting: nothing to do.
-        let stopped = h.is_paused() || st.phase == map::Phase::Error;
+        let stopped = h.is_paused() || matches!(st.phase, map::Phase::Paused | map::Phase::Error);
         if st.finished || !stopped {
             return Ok(());
         }
@@ -923,7 +1065,7 @@ impl Engine for TorrentEngine {
                 task.abort();
                 task.await.ok().flatten()
             }
-            Slot::Held | Slot::PendingFailed { .. } | Slot::Adding => None,
+            Slot::Held | Slot::PendingFailed { .. } | Slot::Attention(_) | Slot::Adding => None,
         };
         let deleted = match handle {
             Some(h) => {
@@ -967,6 +1109,8 @@ impl Engine for TorrentEngine {
             (h.clone(), cached)
         };
         let stats = h.stats();
+        // A map cached while downloading is stale once the torrent has finished.
+        let cached = cached.filter(|(n, have)| !stats.finished || map::has_every_piece(*n, have));
         let fresh = match cached {
             Some(_) => None,
             None => {
@@ -1003,10 +1147,10 @@ impl Engine for TorrentEngine {
             // Removed meanwhile: nothing to report.
             let e = map.get_mut(&id)?;
             e.uploaded = e.uploaded.max(stats.uploaded_bytes);
-            if e.detail
-                .as_ref()
-                .is_none_or(|c| c.at.elapsed() >= DETAIL_TTL)
-            {
+            if e.detail.as_ref().is_none_or(|c| {
+                c.at.elapsed() >= DETAIL_TTL
+                    || (stats.finished && !map::has_every_piece(c.piece_count, &c.have))
+            }) {
                 e.detail = Some(DetailCache {
                     at: Instant::now(),
                     piece_count,
@@ -1035,7 +1179,10 @@ impl Engine for TorrentEngine {
             .filter(|e| !matches!(e.slot, Slot::Adding))
             .ok_or(EngineError::NotFound(id))?;
         match e.slot {
-            Slot::Resolving { .. } | Slot::Held | Slot::PendingFailed { .. } => {
+            Slot::Resolving { .. }
+            | Slot::Held
+            | Slot::PendingFailed { .. }
+            | Slot::Attention(_) => {
                 let bps = bps.filter(|&b| b > 0);
                 e.limit = bps;
                 e.limit_cell.store(bps.unwrap_or(0), Ordering::Relaxed);

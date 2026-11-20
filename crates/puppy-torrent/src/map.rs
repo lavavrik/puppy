@@ -231,8 +231,24 @@ pub(crate) fn have_bitfield(
     out
 }
 
+/// Whether `have` (MSB-first, as [`have_bitfield`] makes it) has all `piece_count` bits set.
+pub(crate) fn has_every_piece(piece_count: u32, have: &[u8]) -> bool {
+    (0..piece_count as usize).all(|p| have.get(p / 8).is_some_and(|b| b & (0x80 >> (p % 8)) != 0))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_piece() {
+        use super::has_every_piece;
+        assert!(has_every_piece(0, &[]));
+        assert!(has_every_piece(3, &[0b1110_0000]));
+        assert!(!has_every_piece(3, &[0b1100_0000]));
+        assert!(has_every_piece(9, &[0xff, 0x80]));
+        assert!(!has_every_piece(9, &[0xff]));
+        assert!(!has_every_piece(9, &[0x7f, 0x80]));
+    }
+
     use super::*;
 
     #[test]

@@ -23,6 +23,9 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 
 [dev-dependencies]
+# The torrent test's local seeder (crates/puppy-torrent/tests/support).
+librqbit.workspace = true
+bytes.workspace = true
 puppy-testserver = { path = "../puppy-testserver" }
 tempfile.workspace = true
 anyhow.workspace = true

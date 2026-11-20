@@ -2812,8 +2812,10 @@ name = "puppy-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "interprocess",
  "libc",
+ "librqbit",
  "puppy-core",
  "puppy-daemon",
  "puppy-proto",
@@ -2864,6 +2866,7 @@ dependencies = [
  "puppy-core",
  "puppy-proto",
  "puppy-testserver",
+ "puppy-torrent",
  "serde",
  "serde_json",
  "tempfile",
