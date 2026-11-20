@@ -10,6 +10,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Errors from loading the state file.
+#[derive(thiserror::Error, Debug)]
+pub enum StoreError {
+    /// The file exists but could not be read or quarantined; the caller must not
+    /// overwrite it.
+    #[error("state file {} is unreadable: {source}", path.display())]
+    Unreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 const CURRENT_VERSION: u32 = 1;
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -118,13 +131,14 @@ impl Inner {
         loop {
             tokio::time::sleep(DEBOUNCE).await;
             let _g = self.write_lock.lock().await;
-            if let Err(e) = self.write_pending().await {
+            let res = self.write_pending().await;
+            let mut p = self.pending.lock().unwrap();
+            if let Err(e) = res {
                 // State stays pending; the next save_soon/flush retries.
                 tracing::warn!("failed to save {}: {e}", self.path.display());
-                self.pending.lock().unwrap().running = false;
+                p.running = false;
                 return;
             }
-            let mut p = self.pending.lock().unwrap();
             if p.state.is_none() {
                 p.running = false;
                 return;
@@ -152,33 +166,37 @@ impl Store {
     }
 
     /// Missing => default. Corrupt or version != 1 => quarantined as
-    /// `state.json.corrupt-<unix-seconds>[-n]`, warned, default.
-    pub async fn load(&self) -> PersistedState {
+    /// `state.json.corrupt-<unix-seconds>[-n]`, warned, default. Any other read error, or a
+    /// failed quarantine, is an error so the caller never overwrites the user's real list.
+    pub async fn load(&self) -> Result<PersistedState, StoreError> {
         let path = &self.inner.path;
+        let unreadable = |source| StoreError::Unreadable {
+            path: path.clone(),
+            source,
+        };
         let bytes = match tokio::fs::read(path).await {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PersistedState::default(),
-            Err(e) => {
-                tracing::warn!("cannot read {}: {e}", path.display());
-                return PersistedState::default();
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PersistedState::default());
             }
+            Err(e) => return Err(unreadable(e)),
         };
         match serde_json::from_slice::<PersistedState>(&bytes) {
-            Ok(st) if st.version == CURRENT_VERSION => st,
+            Ok(st) if st.version == CURRENT_VERSION => Ok(st),
             Ok(st) => {
                 tracing::warn!("{} has unsupported version {}", path.display(), st.version);
-                self.quarantine().await;
-                PersistedState::default()
+                self.quarantine().await.map_err(unreadable)?;
+                Ok(PersistedState::default())
             }
             Err(e) => {
                 tracing::warn!("{} is corrupt: {e}", path.display());
-                self.quarantine().await;
-                PersistedState::default()
+                self.quarantine().await.map_err(unreadable)?;
+                Ok(PersistedState::default())
             }
         }
     }
 
-    async fn quarantine(&self) {
+    async fn quarantine(&self) -> std::io::Result<()> {
         let path = &self.inner.path;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -191,17 +209,23 @@ impl Store {
             n += 1;
             dest = PathBuf::from(format!("{base}-{n}"));
         }
-        match tokio::fs::rename(path, &dest).await {
-            Ok(()) => tracing::warn!("quarantined state file to {}", dest.display()),
-            Err(e) => tracing::warn!("failed to quarantine {}: {e}", path.display()),
-        }
+        tokio::fs::rename(path, &dest).await?;
+        tracing::warn!("quarantined state file to {}", dest.display());
+        Ok(())
     }
 
     /// Writes immediately (atomic, private). Supersedes any pending debounced state.
     pub async fn save_now(&self, st: &PersistedState) -> std::io::Result<()> {
         let _g = self.inner.write_lock.lock().await;
         self.inner.pending.lock().unwrap().state = None;
-        self.inner.write(st).await
+        let res = self.inner.write(st).await;
+        if res.is_err() {
+            let mut p = self.inner.pending.lock().unwrap();
+            if p.state.is_none() {
+                p.state = Some(st.clone());
+            }
+        }
+        res
     }
 
     /// Debounced: coalesces calls within 300 ms; the latest state wins. Needs a Tokio runtime.
@@ -286,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn missing_state_is_default() {
         let (_d, s) = store();
-        assert_eq!(s.load().await, PersistedState::default());
+        assert_eq!(s.load().await.unwrap(), PersistedState::default());
         assert_eq!(PersistedState::default().next_id, 1);
     }
 
@@ -295,19 +319,19 @@ mod tests {
         let (_d, s) = store();
         let st = sample(7);
         s.save_now(&st).await.unwrap();
-        assert_eq!(s.load().await, st);
+        assert_eq!(s.load().await.unwrap(), st);
     }
 
     #[tokio::test]
     async fn corrupt_state_is_quarantined() {
         let (d, s) = store();
         std::fs::write(d.path().join("state.json"), b"garbage{").unwrap();
-        assert_eq!(s.load().await, PersistedState::default());
+        assert_eq!(s.load().await.unwrap(), PersistedState::default());
         assert!(!d.path().join("state.json").exists());
         assert_eq!(corrupt_files(d.path()).len(), 1);
         // A second corrupt file within the same second gets a suffix, not an overwrite.
         std::fs::write(d.path().join("state.json"), b"garbage2").unwrap();
-        s.load().await;
+        s.load().await.unwrap();
         assert_eq!(corrupt_files(d.path()).len(), 2);
     }
 
@@ -321,7 +345,7 @@ mod tests {
             serde_json::to_vec(&st).unwrap(),
         )
         .unwrap();
-        assert_eq!(s.load().await, PersistedState::default());
+        assert_eq!(s.load().await.unwrap(), PersistedState::default());
         assert_eq!(corrupt_files(d.path()).len(), 1);
     }
 
@@ -334,7 +358,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         s.flush().await;
         assert_eq!(s.write_count(), 1);
-        assert_eq!(s.load().await.next_id, 10);
+        assert_eq!(s.load().await.unwrap().next_id, 10);
     }
 
     #[tokio::test(start_paused = true)]
@@ -342,10 +366,68 @@ mod tests {
         let (_d, s) = store();
         s.save_soon(sample(4));
         s.flush().await;
-        assert_eq!(s.load().await.next_id, 4);
+        assert_eq!(s.load().await.unwrap().next_id, 4);
         // The background task finds nothing left to write.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(s.write_count(), 1);
+    }
+
+    #[cfg(unix)]
+    fn chmod(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_state_is_error() {
+        let (d, s) = store();
+        let f = d.path().join("state.json");
+        std::fs::write(&f, b"{}").unwrap();
+        chmod(&f, 0o000);
+        if std::fs::read(&f).is_ok() {
+            return; // running as root: cannot make the file unreadable
+        }
+        assert!(matches!(s.load().await, Err(StoreError::Unreadable { .. })));
+        chmod(&f, 0o600);
+        assert!(f.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quarantine_failure_is_error() {
+        let (d, s) = store();
+        let f = d.path().join("state.json");
+        std::fs::write(&f, b"garbage").unwrap();
+        chmod(d.path(), 0o500); // rename needs write access to the directory
+        let probe = d.path().join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            chmod(d.path(), 0o700);
+            return; // running as root: directory permissions are not enforced
+        }
+        let res = s.load().await;
+        chmod(d.path(), 0o700);
+        assert!(matches!(res, Err(StoreError::Unreadable { .. })));
+        assert_eq!(std::fs::read(&f).unwrap(), b"garbage");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_write_retried_by_flush() {
+        let (d, s) = store();
+        let probe = d.path().join("probe");
+        chmod(d.path(), 0o500);
+        if std::fs::write(&probe, b"").is_ok() {
+            chmod(d.path(), 0o700);
+            return; // running as root
+        }
+        s.save_soon(sample(6));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(s.write_count(), 0);
+        chmod(d.path(), 0o700);
+        s.flush().await;
+        assert_eq!(s.write_count(), 1);
+        assert_eq!(s.load().await.unwrap().next_id, 6);
     }
 
     #[cfg(unix)]
