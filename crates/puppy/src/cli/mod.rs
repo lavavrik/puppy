@@ -1,11 +1,13 @@
 //! Scriptable subcommands: shared context, errors with their exit codes, and
 //! pipe-safe output.
 
+pub mod add;
 pub mod list;
 pub mod output;
 
 use anyhow::Context;
-use puppy_client::{Client, ClientError, Paths};
+pub use puppy_client::ClientError;
+use puppy_client::{Client, Paths};
 use std::path::PathBuf;
 
 /// What every command needs: where puppy lives, which executable to spawn as the

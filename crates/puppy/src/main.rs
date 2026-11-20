@@ -11,6 +11,8 @@ mod cli;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use cli::add::AddArgs;
+use cli::list::StateFilter;
 use cli::output::err;
 use cli::{CliError, Ctx};
 use puppy_client::Paths;
@@ -19,6 +21,7 @@ use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run
 use puppy_tui::api::ClientApi;
 use puppy_tui::theme::{Theme, ThemeChoice};
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,8 +71,50 @@ enum Command {
     },
     /// Print a one-line summary (`N downloads, X active`), starting a daemon if needed.
     Status,
+    /// Add downloads from URLs, magnet links or .torrent files (`-` reads them from stdin).
+    Add {
+        /// URLs, magnet links, .torrent paths; `-` reads one per line from stdin.
+        #[arg(required = true, value_name = "SOURCE")]
+        sources: Vec<String>,
+        /// Save into this folder (default: the daemon's download folder).
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+        /// Save under this file name (one source only).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Add without starting.
+        #[arg(long)]
+        paused: bool,
+        /// Speed limit, e.g. `500K`, `2M`; `0` for none.
+        #[arg(long, value_name = "RATE")]
+        limit: Option<String>,
+        /// Extra request header, `"Name: value"` (repeatable).
+        #[arg(long = "header", short = 'H', value_name = "HEADER")]
+        headers: Vec<String>,
+        /// Cookie header value, e.g. `a=b; c=d`.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
+        /// Referer header value.
+        #[arg(long, value_name = "URL")]
+        referer: Option<String>,
+    },
     /// List downloads.
-    Ls,
+    Ls {
+        /// Only these states (comma-separated or repeated).
+        #[arg(
+            long,
+            short = 's',
+            value_enum,
+            value_delimiter = ',',
+            value_name = "STATE"
+        )]
+        state: Vec<StateFilter>,
+    },
+    /// Show everything about one download.
+    Info {
+        /// The download's id (see `puppy ls`).
+        id: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -92,7 +137,32 @@ fn main() -> ExitCode {
         match cli.command {
             Some(Command::Daemon { idle_exit }) => daemon(idle_exit).await.map_err(Into::into),
             Some(Command::Status) => cli::list::status(&Ctx::from_env(cli.json)?).await,
-            Some(Command::Ls) => cli::list::ls(&Ctx::from_env(cli.json)?).await,
+            Some(Command::Add {
+                sources,
+                output_dir,
+                name,
+                paused,
+                limit,
+                headers,
+                cookie,
+                referer,
+            }) => cli::add::add(
+                &Ctx::from_env(cli.json)?,
+                AddArgs {
+                    sources,
+                    output_dir,
+                    name,
+                    paused,
+                    limit,
+                    headers,
+                    cookie,
+                    referer,
+                },
+            )
+            .await
+            .map(|_| ()),
+            Some(Command::Ls { state }) => cli::list::ls(&Ctx::from_env(cli.json)?, state).await,
+            Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, id).await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
     });

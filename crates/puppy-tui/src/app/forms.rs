@@ -79,7 +79,7 @@ fn focus_key(key: &KeyEvent) -> Option<bool> {
 
 /// Strips surrounding whitespace and one pair of matching quotes (paths dragged into a
 /// terminal arrive quoted).
-fn unquote(s: &str) -> &str {
+pub fn unquote(s: &str) -> &str {
     let s = s.trim();
     for q in ['"', '\'', '`'] {
         if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
