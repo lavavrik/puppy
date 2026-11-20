@@ -401,7 +401,7 @@ impl RowCtx<'_> {
                 push(size, Token::Dim);
             }
             WireState::ChoosingFiles => {
-                push("choose files · press c".into(), Token::Warn);
+                push("choose files · c".into(), Token::Warn);
                 if let Some(note) = &d.note {
                     push(note.clone(), Token::Dim);
                 }

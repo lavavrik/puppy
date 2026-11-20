@@ -43,6 +43,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         peers: None,
         next_retry_unix: None,
         note: None,
+        seed: None,
     }
 }
 
@@ -1077,9 +1078,10 @@ fn demo_render_print() {
     filtered.cursor = 0;
     let mut refused = picker.clone();
     refused.refused("refusing to overwrite: a file of this torrent already exists");
-    let mut seed = puppy_tui::app::SeedForm::new(
+    let mut seeding = snap(
         8,
-        &WireState::Seeding {
+        "debian-13.1.0-amd64-netinst.iso",
+        WireState::Seeding {
             uploaded: 0,
             ratio: 0.42,
             seeded_secs: 2880,
@@ -1087,6 +1089,11 @@ fn demo_render_print() {
             time_target_secs: Some(7200),
         },
     );
+    seeding.seed = Some(puppy_core::types::SeedPolicy {
+        ratio: Some(1.0),
+        time_secs: None,
+    });
+    let mut seed = puppy_tui::app::SeedForm::new(&seeding);
     seed.focus = 1;
     let popups = popups.into_iter().chain([
         ("file picker", Popup::Picker(Box::new(picker))),
@@ -1276,11 +1283,7 @@ fn render_seeding_and_choosing_rows() {
     let (x, y) = find_xy(&buf, "Show.S01").unwrap();
     let icon = (1..x).find(|&xx| buf[(xx, y)].symbol() == "☐").unwrap();
     assert_eq!(buf[(icon, y)].fg, t.p.warn);
-    assert!(
-        r[c + 1].contains("choose files · press c"),
-        "{:?}",
-        r[c + 1]
-    );
+    assert!(r[c + 1].contains("choose files · c"), "{:?}", r[c + 1]);
     assert!(
         r[c + 1].contains("no file matched --files"),
         "{:?}",

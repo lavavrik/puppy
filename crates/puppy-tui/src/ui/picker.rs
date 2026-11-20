@@ -43,6 +43,7 @@ pub const TITLE: &str = "Choose files — ";
 pub const LOADING: &str = "loading the file list…";
 pub const BUTTON: &str = "[ Download ]";
 pub const SENDING: &str = "choosing…";
+pub const TOO_SMALL: &str = "terminal too small for the file picker";
 
 /// Draws the picker over `region` (above the footer), centered in `area`; returns the
 /// filter's cursor while it is typed into.
@@ -50,6 +51,14 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, region: Rect, area: Rect) ->
     let t = app.theme;
     let w = PICKER_MAX_WIDTH.min(area.width.saturating_sub(4));
     if w < MIN_WIDTH || region.height < MIN_HEIGHT {
+        // Still modal: say why nothing shows.
+        if region.height > 0 && area.width > 0 {
+            let y = region.y + region.height / 2;
+            let line = Rect::new(area.x, y, area.width, 1);
+            Clear.render(line, buf);
+            super::centered(buf, line, y, &[(TOO_SMALL, app.theme.style(Token::Warn))]);
+            app.hits.push((line, HitTarget::PopupInside));
+        }
         return None;
     }
     let note = match &app.mode {

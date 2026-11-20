@@ -249,6 +249,10 @@ pub struct DownloadSnapshot {
     /// for a file choice although one was given).
     #[serde(default)]
     pub note: Option<String>,
+    /// A torrent's own seeding policy as set (`add --seed-*`, `seed`, the dashboard):
+    /// a `None` field (or no policy) inherits the daemon's default.
+    #[serde(default)]
+    pub seed: Option<SeedPolicy>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +414,7 @@ mod tests {
             peers: None,
             next_retry_unix: Some(99),
             note: None,
+            seed: None,
         }
     }
 

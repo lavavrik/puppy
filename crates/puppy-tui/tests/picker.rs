@@ -44,6 +44,7 @@ fn torrent(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         peers: None,
         next_retry_unix: None,
         note: None,
+        seed: None,
     }
 }
 
@@ -210,7 +211,14 @@ fn picker_renders_tree_and_totals() {
     assert!(r[notes].contains(" 4 "), "{:?}", r[notes]);
     // Footer hints for the picker.
     let hints = r.last().unwrap();
-    for h in ["Space toggle", "a all", "n none", "/ filter", "Esc close"] {
+    for h in [
+        "Space toggle",
+        "Enter download",
+        "a all",
+        "n none",
+        "/ filter",
+        "Esc close",
+    ] {
         assert!(hints.contains(h), "{h}: {hints:?}");
     }
     // Collapse S01 with ←: its files are hidden, the folder shows ▸.
@@ -218,12 +226,20 @@ fn picker_renders_tree_and_totals() {
     assert_eq!(row_names(picker(&a)), ["S01", "S02", "e1.mkv", "notes.txt"]);
     let r = render(&mut a, 100, 30);
     assert!(find(&r, "▸ ☑ S01").is_some(), "{r:#?}");
-    // → expands it again; Enter on a folder folds too.
+    // → expands it again; Enter confirms on a folder row too.
     a.update(key(KeyCode::Right), Instant::now());
     assert_eq!(row_names(picker(&a)).len(), 6);
+    assert!(picker(&a).nodes[picker(&a).rows()[picker(&a).cursor]].is_folder());
     let cmds = a.update(key(KeyCode::Enter), Instant::now());
-    assert!(cmds.is_empty());
-    assert_eq!(row_names(picker(&a)).len(), 4);
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::SelectFiles { id: 1, .. }]),
+        "{cmds:?}"
+    );
+    // While it is sent, toggles are ignored.
+    let now = Instant::now();
+    a.update(ch(' '), now);
+    a.update(ch('n'), now);
+    assert_eq!(picker(&a).checked, [true; 4]);
 }
 
 #[test]
@@ -331,6 +347,79 @@ fn picker_filter() {
     // Esc again closes the picker.
     a.update(key(KeyCode::Esc), now);
     assert_eq!(a.mode, Mode::Normal);
+}
+
+#[test]
+fn picker_filter_is_below_the_hoisted_root_and_notes_a_n() {
+    let (mut a, now) = picker_app();
+    // "Show/" is the title, not part of what the filter sees.
+    a.update(ch('/'), now);
+    for c in "show".chars() {
+        a.update(ch(c), now);
+    }
+    assert!(picker(&a).rows().is_empty());
+    a.update(key(KeyCode::Esc), now);
+    a.update(ch('/'), now);
+    a.update(ch('t'), now);
+    a.update(ch('x'), now);
+    a.update(key(KeyCode::Enter), now);
+    assert_eq!(row_names(picker(&a)), ["notes.txt"]);
+    let hints = render(&mut a, 120, 30).pop().unwrap();
+    assert!(hints.contains("a/n shown files"), "{hints:?}");
+    assert!(!hints.contains("a all"), "{hints:?}");
+}
+
+#[test]
+fn picker_submit_while_filtered_keeps_hidden_files() {
+    let (mut a, now) = picker_app();
+    // notes.txt off, then filter to e1 files: the hidden e2 (checked) still counts.
+    cursor_to(&mut a, now, "notes.txt");
+    a.update(ch(' '), now);
+    a.update(ch('/'), now);
+    a.update(ch('e'), now);
+    a.update(ch('1'), now);
+    a.update(key(KeyCode::Enter), now);
+    assert_eq!(row_names(picker(&a)), ["S01", "e1.mkv", "S02", "e1.mkv"]);
+    let cmds = a.update(ch('y'), now);
+    assert_eq!(
+        cmds,
+        vec![Cmd::SelectFiles {
+            id: 1,
+            selection: Selection {
+                indices: vec![0, 1, 2],
+                globs: vec![],
+            },
+        }]
+    );
+}
+
+#[test]
+fn picker_sends_wire_indices_not_positions() {
+    // The daemon's indices (0-based) need not follow the list order.
+    let files = vec![
+        file(7, "T/b.bin", 1),
+        file(3, "T/a.bin", 2),
+        file(0, "T/c.bin", 3),
+    ];
+    let (mut a, now, _) = connected(vec![torrent(1, "T", WireState::ChoosingFiles)]);
+    a.update(Msg::Files(1, files), now);
+    cursor_to(&mut a, now, "a.bin");
+    a.update(ch(' '), now);
+    let r = render(&mut a, 100, 30);
+    // The number shown is the wire index + 1 (what `puppy select` takes).
+    let row = find(&r, "b.bin").unwrap();
+    assert!(r[row].contains(" 8 "), "{:?}", r[row]);
+    let cmds = a.update(key(KeyCode::Enter), now);
+    assert_eq!(
+        cmds,
+        vec![Cmd::SelectFiles {
+            id: 1,
+            selection: Selection {
+                indices: vec![7, 0],
+                globs: vec![],
+            },
+        }]
+    );
 }
 
 #[test]
@@ -584,23 +673,28 @@ fn seed_popup_emits_set_seed() {
     );
     assert_eq!(a.update(ch('p'), now), vec![Cmd::Pause(1)]);
 
+    // Both values inherited: empty fields, the defaults in effect as placeholders.
     a.update(ch('s'), now);
     let form = match &a.mode {
         Mode::Popup(Popup::Seed(f)) => f.clone(),
         m => panic!("{m:?}"),
     };
-    assert_eq!(form.ratio.value, "1.0");
-    assert_eq!(form.time.value, "2h");
+    assert!(form.ratio.is_empty() && form.time.is_empty());
     let r = render(&mut a, 100, 30);
     for s in [
         "Seeding",
         "Ratio",
         "Time",
+        "default (1.0)",
+        "default (2h)",
         "e.g. 1.5, 0 = off, empty = default",
-        "e.g. 2h, 30m, 0 = off",
+        "e.g. 2h, 30m, 0 = off, empty = default",
     ] {
         assert!(find(&r, s).is_some(), "{s}: {r:#?}");
     }
+    // An unchanged save sends nothing: inherited stays inherited.
+    assert!(a.update(key(KeyCode::Enter), now).is_empty());
+    assert_eq!(a.mode, Mode::Normal);
     // Bad ratio: inline error, no command.
     a.mode = Mode::Popup(Popup::Seed(SeedForm {
         ratio: TextInput::with_value("lots"),
@@ -626,7 +720,6 @@ fn seed_popup_emits_set_seed() {
     // Ratio 1.5, time empty (default): the whole policy is replaced.
     a.mode = Mode::Popup(Popup::Seed(SeedForm {
         ratio: TextInput::with_value("1.5"),
-        time: TextInput::new(),
         ..form.clone()
     }));
     assert_eq!(
@@ -657,17 +750,44 @@ fn seed_popup_emits_set_seed() {
         })
     );
 
-    // A torrent still downloading: the policy can be set ahead (fields empty).
-    let (mut a, now, _) = connected(vec![torrent(5, "Next", WireState::Active)]);
+    // A torrent still downloading, added with `--seed-ratio 3`: the ratio is prefilled
+    // and kept when only the time is edited.
+    let mut next = torrent(5, "Next", WireState::Active);
+    next.seed = Some(SeedPolicy {
+        ratio: Some(3.0),
+        time_secs: None,
+    });
+    let (mut a, now, _) = connected(vec![next]);
     a.update(ch('s'), now);
     match &a.mode {
-        Mode::Popup(Popup::Seed(f)) => assert!(f.ratio.is_empty() && f.time.is_empty()),
+        Mode::Popup(Popup::Seed(f)) => {
+            assert_eq!(f.ratio.value, "3.0");
+            assert!(f.time.is_empty());
+            assert_eq!(f.time_default, "default");
+        }
         m => panic!("{m:?}"),
     }
-    // Disabled targets prefill as 0.
-    let f = SeedForm::new(
+    assert!(a.update(key(KeyCode::Enter), now).is_empty(), "unchanged");
+    a.update(ch('s'), now);
+    a.update(key(KeyCode::Tab), now);
+    for c in "30m".chars() {
+        a.update(ch(c), now);
+    }
+    assert_eq!(
+        a.update(key(KeyCode::Enter), now),
+        vec![Cmd::SetSeed {
+            id: 5,
+            policy: SeedPolicy {
+                ratio: Some(3.0),
+                time_secs: Some(1800),
+            },
+        }]
+    );
+    // Disabled inherited targets: `default (off)`; explicit values format as typed.
+    let mut d = torrent(
         1,
-        &WireState::Seeding {
+        "x",
+        WireState::Seeding {
             uploaded: 0,
             ratio: 0.0,
             seeded_secs: 0,
@@ -675,9 +795,15 @@ fn seed_popup_emits_set_seed() {
             time_target_secs: Some(5400),
         },
     );
+    d.seed = Some(SeedPolicy {
+        ratio: None,
+        time_secs: Some(5400),
+    });
+    let f = SeedForm::new(&d);
+    assert_eq!(f.ratio_default, "default (off)");
     assert_eq!(
         (f.ratio.value.as_str(), f.time.value.as_str()),
-        ("0", "1h 30m")
+        ("", "1h 30m")
     );
     // Not for HTTP or completed torrents.
     let mut http = torrent(6, "page.html", WireState::Active);

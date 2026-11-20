@@ -256,18 +256,16 @@ fn popup_hints(p: &Popup) -> Vec<Hint> {
             hint("Esc", "clear filter", Some(ESC)),
         ],
         Popup::Picker(p) => {
-            let mut v = vec![hint("Space", "toggle", Some(' '))];
-            if p.on_folder() {
-                v.extend([
-                    hint("Enter", "fold", None),
-                    hint("y", "download", Some('y')),
-                ]);
+            let mut v = vec![
+                hint("Space", "toggle", Some(' ')),
+                hint("Enter", "download", Some('y')),
+            ];
+            if p.filter.value.trim().is_empty() {
+                v.extend([hint("a", "all", Some('a')), hint("n", "none", Some('n'))]);
             } else {
-                v.push(hint("Enter", "download", None));
+                v.push(hint("a/n", "shown files", None));
             }
             v.extend([
-                hint("a", "all", Some('a')),
-                hint("n", "none", Some('n')),
                 hint("/", "filter", Some('/')),
                 hint("←→", "fold", None),
                 hint("Esc", "close", Some(ESC)),

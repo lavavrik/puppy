@@ -27,7 +27,7 @@ const PAD: u16 = 2;
 const ERROR_LINES: usize = 3;
 pub const RATE_EXAMPLES: &str = "e.g. 2M, 500k, none";
 pub const RATIO_EXAMPLES: &str = "e.g. 1.5, 0 = off, empty = default";
-pub const TIME_EXAMPLES: &str = "e.g. 2h, 30m, 0 = off";
+pub const TIME_EXAMPLES: &str = "e.g. 2h, 30m, 0 = off, empty = default";
 
 /// The help table: a section title (empty keys) or keys and what they do.
 const HELP: &[(&str, &str)] = &[
@@ -47,6 +47,12 @@ const HELP: &[(&str, &str)] = &[
     ("l", "speed limit for the selection"),
     ("c", "choose a torrent's files"),
     ("s", "seeding: ratio and time limits"),
+    ("", "File picker"),
+    ("Space, click", "toggle a file or folder"),
+    ("a, n", "all / none (only the shown files when filtering)"),
+    ("←, →", "fold / unfold a folder"),
+    ("/", "filter by path"),
+    ("Enter, y", "download the selected files"),
     ("", "Queue & limits"),
     ("K, Shift+↑", "move up in the queue"),
     ("J, Shift+↓", "move down in the queue"),
@@ -385,9 +391,9 @@ fn seed_rows<'a>(
         _ => "applies once the download completes".to_string(),
     };
     rows.push(Row::Text(vec![(now, t.style(Token::Dim))]));
-    for (i, label, input, examples) in [
-        (0, "Ratio", &f.ratio, RATIO_EXAMPLES),
-        (1, "Time", &f.time, TIME_EXAMPLES),
+    for (i, label, input, examples, default) in [
+        (0, "Ratio", &f.ratio, RATIO_EXAMPLES, &f.ratio_default),
+        (1, "Time", &f.time, TIME_EXAMPLES, &f.time_default),
     ] {
         rows.push(Row::Blank);
         rows.push(Row::Label {
@@ -396,7 +402,7 @@ fn seed_rows<'a>(
         });
         rows.push(Row::Input {
             input,
-            placeholder: Some("default".into()),
+            placeholder: Some(default.clone()),
             focused: f.focus == i,
         });
         error_rows(

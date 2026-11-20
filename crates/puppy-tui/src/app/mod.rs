@@ -1147,7 +1147,7 @@ impl App {
             }
             KeyAction::Seed => {
                 if let Some(d) = self.target(Action::Seed, now) {
-                    self.mode = Mode::Popup(Popup::Seed(SeedForm::new(d.id, &d.state)));
+                    self.mode = Mode::Popup(Popup::Seed(SeedForm::new(&d)));
                 }
             }
             KeyAction::GlobalLimits => {
@@ -1271,6 +1271,11 @@ impl App {
                 }
             }
             Popup::Seed(form) => {
+                if key.code == KeyCode::Enter && form.unchanged() {
+                    // Nothing to change: an inherited value stays inherited.
+                    self.mode = Mode::Normal;
+                    return Vec::new();
+                }
                 if key.code == KeyCode::Enter {
                     form.submit()
                 } else {
@@ -1364,6 +1369,7 @@ mod tests {
             peers: None,
             next_retry_unix: None,
             note: None,
+            seed: None,
         }
     }
 

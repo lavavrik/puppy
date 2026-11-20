@@ -108,6 +108,7 @@ mod tests {
             peers: None,
             next_retry_unix: None,
             note: None,
+            seed: None,
         }
     }
 

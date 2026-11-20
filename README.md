@@ -284,7 +284,8 @@ Things to know about v1:
   state first. See "Command line". Torrents added from the dashboard always
   ask: once a multi-file torrent's contents are known the file picker opens
   (a folder tree with checkboxes; `Space` toggles, `a`/`n` all/none, `/`
-  filters, `←`/`→` fold, `Enter` on a file or `y` confirms). `Esc` leaves it
+  filters by path, `←`/`→` fold, `Enter` (or `y`) confirms; with a filter,
+  `a`/`n` act on the shown files). `Esc` leaves it
   waiting; `c` reopens it. The folder layout is fixed when the torrent starts
   waiting: if a file of it appears on disk meanwhile, choosing fails and the
   torrent must be removed and added again.

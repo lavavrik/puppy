@@ -82,8 +82,10 @@ pub struct Picker {
     pub offset: usize,
     /// Rows shown at once (set by drawing; what PageUp/PageDown move).
     pub page: usize,
-    /// The selection was sent; waiting for the daemon.
+    /// The selection was sent; waiting for the daemon (toggles are ignored).
     pub submitting: bool,
+    /// The hoisted root folder (`Show/`): the filter matches paths below it.
+    pub root: String,
     pub error: Option<String>,
 }
 
@@ -174,6 +176,7 @@ impl Picker {
             page: DEFAULT_PAGE,
             submitting: false,
             error: None,
+            root: String::new(),
         }
     }
 
@@ -190,8 +193,10 @@ impl Picker {
             root.insert(&components(&f.path), k);
         }
         // The torrent's own folder is the title already: its contents are the top level.
+        self.root.clear();
         if root.files.is_empty() && root.dirs.len() == 1 && root.dirs[0].name == self.name {
             root = root.dirs.pop().unwrap_or_default();
+            self.root = format!("{}/", root.name);
         }
         let mut nodes = Vec::with_capacity(files.len() + files.len() / 4);
         root.flatten(0, &files, &mut nodes);
@@ -217,7 +222,10 @@ impl Picker {
         }
         self.files
             .iter()
-            .map(|f| contains_folded(&f.path, &needle))
+            .map(|f| {
+                let path = f.path.trim_start_matches('/');
+                contains_folded(path.strip_prefix(&self.root).unwrap_or(path), &needle)
+            })
             .collect()
     }
 
@@ -318,11 +326,6 @@ impl Picker {
         self.rows().get(self.cursor).copied()
     }
 
-    /// Whether the cursor is on a folder.
-    pub fn on_folder(&self) -> bool {
-        self.current().is_some_and(|i| self.nodes[i].is_folder())
-    }
-
     /// Runs `change` (which may change the visible rows), keeping the cursor on the
     /// same node, or the nearest one after it.
     fn keep_cursor(&mut self, change: impl FnOnce(&mut Self)) {
@@ -354,6 +357,9 @@ impl Picker {
     /// Toggles row `row`: a file flips; a folder selects all of its (shown) files
     /// unless all are selected already, which clears them.
     pub fn toggle_row(&mut self, row: usize) {
+        if self.submitting {
+            return;
+        }
         let Some(&i) = self.rows().get(row) else {
             return;
         };
@@ -367,6 +373,9 @@ impl Picker {
 
     /// Selects (`on`) or clears every file the filter shows.
     pub fn set_all(&mut self, on: bool) {
+        if self.submitting {
+            return;
+        }
         let matching = self.matches();
         for (c, m) in self.checked.iter_mut().zip(matching) {
             if m {
@@ -508,7 +517,6 @@ impl Picker {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Left | KeyCode::Char('h') => self.left(),
             KeyCode::Right | KeyCode::Char('l') => self.right(),
-            KeyCode::Enter if self.on_folder() => self.toggle_fold(self.cursor),
             KeyCode::Enter | KeyCode::Char('y') => return self.submit().map(PickerOutcome::Submit),
             _ => {}
         }

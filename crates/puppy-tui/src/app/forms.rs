@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, SeedPolicy, Source};
-use puppy_proto::WireState;
+use puppy_proto::{DownloadSnapshot, WireState};
 
 use super::Cmd;
 use super::input::TextInput;
@@ -394,29 +394,57 @@ pub struct SeedForm {
     pub error: Option<String>,
     /// The field `error` is about (0 = ratio, 1 = time).
     pub error_field: usize,
+    /// The torrent's own policy when the popup opened: Enter without a change sends
+    /// nothing (an inherited value stays inherited).
+    pub initial: SeedPolicy,
+    /// Placeholders of the empty (inherited) fields: `default (1.0)`, `default (2h)`
+    /// while seeding (the effective value), else `default`.
+    pub ratio_default: String,
+    pub time_default: String,
 }
 
+/// An empty seeding field's placeholder.
+pub const SEED_DEFAULT: &str = "default";
+
 impl SeedForm {
-    /// Prefilled from a seeding torrent's targets (a trigger that is off shows `0`);
-    /// empty for a torrent still downloading.
-    pub fn new(id: DownloadId, state: &WireState) -> Self {
-        let (ratio, time) = match state {
+    /// Each field prefilled only from the torrent's own (explicit) value; an inherited
+    /// one is empty, its placeholder naming the default in effect when known.
+    pub fn new(d: &DownloadSnapshot) -> Self {
+        let own = d.seed.clone().unwrap_or_default();
+        let (ratio_default, time_default) = match &d.state {
             WireState::Seeding {
                 ratio_target,
                 time_target_secs,
                 ..
             } => (
-                ratio_target.map_or_else(|| "0".into(), ratio_text),
-                time_target_secs.map_or_else(|| "0".into(), duration_text),
+                format!(
+                    "{SEED_DEFAULT} ({})",
+                    ratio_target.map_or_else(|| "off".into(), ratio_text)
+                ),
+                format!(
+                    "{SEED_DEFAULT} ({})",
+                    time_target_secs.map_or_else(|| "off".into(), duration_text)
+                ),
             ),
-            _ => (String::new(), String::new()),
+            _ => (SEED_DEFAULT.into(), SEED_DEFAULT.into()),
         };
         Self {
-            id,
-            ratio: TextInput::with_value(&ratio),
-            time: TextInput::with_value(&time),
+            id: d.id,
+            ratio: TextInput::with_value(&own.ratio.map(ratio_text).unwrap_or_default()),
+            time: TextInput::with_value(&own.time_secs.map(duration_text).unwrap_or_default()),
+            ratio_default,
+            time_default,
+            initial: own,
             ..Self::default()
         }
+    }
+
+    /// The fields parse to the policy the torrent already has.
+    pub fn unchanged(&self) -> bool {
+        matches!(
+            (parse_ratio(&self.ratio.value), parse_duration(&self.time.value)),
+            (Ok(ratio), Ok(time_secs)) if SeedPolicy { ratio, time_secs } == self.initial
+        )
     }
 
     fn focused(&mut self) -> &mut TextInput {

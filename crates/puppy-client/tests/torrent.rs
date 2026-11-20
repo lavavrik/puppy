@@ -898,6 +898,12 @@ async fn restart_keeps_new_states() {
     let events = Events::start(&env).await;
     // Seeding again at once (restored live), with the policy set before the restart.
     assert!(is_seeding(&snapshot(&c, ida).await));
+    // The snapshot carries the torrent's own policy (what the dashboard prefills).
+    assert_eq!(
+        snapshot(&c, ida).await.seed.and_then(|p| p.ratio),
+        Some(5.0)
+    );
+    assert_eq!(snapshot(&c, idb).await.seed, None);
     assert_eq!(snapshot(&c, idb).await.state, WireState::ChoosingFiles);
     let seen = watch(&c, ida, "restored seeding", |s| {
         matches!(
