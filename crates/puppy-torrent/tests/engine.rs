@@ -39,6 +39,7 @@ impl Env {
             lsd: false,
             listen_port: 0,
             seed_ratio,
+            seed_time: std::time::Duration::ZERO,
             data_dir: dir.path().join("data"),
             default_dir: dir.path().join("downloads"),
             test_mode: true,
@@ -640,7 +641,7 @@ async fn leech_from(
 async fn completion_stops_seeding() {
     let seeder = Seeder::start(&[("s.bin", 200 * KIB)]).await;
 
-    // Default policy (seed ratio 0): once Completed, nothing is served to other peers.
+    // Both targets 0: once Completed, nothing is served to other peers.
     let env = Env::new(vec![seeder.addr]).await;
     let mut rx = env.engine.subscribe();
     env.add(1, env.torrent_req(&seeder)).await.unwrap();
@@ -657,9 +658,9 @@ async fn completion_stops_seeding() {
     assert_eq!(env.status(1).state, DownloadState::Completed);
     session.cancellation_token().cancel();
 
-    // Control: with a non-zero ratio (reserved: keeps seeding) the same leecher completes,
-    // so the check above can fail.
-    let env = Env::with(vec![seeder.addr], 1.0).await;
+    // Control: with a ratio target (far away) it seeds: the same leecher completes, so
+    // the check above can fail.
+    let env = Env::with(vec![seeder.addr], 10.0).await;
     let mut rx = env.engine.subscribe();
     env.add(1, env.torrent_req(&seeder)).await.unwrap();
     events_until_completed(&mut rx, 1).await;

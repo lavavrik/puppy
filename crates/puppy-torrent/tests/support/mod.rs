@@ -250,3 +250,59 @@ pub fn craft_torrent(name: &str, len: u64, files: Option<&[(&[&str], u64)]>) -> 
     out.extend_from_slice(b"ee");
     out
 }
+
+/// A raw librqbit leecher (no puppy code) of a torrent whose only peer is `peer`
+/// (e.g. puppy's listen address): makes puppy upload, network-free. Its session stops
+/// when it is dropped.
+pub struct Leecher {
+    pub session: Arc<Session>,
+    pub handle: Arc<librqbit::ManagedTorrent>,
+    /// Holds the downloaded files.
+    pub dir: TempDir,
+}
+
+impl Leecher {
+    /// Starts downloading `torrent_bytes` from `peer`, at most `download_bps` if given.
+    pub async fn start(torrent_bytes: &Bytes, peer: SocketAddr, download_bps: Option<u32>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = local_session_options(false, None);
+        opts.ratelimits.download_bps = download_bps.and_then(NonZeroU32::new);
+        let session = Session::new_with_opts(dir.path().to_owned(), opts)
+            .await
+            .expect("leecher session starts");
+        let handle = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent_bytes.clone()),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    disable_trackers: true,
+                    initial_peers: Some(vec![peer]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("torrent added")
+            .into_handle()
+            .expect("a managed torrent");
+        Leecher {
+            session,
+            handle,
+            dir,
+        }
+    }
+
+    /// Bytes downloaded and verified so far.
+    pub fn progress(&self) -> u64 {
+        self.handle.stats().progress_bytes
+    }
+
+    pub fn finished(&self) -> bool {
+        self.handle.stats().finished
+    }
+}
+
+impl Drop for Leecher {
+    fn drop(&mut self) {
+        self.session.cancellation_token().cancel();
+    }
+}

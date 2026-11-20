@@ -32,6 +32,8 @@ pub(crate) struct Stats {
     pub peers: u32,
     /// Bytes had per file (librqbit's file indices; empty while initializing).
     pub file_progress: Vec<u64>,
+    /// Bytes uploaded by the current live session (0 when not live).
+    pub uploaded: u64,
 }
 
 impl Stats {
@@ -82,6 +84,7 @@ impl From<&TorrentStats> for Stats {
             up_bps,
             peers,
             file_progress: s.file_progress.clone(),
+            uploaded: s.uploaded_bytes,
         }
     }
 }
@@ -203,17 +206,9 @@ pub(crate) fn peer_counts(s: &TorrentStats) -> (u32, u32, u32) {
     }
 }
 
-/// Share ratio: uploaded / total (0 when the torrent has no size).
-pub(crate) fn ratio(uploaded: u64, total: u64) -> f32 {
-    if total == 0 {
-        0.0
-    } else {
-        (uploaded as f64 / total as f64) as f32
-    }
-}
-
-/// The piece map puppy shows, synthesised from per-file progress (librqbit does not expose
-/// its have-bitfield). MSB first: piece 0 is bit 7 of byte 0.
+/// A piece map synthesised from per-file progress: the fallback before a restored
+/// torrent's exact map is known (see [`fallback_map`]). MSB first: piece 0 is bit 7 of
+/// byte 0.
 ///
 /// Each file's progress is taken as an in-order prefix of that file (clamped to its
 /// length); a piece is set iff every byte it covers (possibly across several files) lies
@@ -258,24 +253,71 @@ pub(crate) fn have_bitfield(
     out
 }
 
-/// Whether `have` (MSB-first, as [`have_bitfield`] makes it) has all `piece_count` bits set.
-pub(crate) fn has_every_piece(piece_count: u32, have: &[u8]) -> bool {
-    (0..piece_count as usize).all(|p| have.get(p / 8).is_some_and(|b| b & (0x80 >> (p % 8)) != 0))
+/// librqbit's have-bitfield (MSB first, as `api_dump_haves` returns it) trimmed to
+/// `piece_count` bits: one bit per piece, byte padded, padding bits clear.
+pub(crate) fn exact_bitfield(raw: &[u8], piece_count: u32) -> Vec<u8> {
+    let n = piece_count as usize;
+    let mut out = raw.get(..n.div_ceil(8)).unwrap_or(raw).to_vec();
+    out.resize(n.div_ceil(8), 0);
+    if !n.is_multiple_of(8)
+        && let Some(last) = out.last_mut()
+    {
+        *last &= !(0xFFu8 >> (n % 8));
+    }
+    out
+}
+
+/// The pieces of a completed torrent: every piece that overlaps a wanted file
+/// (`selected`: librqbit file indices; `None`: every file). MSB first.
+pub(crate) fn selected_pieces(
+    piece_len: u64,
+    total: u64,
+    file_lengths: &[u64],
+    selected: Option<&[usize]>,
+) -> Vec<u8> {
+    if piece_len == 0 {
+        return Vec::new();
+    }
+    let pieces = total.div_ceil(piece_len);
+    let mut out = vec![0u8; pieces.div_ceil(8) as usize];
+    let mut offset = 0u64;
+    for (i, &len) in file_lengths.iter().enumerate() {
+        let wanted = selected.is_none_or(|s| s.contains(&i));
+        if wanted && len > 0 {
+            let first = offset / piece_len;
+            let last = (offset + len - 1) / piece_len;
+            for p in first..=last.min(pieces.saturating_sub(1)) {
+                out[(p / 8) as usize] |= 0x80 >> (p % 8);
+            }
+        }
+        offset += len;
+    }
+    out
+}
+
+/// The piece map when librqbit cannot give its own (not live, not paused: checking,
+/// failed): a completed torrent (`completed`: its [`selected_pieces`]) has those pieces
+/// and whatever the last exact map had; else the last exact map; else (after a restart,
+/// before it went live) the per-file synthesis.
+pub(crate) fn fallback_map(
+    last: Option<&[u8]>,
+    completed: Option<Vec<u8>>,
+    synth: impl FnOnce() -> Vec<u8>,
+) -> Vec<u8> {
+    match (completed, last) {
+        (Some(mut done), last) => {
+            for (d, l) in done.iter_mut().zip(last.unwrap_or_default()) {
+                *d |= l;
+            }
+            done
+        }
+        (None, Some(last)) => last.to_vec(),
+        (None, None) => synth(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn every_piece() {
-        use super::has_every_piece;
-        assert!(has_every_piece(0, &[]));
-        assert!(has_every_piece(3, &[0b1110_0000]));
-        assert!(!has_every_piece(3, &[0b1100_0000]));
-        assert!(has_every_piece(9, &[0xff, 0x80]));
-        assert!(!has_every_piece(9, &[0xff]));
-        assert!(!has_every_piece(9, &[0x7f, 0x80]));
-    }
-
     use super::*;
 
     #[test]
@@ -330,10 +372,49 @@ mod tests {
     }
 
     #[test]
-    fn ratio_is_uploaded_over_total() {
-        assert_eq!(ratio(5, 0), 0.0);
-        assert_eq!(ratio(0, 100), 0.0);
-        assert_eq!(ratio(150, 100), 1.5);
+    fn exact_bitfield_is_trimmed() {
+        assert_eq!(exact_bitfield(&[0xFF, 0xFF], 9), vec![0xFF, 0x80]);
+        assert_eq!(exact_bitfield(&[0b1010_1111], 4), vec![0b1010_0000]);
+        assert_eq!(exact_bitfield(&[0xF0], 8), vec![0xF0]);
+        assert_eq!(exact_bitfield(&[], 3), vec![0], "short input padded");
+        assert_eq!(exact_bitfield(&[0xFF], 0), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn selected_pieces_overlap_wanted_files() {
+        // Files of 6, 6 and 4 bytes, pieces of 4: [0,4) [4,8) [8,12) [12,16).
+        let l = [6, 6, 4];
+        assert_eq!(selected_pieces(4, 16, &l, None), vec![0b1111_0000]);
+        assert_eq!(
+            selected_pieces(4, 16, &l, Some(&[0])),
+            vec![0b1100_0000],
+            "file 0 touches pieces 0 and 1"
+        );
+        assert_eq!(selected_pieces(4, 16, &l, Some(&[2])), vec![0b0001_0000]);
+        assert_eq!(selected_pieces(4, 16, &l, Some(&[1])), vec![0b0110_0000]);
+        // Empty files mark nothing.
+        assert_eq!(selected_pieces(4, 8, &[4, 0, 4], Some(&[1])), vec![0]);
+        assert_eq!(selected_pieces(0, 8, &[8], None), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn fallbacks_in_order() {
+        let synth = || vec![0b1000_0000];
+        // Completed: the selected pieces, plus what the last exact map had.
+        assert_eq!(
+            fallback_map(Some(&[0b0000_0001]), Some(vec![0b1110_0000]), synth),
+            vec![0b1110_0001]
+        );
+        assert_eq!(
+            fallback_map(None, Some(vec![0b1110_0000]), synth),
+            vec![0b1110_0000]
+        );
+        // Not completed: the last exact map, else the synthesis.
+        assert_eq!(
+            fallback_map(Some(&[0b0100_0000]), None, synth),
+            vec![0b0100_0000]
+        );
+        assert_eq!(fallback_map(None, None, synth), vec![0b1000_0000]);
     }
 
     fn stats(phase: Phase) -> Stats {
@@ -347,6 +428,7 @@ mod tests {
             up_bps: 7,
             peers: 3,
             file_progress: Vec::new(),
+            uploaded: 0,
         }
     }
 

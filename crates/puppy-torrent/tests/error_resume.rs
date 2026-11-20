@@ -58,6 +58,7 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
         lsd: false,
         listen_port: 0,
         seed_ratio: 0.0,
+        seed_time: std::time::Duration::ZERO,
         data_dir: dir.path().join("data"),
         default_dir: dir.path().join("downloads"),
         test_mode: true,

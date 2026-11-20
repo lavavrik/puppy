@@ -239,6 +239,7 @@ async fn start_torrent_engine(
         lsd: t.lsd,
         listen_port: t.listen_port,
         seed_ratio: t.seed_ratio,
+        seed_time: t.seed_time,
         data_dir: paths.data_dir.clone(),
         default_dir: download_dir,
         test_mode: test.is_some(),

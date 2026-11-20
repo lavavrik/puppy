@@ -13,7 +13,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::{DhtPersistenceConfig, Id20};
 use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
     ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
 };
 use puppy_core::engine::{
@@ -21,7 +21,7 @@ use puppy_core::engine::{
 };
 use puppy_core::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
-    FileChoice, Selection, Source, TorrentFile,
+    FileChoice, SeedPolicy, Selection, Source, TorrentFile,
 };
 use tokio::sync::{OnceCell, broadcast};
 use tokio::task::JoinHandle;
@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::map;
 use crate::poll;
+use crate::seeding::{self, SeedPhase, SeedRecord, SeedTracker, SeedView, Targets};
 use crate::selection::{self, Chosen, Decision, Sidecar};
 use crate::source::{self, Layout, TorrentInfo};
 
@@ -47,9 +48,13 @@ pub struct TorrentEngineOptions {
     /// Port for incoming peer connections on `0.0.0.0`; an OS-assigned port is used if it
     /// cannot be bound. 0: always OS-assigned.
     pub listen_port: u16,
-    /// Seeding policy. `0.0` (the default): stop at completion. Reserved: any value
-    /// above 0 currently means "keep seeding until removed" (no ratio tracking yet).
+    /// Seeding after completion stops once uploaded / size reaches this (0: no ratio
+    /// target). A torrent's own [`SeedPolicy`] overrides it; see
+    /// [`TorrentEngine::set_seed_defaults`].
     pub seed_ratio: f32,
+    /// ...or once it has seeded this long (0: no time target), whichever comes first.
+    /// Both 0: stop at completion.
+    pub seed_time: Duration,
     /// puppy's data dir; the engine keeps its own files under `<data_dir>/torrent/` and
     /// copies of added `.torrent` files in `<data_dir>/torrents/<id>.torrent`.
     pub data_dir: PathBuf,
@@ -73,8 +78,15 @@ pub struct TorrentEngineOptions {
 /// - `add` never waits for the network: a `.torrent` is handed to librqbit at once; a
 ///   magnet's metadata is fetched in the background (the download is `Starting` meanwhile
 ///   and can be paused or removed).
-/// - Stop at completion (seeding policy v1): a finished torrent is paused in librqbit and
-///   reported `Completed`.
+/// - Seeding: a torrent whose data is complete (its selected files) is reported
+///   `Completed` once, then seeds (`Seeding`) until its ratio or time target is met
+///   (whichever first; see [`seeding`]), then is paused in librqbit and `Completed`
+///   (`SeedingFinished` is sent). Both targets 0: paused at completion. `pause` while
+///   seeding stops seeding too. The counters are kept in `<data_dir>/torrents/<id>.seed`
+///   (every 30 s while seeding, on changes, pause and shutdown); a restored seeding
+///   torrent goes on seeding (a met target: `Completed` at once).
+/// - The piece map is librqbit's own (`api_dump_haves`); see [`map::fallback_map`] for
+///   when it is not available.
 /// - Unlike the HTTP engine, dropping it stops its torrents (the session goes with it).
 /// - File selection (once, when the contents are known: at add for a `.torrent`, after
 ///   the metadata for a magnet): `FileChoice::Ask` on a multi-file torrent, or a magnet
@@ -121,10 +133,11 @@ pub(crate) struct Entry {
     limit: Option<u64>,
     /// `limit` as a magnet's metadata task reads it just before the real add (0: none).
     limit_cell: Arc<AtomicU64>,
-    /// The piece map, recomputed at most every [`DETAIL_TTL`].
-    detail: Option<DetailCache>,
-    /// Most bytes uploaded seen so far (librqbit forgets them once the torrent is paused).
-    uploaded: u64,
+    /// The last exact piece map seen `(piece count, have)` (a fallback, see
+    /// [`map::fallback_map`]).
+    last_map: Option<(u32, Vec<u8>)>,
+    /// Seeding counters, phase and the torrent's own targets.
+    pub(crate) seed: SeedTracker,
     /// The torrent's contents, once known (`.torrent`: at add; magnet: once its metadata
     /// has been fetched).
     info: Option<Arc<TorrentInfo>>,
@@ -143,16 +156,6 @@ pub(crate) struct Entry {
     /// The torrent should be running: set by a non-paused add and by `resume`, cleared
     /// by `pause`. librqbit's own paused flag can disagree (see [`Shared::unstick`]).
     run_wanted: bool,
-}
-
-/// How long a synthesised piece map is reused by `detail`.
-const DETAIL_TTL: Duration = Duration::from_secs(1);
-
-/// A torrent's piece map as last computed.
-struct DetailCache {
-    at: Instant,
-    piece_count: u32,
-    have: Vec<u8>,
 }
 
 /// A bytes/s limit as librqbit takes it: `None`/0 is unlimited, above `u32::MAX` clamps.
@@ -203,28 +206,76 @@ pub(crate) enum View {
         name: String,
         path: PathBuf,
         selected: Option<Arc<Chosen>>,
+        seed: SeedView,
     },
+}
+
+/// What the poll task learns from librqbit besides the status.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Observed {
+    /// librqbit's upload counter of the current live session.
+    pub uploaded: u64,
+    /// Live and complete: seeding time counts.
+    pub seeding_live: bool,
 }
 
 impl View {
     /// The status (reads librqbit's stats: call without the torrents lock).
     pub(crate) fn status(self) -> DownloadStatus {
+        self.observe().0
+    }
+
+    /// The status, and librqbit's counters for a torrent in it.
+    pub(crate) fn observe(self) -> (DownloadStatus, Option<Observed>) {
         match self {
-            View::Pending(st) => st,
+            View::Pending(st) => (st, None),
             View::Managed {
                 handle,
                 name,
                 path,
                 selected,
+                seed,
             } => {
                 let mut stats = map::Stats::from(&handle.stats());
                 if let Some(c) = &selected {
                     stats.restrict(&c.lib_sizes);
                 }
                 let name = handle.name().unwrap_or(name);
-                map::status(&stats, name, path)
+                let mut st = map::status(&stats, name, path);
+                apply_seed(&mut st, &stats, &seed);
+                let obs = Observed {
+                    uploaded: stats.uploaded,
+                    seeding_live: stats.finished && stats.phase == map::Phase::Live,
+                };
+                (st, Some(obs))
             }
         }
+    }
+}
+
+/// The seeding view of a managed torrent's status: stopped seeding ⇒ `Completed`;
+/// complete and seeding (also while librqbit re-checks a restored seeding torrent, and
+/// before the poll task has seen the completion, unless both targets are 0) ⇒
+/// `Seeding`, with its upload speed. An error wins.
+fn apply_seed(st: &mut DownloadStatus, s: &map::Stats, seed: &SeedView) {
+    if matches!(st.state, DownloadState::Failed { .. }) {
+        return;
+    }
+    let seeding = match seed.phase {
+        SeedPhase::Done => {
+            st.state = DownloadState::Completed;
+            st.done_bytes = s.total_bytes;
+            (st.down_bps, st.up_bps, st.eta_secs) = (0, 0, None);
+            return;
+        }
+        SeedPhase::Seeding => s.finished || matches!(s.phase, map::Phase::Initializing { .. }),
+        SeedPhase::Downloading => s.finished && !seed.targets.none(),
+    };
+    if seeding {
+        st.state = seed.seeding_state(s.uploaded, s.total_bytes);
+        st.done_bytes = s.total_bytes;
+        st.up_bps = s.up_bps;
+        (st.down_bps, st.eta_secs) = (0, None);
     }
 }
 
@@ -235,6 +286,10 @@ pub(crate) struct Shared {
     /// The global `(download, upload)` limits, applied to the session (also when it
     /// starts).
     limits: Mutex<(Option<u64>, Option<u64>)>,
+    /// librqbit's API over the session (the exact piece map), once it has started.
+    api: std::sync::OnceLock<Api>,
+    /// The global seeding targets `(ratio, time)` (see [`TorrentEngine::set_seed_defaults`]).
+    seed_defaults: Mutex<(f32, Duration)>,
     /// The engine's token: the session's tokens are its children, so dropping the
     /// engine stops the session and the poll task.
     cancel: CancellationToken,
@@ -266,6 +321,7 @@ impl Shared {
             })?;
         // Also covers limits set while the session was starting.
         self.apply_limits(session);
+        self.api.get_or_init(|| Api::new(session.clone(), None));
         Ok(session)
     }
 
@@ -305,9 +361,15 @@ impl Shared {
         }
     }
 
+    /// `policy`'s targets with the current global values.
+    pub(crate) fn targets(&self, policy: &SeedPolicy) -> Targets {
+        let (ratio, time) = *self.seed_defaults.lock().unwrap_or_else(|e| e.into_inner());
+        Targets::of(policy, ratio, time)
+    }
+
     /// What is needed to compute `e`'s status, taken under the torrents lock; librqbit's
     /// stats are then read outside it (`None` while its `.torrent` is being added).
-    pub(crate) fn view(e: &Entry) -> Option<View> {
+    pub(crate) fn view(&self, e: &Entry) -> Option<View> {
         let pending = |state| {
             Some(View::Pending(map::pending_status(
                 state,
@@ -343,6 +405,7 @@ impl Shared {
                 name: e.name.clone(),
                 path: e.layout.path.clone(),
                 selected: e.selected.clone(),
+                seed: e.seed.view(self.targets(&e.seed.policy)),
             }),
         }
     }
@@ -634,7 +697,6 @@ impl Shared {
             Some(e) => {
                 e.slot = Slot::Managed(nh.clone());
                 e.overwrite = true;
-                e.detail = None;
                 true
             }
             None => false,
@@ -842,6 +904,65 @@ impl Shared {
             .join(format!("{id}.selection"))
     }
 
+    /// `<data_dir>/torrents/<id>.seed`: download `id`'s seeding counters ([`SeedRecord`]).
+    fn seed_file(&self, id: DownloadId) -> PathBuf {
+        self.opts
+            .data_dir
+            .join("torrents")
+            .join(format!("{id}.seed"))
+    }
+
+    /// Writes download `id`'s seeding record, if it is still there (a failure is only
+    /// logged).
+    pub(crate) fn write_seed(&self, id: DownloadId, rec: &SeedRecord) {
+        if !self.lock().contains_key(&id) {
+            return; // removed meanwhile: its record is gone with it
+        }
+        if let Err(e) = rec.write(&self.seed_file(id)) {
+            tracing::warn!(id, "recording the seeding counters: {e}");
+        }
+    }
+
+    /// Writes the seeding record of every torrent with something to record, with
+    /// librqbit's current upload counters (pause, shutdown).
+    fn persist_seeds(&self, only: Option<DownloadId>) {
+        let handles: Vec<_> = self
+            .lock()
+            .iter()
+            .filter(|(id, _)| only.is_none_or(|o| o == **id))
+            .filter_map(|(&id, e)| match &e.slot {
+                Slot::Managed(h) => Some((id, h.clone())),
+                _ => None,
+            })
+            .collect();
+        let now = Instant::now();
+        for (id, h) in handles {
+            let uploaded = h.stats().uploaded_bytes;
+            let rec = {
+                let mut map = self.lock();
+                let Some(e) = map.get_mut(&id) else {
+                    continue;
+                };
+                e.seed.observe_upload(uploaded);
+                e.seed.worth_recording().then(|| e.seed.record(now))
+            };
+            if let Some(rec) = rec {
+                self.write_seed(id, &rec);
+            }
+        }
+    }
+
+    /// librqbit's own piece map of `h` `(piece count, have)`, MSB first; `None` if it
+    /// has none now (checking its files, failed) or the session is not running.
+    fn exact_map(&self, h: &ManagedTorrentHandle) -> Option<(u32, Vec<u8>)> {
+        let (bf, n) = self
+            .api
+            .get()?
+            .api_dump_haves(TorrentIdOrHash::Id(h.id()))
+            .ok()?;
+        Some((n, map::exact_bitfield(bf.as_raw_slice(), n)))
+    }
+
     /// The recorded placement of download `id`'s files (none recorded: its own folder,
     /// as for every magnet).
     async fn placement(&self, id: DownloadId) -> source::Placement {
@@ -851,13 +972,14 @@ impl Shared {
         }
     }
 
-    /// Deletes the stored `.torrent` copy of download `id`, its placement marker and its
-    /// selection sidecar, if any.
+    /// Deletes the stored `.torrent` copy of download `id`, its placement marker, its
+    /// selection sidecar and its seeding record, if any.
     fn forget(&self, id: DownloadId) {
         for path in [
             self.stored_torrent(id),
             self.placement_marker(id),
             self.selection_file(id),
+            self.seed_file(id),
         ] {
             match std::fs::remove_file(&path) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -1190,8 +1312,11 @@ impl TorrentEngine {
     pub async fn new(opts: TorrentEngineOptions) -> Result<Self, EngineError> {
         let (events, _) = broadcast::channel(256);
         let cancel = CancellationToken::new();
+        let seed_defaults = Mutex::new((opts.seed_ratio, opts.seed_time));
         let shared = Arc::new(Shared {
             session: OnceCell::new(),
+            api: std::sync::OnceLock::new(),
+            seed_defaults,
             limits: Mutex::new((None, None)),
             cancel: cancel.clone(),
             torrents: Mutex::new(HashMap::new()),
@@ -1252,6 +1377,27 @@ impl TorrentEngine {
         }
     }
 
+    /// Changes the global seeding targets (`ratio`, `time`; 0 disables one) for every
+    /// torrent that does not set its own; applied at the next look (~500 ms).
+    pub fn set_seed_defaults(&self, ratio: f32, time: Duration) {
+        *self
+            .shared
+            .seed_defaults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (ratio, time);
+    }
+
+    /// librqbit's own piece map of download `id` `(piece count, have)`, MSB first
+    /// (tests).
+    #[doc(hidden)]
+    pub fn piece_dump(&self, id: DownloadId) -> Option<(u32, Vec<u8>)> {
+        let h = match &self.shared.lock().get(&id)?.slot {
+            Slot::Managed(h) => h.clone(),
+            _ => return None,
+        };
+        self.shared.exact_map(&h)
+    }
+
     /// Where the session accepts incoming peer connections (`None` until it is started).
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.shared.started()?.listen_addr()
@@ -1268,6 +1414,7 @@ impl TorrentEngine {
         for id in ids {
             self.shared.persist_choice(id);
         }
+        self.shared.persist_seeds(None);
         if let Some(session) = self.shared.started() {
             session.stop().await;
         }
@@ -1288,6 +1435,7 @@ impl TorrentEngine {
         opts: &AddOptions,
         trackers: Vec<String>,
         files: Option<&FileChoice>,
+        mut seed: SeedTracker,
     ) -> Result<Added, EngineError> {
         let info = Arc::new(source::parse_torrent(&bytes)?);
         let decision = match files {
@@ -1301,14 +1449,24 @@ impl TorrentEngine {
         let (indices, record) = match decision {
             Decision::Choose(reason) => {
                 return self
-                    .enter_choosing(id, bytes.into(), info, target, copy, opts, trackers, reason)
+                    .enter_choosing(
+                        id,
+                        bytes.into(),
+                        info,
+                        target,
+                        copy,
+                        opts,
+                        trackers,
+                        reason,
+                        seed,
+                    )
                     .await;
             }
             Decision::All => (None, Default::default()),
             Decision::Select { indices, record } => (Some(indices), record),
         };
         let session = self.shared.session().await?;
-        let (layout, overwrite, chosen) = {
+        let (layout, overwrite, chosen, paused) = {
             let mut map = self.shared.lock();
             check_free(&map, id, &info.info_hash)?;
             let (layout, overwrite) = target.layout(&info, &map);
@@ -1317,6 +1475,16 @@ impl TorrentEngine {
                     selection::created_stubs(&layout.output_folder, &info, &indices, &record);
                 Arc::new(Chosen::new(&info, indices, record))
             });
+            // A restored seeding torrent goes on seeding (live whatever `start_paused`
+            // says), unless its counters meet its targets already.
+            let total = chosen.as_ref().map_or(info.total_bytes, |c| c.total());
+            seed.settle_restored(self.shared.targets(&seed.policy), total);
+            let paused = match seed.phase {
+                SeedPhase::Downloading => opts.start_paused,
+                SeedPhase::Seeding => false,
+                SeedPhase::Done => true,
+            };
+            let completed_sent = seed.phase != SeedPhase::Downloading;
             map.insert(
                 id,
                 Entry {
@@ -1327,19 +1495,19 @@ impl TorrentEngine {
                     overwrite,
                     limit: opts.limit,
                     limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
-                    detail: None,
-                    uploaded: 0,
+                    last_map: None,
+                    seed,
                     info: Some(info.clone()),
                     choice: FileChoice::All,
                     selected: chosen.clone(),
                     last_fetched: 0,
                     slot: Slot::Adding,
                     last_state: None,
-                    completed_sent: false,
-                    run_wanted: !opts.start_paused,
+                    completed_sent,
+                    run_wanted: !paused,
                 },
             );
-            (layout, overwrite, chosen)
+            (layout, overwrite, chosen, paused)
         };
         let stored = self.shared.stored_torrent(id);
         let mut guard = Reservation {
@@ -1348,9 +1516,9 @@ impl TorrentEngine {
             stored: copy == StoredCopy::Write,
             armed: true,
         };
-        let mut add_opts =
-            self.shared
-                .add_options(&layout, opts.start_paused, opts.limit, overwrite, trackers)?;
+        let mut add_opts = self
+            .shared
+            .add_options(&layout, paused, opts.limit, overwrite, trackers)?;
         add_opts.only_files = chosen.as_ref().map(|c| info.lib_indices(&c.indices));
         if copy != StoredCopy::Keep {
             tokio::fs::write(&stored, &bytes).await?;
@@ -1425,6 +1593,7 @@ impl TorrentEngine {
         opts: &AddOptions,
         trackers: Vec<String>,
         reason: Option<String>,
+        seed: SeedTracker,
     ) -> Result<Added, EngineError> {
         let layout = {
             let mut map = self.shared.lock();
@@ -1442,8 +1611,8 @@ impl TorrentEngine {
                     overwrite: false,
                     limit: opts.limit,
                     limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
-                    detail: None,
-                    uploaded: 0,
+                    last_map: None,
+                    seed,
                     info: Some(info.clone()),
                     choice: FileChoice::All,
                     selected: None,
@@ -1500,6 +1669,7 @@ impl TorrentEngine {
         target: Target<'_>,
         opts: &AddOptions,
         choice: FileChoice,
+        seed: SeedTracker,
     ) -> Result<Added, EngineError> {
         let info = source::parse_magnet(&uri)?;
         let name = info.display_name();
@@ -1534,8 +1704,8 @@ impl TorrentEngine {
                 overwrite: false,
                 limit: opts.limit,
                 limit_cell,
-                detail: None,
-                uploaded: 0,
+                last_map: None,
+                seed,
                 info: None,
                 choice,
                 selected: None,
@@ -1551,6 +1721,44 @@ impl TorrentEngine {
             path: layout.path,
             total_bytes: None,
         })
+    }
+
+    /// After `pause` stopped torrent `id` in librqbit (`stats`: just before): a complete
+    /// torrent stops seeding (`Completed`; `SeedingFinished` if it was seeding), and its
+    /// counters are recorded.
+    fn stop_seeding_paused(&self, id: DownloadId, stats: &map::Stats) {
+        let (completed, was_seeding, rec) = {
+            let mut map = self.shared.lock();
+            let Some(e) = map.get_mut(&id) else {
+                return;
+            };
+            e.seed.observe_upload(stats.uploaded);
+            let mut completed = false;
+            if e.seed.phase == SeedPhase::Downloading && stats.finished {
+                // Complete, not seen by the poll task yet (but reported seeding, unless
+                // both targets are 0): completed now.
+                let seed = !self.shared.targets(&e.seed.policy).none();
+                e.seed.complete(seed, seeding::now_unix());
+                completed = !e.completed_sent;
+                e.completed_sent = true;
+            }
+            let was = e.seed.phase == SeedPhase::Seeding && e.seed.stop();
+            let rec = e
+                .seed
+                .worth_recording()
+                .then(|| e.seed.record(Instant::now()));
+            (completed, was, rec)
+        };
+        if let Some(rec) = rec {
+            self.shared.write_seed(id, &rec);
+        }
+        if completed {
+            self.shared.persist_choice(id);
+            let _ = self.shared.events.send(EngineEvent::Completed { id });
+        }
+        if was_seeding {
+            let _ = self.shared.events.send(EngineEvent::SeedingFinished { id });
+        }
     }
 
     /// Removes download `id`: from librqbit (deleting only its own files if asked: see
@@ -1642,6 +1850,11 @@ impl TorrentEngine {
     ) -> Result<Added, EngineError> {
         let stored = self.shared.stored_torrent(id);
         let have_copy = tokio::fs::try_exists(&stored).await.unwrap_or(false);
+        let req_seed = req.seed.clone().unwrap_or_default();
+        let seed = SeedTracker::restored(
+            req_seed.clone(),
+            SeedRecord::read(&self.shared.seed_file(id)),
+        );
         let original = match req.source {
             Source::Magnet { uri } => {
                 let target = Target::Restore { path, folder: true };
@@ -1658,6 +1871,7 @@ impl TorrentEngine {
                                     opts,
                                     trackers,
                                     None,
+                                    seed,
                                 )
                                 .await;
                         }
@@ -1666,7 +1880,7 @@ impl TorrentEngine {
                 }
                 // A recorded choice (with its placeholders) is applied by the metadata
                 // task (see `resolve_and_add`); else the request's.
-                return self.add_magnet(id, uri, target, opts, req.files);
+                return self.add_magnet(id, uri, target, opts, req.files, seed);
             }
             Source::TorrentFile { path } => path,
             Source::Http { .. } => return Err(EngineError::Unsupported("not a torrent source")),
@@ -1678,7 +1892,16 @@ impl TorrentEngine {
         if have_copy {
             let bytes = source::read_torrent_file(&stored).await?;
             return self
-                .add_torrent_file(id, bytes, target, StoredCopy::Keep, opts, Vec::new(), None)
+                .add_torrent_file(
+                    id,
+                    bytes,
+                    target,
+                    StoredCopy::Keep,
+                    opts,
+                    Vec::new(),
+                    None,
+                    seed,
+                )
                 .await;
         }
         if tokio::fs::try_exists(&original).await.unwrap_or(false) {
@@ -1697,6 +1920,7 @@ impl TorrentEngine {
                     opts,
                     Vec::new(),
                     None,
+                    seed,
                 )
                 .await;
         }
@@ -1718,8 +1942,8 @@ impl TorrentEngine {
                 overwrite: true,
                 limit: opts.limit,
                 limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
-                detail: None,
-                uploaded: 0,
+                last_map: None,
+                seed: SeedTracker::new(req_seed),
                 info: None,
                 choice: FileChoice::All,
                 selected: None,
@@ -1999,6 +2223,7 @@ impl Engine for TorrentEngine {
             .clone()
             .unwrap_or_else(|| self.shared.opts.default_dir.clone());
         let target = Target::Fresh(&base);
+        let seed = SeedTracker::new(req.seed.clone().unwrap_or_default());
         match req.source {
             Source::TorrentFile { path } => {
                 let bytes = source::read_torrent_file(&path).await?;
@@ -2010,10 +2235,11 @@ impl Engine for TorrentEngine {
                     &opts,
                     Vec::new(),
                     Some(&req.files),
+                    seed,
                 )
                 .await
             }
-            Source::Magnet { uri } => self.add_magnet(id, uri, target, &opts, req.files),
+            Source::Magnet { uri } => self.add_magnet(id, uri, target, &opts, req.files, seed),
             Source::Http { .. } => Err(EngineError::Unsupported("not a torrent source")),
         }
     }
@@ -2050,8 +2276,12 @@ impl Engine for TorrentEngine {
         let task = match taken {
             Ok(h) => {
                 self.shared.note_writes();
+                let stats = map::Stats::from(&h.stats());
                 let res = self.shared.pause_managed(&h).await;
                 self.shared.persist_choice(id);
+                if res.is_ok() {
+                    self.stop_seeding_paused(id, &stats);
+                }
                 return res;
             }
             Err(task) => task,
@@ -2088,6 +2318,8 @@ impl Engine for TorrentEngine {
     }
 
     async fn resume(&self, id: DownloadId) -> Result<(), EngineError> {
+        // Complete torrents stay as they are: seeding goes on, stopped seeding (pause,
+        // target met) stays stopped.
         let _ops = self.shared.ops.lock().await;
         let (h, overwrite) = {
             let mut map = self.shared.lock();
@@ -2132,7 +2364,7 @@ impl Engine for TorrentEngine {
             }
         };
         let st = map::Stats::from(&h.stats());
-        // Finished: stays stopped (no seeding). Running or starting: nothing to do.
+        // Finished: see above. Running or starting: nothing to do.
         let stopped = h.is_paused() || matches!(st.phase, map::Phase::Paused | map::Phase::Error);
         if st.finished || !stopped {
             return Ok(());
@@ -2207,33 +2439,34 @@ impl Engine for TorrentEngine {
     }
 
     fn status(&self, id: DownloadId) -> Option<DownloadStatus> {
-        let view = Shared::view(self.shared.lock().get(&id)?)?;
+        let view = self.shared.view(self.shared.lock().get(&id)?)?;
         Some(view.status())
     }
 
-    /// The piece map is synthesised from per-file progress (see [`map::have_bitfield`]) and
-    /// reused for a second. Seeds are connected peers that have every piece, leechers the
-    /// other connected peers; the ratio is bytes uploaded since the torrent last went live
-    /// (the highest seen) over its size. `None` until librqbit has the torrent's metadata.
+    /// The piece map is librqbit's own (MSB first; pieces outside a file selection show
+    /// their real state); when librqbit has none (checking its files, failed) see
+    /// [`map::fallback_map`]. Seeds are connected peers that have every piece, leechers
+    /// the other connected peers; the ratio is the cumulative upload over the (selected)
+    /// size. `None` until librqbit has the torrent's metadata.
     fn detail(&self, id: DownloadId) -> Option<EngineDetail> {
-        let (h, cached) = {
+        let (h, last, complete, selected, seed) = {
             let map = self.shared.lock();
             let e = map.get(&id)?;
             let Slot::Managed(h) = &e.slot else {
                 return None;
             };
-            let cached = e
-                .detail
-                .as_ref()
-                .filter(|c| c.at.elapsed() < DETAIL_TTL)
-                .map(|c| (c.piece_count, c.have.clone()));
-            (h.clone(), cached)
+            (
+                h.clone(),
+                e.last_map.clone(),
+                e.seed.phase != SeedPhase::Downloading,
+                e.selected.clone(),
+                e.seed.view(self.shared.targets(&e.seed.policy)),
+            )
         };
         let stats = h.stats();
-        // A map cached while downloading is stale once the torrent has finished.
-        let cached = cached.filter(|(n, have)| !stats.finished || map::has_every_piece(*n, have));
-        let fresh = match cached {
-            Some(_) => None,
+        let exact = self.shared.exact_map(&h);
+        let (piece_count, have) = match &exact {
+            Some(m) => m.clone(),
             None => {
                 let (piece_len, total, pieces, lengths) = h
                     .with_metadata(|m| {
@@ -2246,40 +2479,26 @@ impl Engine for TorrentEngine {
                         )
                     })
                     .ok()?;
-                // A finished torrent has every piece, whatever the progress says.
-                let progress = if stats.finished {
-                    &lengths
-                } else {
-                    &stats.file_progress
-                };
-                Some((
-                    pieces,
-                    map::have_bitfield(piece_len, total, &lengths, progress),
-                ))
-            }
-        };
-        let (piece_count, have) = match (cached, fresh) {
-            (Some(c), _) => c,
-            (None, Some(f)) => f,
-            (None, None) => return None,
-        };
-        let uploaded = {
-            let mut map = self.shared.lock();
-            // Removed meanwhile: nothing to report.
-            let e = map.get_mut(&id)?;
-            e.uploaded = e.uploaded.max(stats.uploaded_bytes);
-            if e.detail.as_ref().is_none_or(|c| {
-                c.at.elapsed() >= DETAIL_TTL
-                    || (stats.finished && !map::has_every_piece(c.piece_count, &c.have))
-            }) {
-                e.detail = Some(DetailCache {
-                    at: Instant::now(),
-                    piece_count,
-                    have: have.clone(),
+                let wanted: Option<Vec<usize>> = selected
+                    .as_ref()
+                    .map(|c| c.lib_sizes.iter().map(|&(i, _)| i).collect());
+                let completed = (complete || stats.finished)
+                    .then(|| map::selected_pieces(piece_len, total, &lengths, wanted.as_deref()));
+                let last = last
+                    .as_ref()
+                    .filter(|(n, _)| *n == pieces)
+                    .map(|(_, have)| have.as_slice());
+                let have = map::fallback_map(last, completed, || {
+                    map::have_bitfield(piece_len, total, &lengths, &stats.file_progress)
                 });
+                (pieces, have)
             }
-            e.uploaded
         };
+        if let Some(m) = exact {
+            // Removed meanwhile: nothing to report.
+            self.shared.lock().get_mut(&id)?.last_map = Some(m);
+        }
+        let total = selected.as_ref().map_or(stats.total_bytes, |c| c.total());
         let (peers, seeds, leechers) = map::peer_counts(&stats);
         Some(EngineDetail::Torrent {
             piece_count,
@@ -2287,7 +2506,7 @@ impl Engine for TorrentEngine {
             peers,
             seeds,
             leechers,
-            ratio: map::ratio(uploaded, stats.total_bytes),
+            ratio: seeding::ratio(seed.uploaded(stats.uploaded_bytes), total),
         })
     }
 
@@ -2474,7 +2693,7 @@ impl Engine for TorrentEngine {
                 e.slot = Slot::Managed(handle.clone());
                 e.selected = chosen;
                 e.run_wanted = false;
-                e.detail = None;
+                e.last_map = None;
                 true
             }
             None => false,
@@ -2485,6 +2704,19 @@ impl Engine for TorrentEngine {
                 .delete(TorrentIdOrHash::Id(handle.id()), false)
                 .await;
         }
+        Ok(())
+    }
+
+    /// Sets the torrent's own seeding targets (`None` fields: the global values), in any
+    /// state; a seeding torrent is checked against them at the next look (~500 ms). A
+    /// torrent that stopped seeding stays stopped.
+    async fn set_seed(&self, id: DownloadId, policy: SeedPolicy) -> Result<(), EngineError> {
+        let mut map = self.shared.lock();
+        let e = map
+            .get_mut(&id)
+            .filter(|e| !matches!(e.slot, Slot::Adding))
+            .ok_or(EngineError::NotFound(id))?;
+        e.seed.policy = policy;
         Ok(())
     }
 }
@@ -2708,6 +2940,7 @@ mod tests {
             lsd: false,
             listen_port: 0,
             seed_ratio: 0.0,
+            seed_time: std::time::Duration::ZERO,
             data_dir: dir.join("data"),
             default_dir: dir.join("downloads"),
             test_mode: true,
@@ -2733,8 +2966,8 @@ mod tests {
             overwrite: false,
             limit: None,
             limit_cell: Arc::new(AtomicU64::new(0)),
-            detail: None,
-            uploaded: 0,
+            last_map: None,
+            seed: SeedTracker::new(SeedPolicy::default()),
             info: None,
             choice: FileChoice::All,
             selected: None,

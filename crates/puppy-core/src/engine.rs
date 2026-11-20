@@ -46,6 +46,10 @@ pub enum EngineEvent {
     Completed {
         id: DownloadId,
     },
+    /// A torrent stopped seeding (target reached or paused); it is `Completed` now.
+    SeedingFinished {
+        id: DownloadId,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

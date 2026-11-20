@@ -507,7 +507,11 @@ impl Inner {
         };
         Self::record_status(e, &status);
         let next = match (&e.state, status.state) {
-            (_, DownloadState::Completed) => DownloadState::Completed,
+            // Seeding is complete data. Interim, until the manager knows the state (plan
+            // Task 4): taken as Completed, which drops the torrent (stops seeding).
+            (_, DownloadState::Completed | DownloadState::Seeding { .. }) => {
+                DownloadState::Completed
+            }
             (DownloadState::Active, s @ DownloadState::Failed { .. }) => s,
             (
                 DownloadState::Active | DownloadState::Paused | DownloadState::Queued,
@@ -681,7 +685,11 @@ async fn event_task(
         };
         let Some(inner) = inner.upgrade() else { return };
         match ev {
-            Ok(EngineEvent::StateChanged { id, .. } | EngineEvent::Completed { id }) => {
+            Ok(
+                EngineEvent::StateChanged { id, .. }
+                | EngineEvent::Completed { id }
+                | EngineEvent::SeedingFinished { id },
+            ) => {
                 inner.on_engine_change(engine, Some(&[id]));
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {

@@ -4,6 +4,7 @@
 mod engine;
 mod map;
 mod poll;
+mod seeding;
 mod selection;
 mod source;
 

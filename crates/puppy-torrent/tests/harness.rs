@@ -17,6 +17,7 @@ fn test_options(dir: &std::path::Path) -> TorrentEngineOptions {
         lsd: true, // ignored in test mode
         listen_port: 42069,
         seed_ratio: 0.0,
+        seed_time: std::time::Duration::ZERO,
         data_dir: dir.join("data"),
         default_dir: dir.join("downloads"),
         test_mode: true,

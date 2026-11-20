@@ -31,6 +31,7 @@ impl Env {
             lsd: false,
             listen_port: 0,
             seed_ratio: 0.0,
+            seed_time: std::time::Duration::ZERO,
             data_dir: dir.path().join("data"),
             default_dir: dir.path().join("downloads"),
             test_mode: true,
@@ -111,12 +112,7 @@ async fn detail_reports_pieces_and_peers() {
     assert_eq!(pieces, 64);
     assert_eq!(have.len(), 8, "one bit per piece, MSB first, byte padded");
     assert!(peers >= 1);
-    // In-order synthesis: a single file's had pieces form a prefix (MSB first).
-    let got = popcount(&have);
-    for i in 0..pieces as usize {
-        let bit = have[i / 8] & (0x80 >> (i % 8)) != 0;
-        assert_eq!(bit, (i as u32) < got, "piece {i}");
-    }
+    // The map is librqbit's own: tests/seeding.rs `exact_piece_map_matches_api`.
 
     // Completion: every piece set, nothing left to leech from.
     let deadline = Instant::now() + TIMEOUT;

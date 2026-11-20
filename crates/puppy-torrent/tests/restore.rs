@@ -29,6 +29,7 @@ async fn engine(root: &Path, peers: Vec<SocketAddr>) -> TorrentEngine {
         lsd: false,
         listen_port: 0,
         seed_ratio: 0.0,
+        seed_time: std::time::Duration::ZERO,
         data_dir: root.join("data"),
         default_dir: root.join("downloads"),
         test_mode: true,
