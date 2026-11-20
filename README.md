@@ -1,8 +1,8 @@
 # puppy
 
 A modern terminal download manager written in Rust, meant as a fresh successor
-to [aria2](https://aria2.github.io/). It downloads over HTTP(S) today;
-BitTorrent and the full-screen dashboard are in progress. A background daemon
+to [aria2](https://aria2.github.io/). It downloads over HTTP(S) today, with a
+full-screen dashboard; BitTorrent is in progress. A background daemon
 owns every download and the queue, so downloads keep going when no client is
 open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
@@ -21,10 +21,20 @@ Early development. Done so far:
   time by default), atomically persisted state, a versioned newline-delimited
   JSON protocol, graceful shutdown, and an idle exit when started on demand.
 
-In progress: the full-screen dashboard (until it lands, `puppy` prints a
-one-line summary) and BitTorrent support (.torrent files and magnet links).
+- **Dashboard**: a full-screen terminal UI (`puppy`) to add, pause, resume,
+  reorder, limit and delete downloads, with a live detail pane, dark and light
+  themes, and monochrome / 16-color fallbacks.
+
+In progress: BitTorrent support (.torrent files and magnet links).
 Scriptable subcommands (`puppy add`, `puppy ls`, …) and browser integration
 come later.
+
+## Screenshot
+
+![puppy's dashboard](docs/demo.gif)
+
+Regenerate with `vhs docs/demo.tape` (needs [vhs](https://github.com/charmbracelet/vhs),
+`python3` and `puppy` on your `PATH`).
 
 ## Build
 
@@ -43,9 +53,44 @@ cargo install --path crates/puppy
 ## Run
 
 ```sh
-puppy daemon   # run the daemon in the foreground (Ctrl-C stops it gracefully)
-puppy          # connect to the daemon, starting one if needed, and print a summary
+puppy                 # open the dashboard, starting a daemon if none is running
+puppy status          # print a one-line summary, e.g. "3 downloads, 1 active"
+puppy daemon          # run the daemon in the foreground (Ctrl-C stops it gracefully)
+puppy --theme light   # override the theme: auto, dark or light
 ```
+
+`puppy` needs an interactive terminal (it exits with status 2 otherwise). Quitting
+the dashboard only disconnects; the daemon and its downloads keep running.
+
+### Keys
+
+| Key                          | Action                                       |
+|------------------------------|----------------------------------------------|
+| `j` / `↓`, `k` / `↑`         | Move down / up                               |
+| `g` / `Home`, `G` / `End`    | Jump to top / bottom                         |
+| `a`                          | Add a download                               |
+| `p`, `r`                     | Pause, resume                                |
+| `d` / `Delete`              | Delete (asks to confirm)                     |
+| `R`                          | Restart (failed or needs-attention only)     |
+| `l`                          | Speed limit for the selected download        |
+| `L`                          | Global speed limits                          |
+| `+` / `-`                    | Raise / lower the number of active downloads |
+| `Shift+↑` / `Shift+↓` (`K` / `J`) | Move in the queue                       |
+| `/`                          | Filter                                       |
+| `Esc`                        | Close popup / clear filter                   |
+| `?`                          | Help                                         |
+| `q` / `Ctrl+C`               | Quit                                         |
+
+The footer shows the keys that apply to the current selection.
+
+### Configuration
+
+Settings go in `config.toml` in the config directory (below). Keys:
+`download_dir`, `connections` (default 8), `max_active` (default 3),
+`global_down_limit`, `global_up_limit` (bytes per second), `theme`
+(`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and
+`proxy`. `NO_COLOR` switches to monochrome; without `COLORTERM=truecolor` the
+16 ANSI colors are used. `--theme` overrides the file.
 
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening
@@ -55,14 +100,15 @@ and the files in [packaging/](packaging/).
 
 State lives in the platform data directory (`~/.local/share/puppy`,
 `~/Library/Application Support/puppy` or `%APPDATA%\puppy`); the daemon's log
-is `logs/puppyd.log` there. Settings go in `config.toml` in the config
-directory (`~/.config/puppy` on Linux, the data directory elsewhere).
+is `logs/puppyd.log` there. `config.toml` lives in the config directory
+(`~/.config/puppy` on Linux, the data directory elsewhere).
 
 ## Project layout
 
 | Crate                     | What it is                                                      |
 |---------------------------|-----------------------------------------------------------------|
-| `crates/puppy`            | The `puppy` binary: the daemon subcommand and the client.       |
+| `crates/puppy`            | The `puppy` binary: dashboard, `status` and `daemon`.           |
+| `crates/puppy-tui`        | The full-screen dashboard (ratatui).                            |
 | `crates/puppy-core`       | Download engines (HTTP so far) behind a common `Engine` trait.  |
 | `crates/puppy-daemon`     | The daemon: paths, config, queue manager, state store, server.  |
 | `crates/puppy-proto`      | The daemon ↔ client protocol types and framing.                 |

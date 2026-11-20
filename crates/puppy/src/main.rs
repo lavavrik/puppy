@@ -2,15 +2,20 @@
 //!
 //! - `puppy daemon [--idle-exit <SECS>]` runs the background daemon (started by a login
 //!   service, or detached by a client with `--idle-exit`).
-//! - `puppy` connects to the daemon (starting one if none runs) and, until the dashboard
-//!   lands, prints a one-line summary.
+//! - `puppy` opens the full-screen dashboard (starting a daemon if none runs).
+//! - `puppy status` prints a one-line summary (scriptable).
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use puppy_client::{Client, Paths};
+use puppy_daemon::Config;
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
 use puppy_proto::WireState;
+use puppy_tui::api::ClientApi;
+use puppy_tui::theme::{Theme, ThemeChoice};
+use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long background work may take to wind down once the command is done.
@@ -21,6 +26,26 @@ const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Color theme for the dashboard (overrides `theme` in config.toml).
+    #[arg(long, value_enum, global = true, value_name = "THEME")]
+    theme: Option<ThemeArg>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ThemeArg {
+    Auto,
+    Dark,
+    Light,
+}
+
+impl From<ThemeArg> for ThemeChoice {
+    fn from(t: ThemeArg) -> Self {
+        match t {
+            ThemeArg::Auto => ThemeChoice::Auto,
+            ThemeArg::Dark => ThemeChoice::Dark,
+            ThemeArg::Light => ThemeChoice::Light,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -33,10 +58,19 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         idle_exit: Option<u64>,
     },
+    /// Print a one-line summary (`N downloads, X active`), starting a daemon if needed.
+    Status,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.command.is_none() && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    {
+        eprintln!(
+            "puppy's dashboard needs an interactive terminal (try `puppy daemon` to run the background service)"
+        );
+        return ExitCode::from(2);
+    }
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -47,7 +81,8 @@ fn main() -> ExitCode {
     let result = rt.block_on(async {
         match cli.command {
             Some(Command::Daemon { idle_exit }) => daemon(idle_exit).await,
-            None => summary().await,
+            Some(Command::Status) => summary().await,
+            None => dashboard(cli.theme).await,
         }
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
@@ -92,4 +127,25 @@ async fn summary() -> anyhow::Result<()> {
     let noun = if n == 1 { "download" } else { "downloads" };
     println!("{n} {noun}, {active} active");
     Ok(())
+}
+
+/// The full-screen dashboard (the default command).
+async fn dashboard(theme: Option<ThemeArg>) -> anyhow::Result<()> {
+    let paths = Paths::resolve().context("cannot set up puppy's directories")?;
+    let config = Config::load(&paths.config_file())?;
+    let choice = match theme {
+        Some(t) => t.into(),
+        None => match config.theme.as_str() {
+            "auto" => ThemeChoice::Auto,
+            "dark" => ThemeChoice::Dark,
+            "light" => ThemeChoice::Light,
+            other => {
+                eprintln!("puppy: unknown theme {other:?} in config.toml; using \"auto\"");
+                ThemeChoice::Auto
+            }
+        },
+    };
+    let theme = Theme::detect(choice, &|k| std::env::var(k).ok());
+    let exe = std::env::current_exe().context("cannot find the puppy executable")?;
+    puppy_tui::runtime::run(Arc::new(ClientApi::new(paths, exe)), theme).await
 }

@@ -429,18 +429,48 @@ async fn sigkill_mid_transfer_then_respawn_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_args_prints_summary() {
+async fn status_prints_summary() {
     let env = Env::new();
-    let (status, out, err) = env.run(&[]);
+    let (status, out, err) = env.run(&["status"]);
     assert!(status.success(), "{status:?}: {err}");
     assert_eq!(out, "0 downloads, 0 active\n");
     // It started a daemon (which may already have idle-exited): add something and
     // ask again.
     let c = env.spawn_client().await.unwrap();
     c.add(env.paused_req("a.bin"), true, None).await.unwrap();
-    let (status, out, err) = env.run(&[]);
+    let (status, out, err) = env.run(&["status"]);
     assert!(status.success(), "{status:?}: {err}");
     assert_eq!(out, "1 download, 0 active\n");
+}
+
+#[test]
+fn tui_flag_parses() {
+    let env = Env::new();
+    let (status, out, err) = env.run(&["--theme", "light", "--help"]);
+    assert!(status.success(), "{status:?}: {err}");
+    assert!(out.contains("--theme"), "{out}");
+    let (status, _, err) = env.run(&["--theme", "neon", "status"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+}
+
+#[test]
+fn no_tty_fails_gracefully() {
+    let env = Env::new();
+    // Piped stdio (not a terminal) for stdin, stdout and stderr.
+    let out = env
+        .command(&[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("puppy's dashboard needs an interactive terminal"),
+        "{err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
