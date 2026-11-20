@@ -28,14 +28,23 @@ pub(crate) async fn run(shared: Weak<Shared>, stop: CancellationToken) {
     }
 }
 
-/// One round: diff states, stop finished torrents, then broadcast.
+/// One round: diff states, stop finished torrents, then broadcast. librqbit's stats are
+/// read outside the torrents lock.
 pub(crate) async fn poll_once(shared: &Shared) {
+    let views: Vec<_> = shared
+        .lock()
+        .iter()
+        .filter_map(|(&id, e)| Shared::view(e).map(|v| (id, v)))
+        .collect();
+    let statuses: Vec<_> = views.into_iter().map(|(id, v)| (id, v.status())).collect();
+
     let mut events = Vec::new();
     let mut to_stop = Vec::new();
     {
         let mut map = shared.lock();
-        for (&id, e) in map.iter_mut() {
-            let Some(status) = shared.entry_status(e) else {
+        for (id, status) in statuses {
+            // Removed meanwhile: nothing to report.
+            let Some(e) = map.get_mut(&id) else {
                 continue;
             };
             if e.last_state.as_ref() != Some(&status.state) {
@@ -48,7 +57,8 @@ pub(crate) async fn poll_once(shared: &Shared) {
             if status.state == DownloadState::Completed && !e.completed_sent {
                 e.completed_sent = true;
                 events.push(EngineEvent::Completed { id });
-                // Seeding policy v1: stop at completion (seed_ratio 0).
+                // Seeding policy v1: stop at completion (seed_ratio 0; above 0 is
+                // reserved and currently means "seed until removed").
                 if shared.opts.seed_ratio <= 0.0
                     && let Slot::Managed(h) = &e.slot
                 {

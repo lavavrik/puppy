@@ -215,3 +215,38 @@ pub async fn leech_raw(seeder: &Seeder, output_dir: &Path) {
         .expect("download completes");
     session.cancellation_token().cancel();
 }
+
+/// Hand-made `.torrent` bytes (no checks; for torrents `create_torrent` won't make): a
+/// single file `name` of `len` bytes, or (`files` given) a multi-file torrent `name`
+/// with `(path components, len)` files. Piece hashes are zeros.
+pub fn craft_torrent(name: &str, len: u64, files: Option<&[(&[&str], u64)]>) -> Vec<u8> {
+    fn bstr(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(format!("{}:", s.len()).as_bytes());
+        out.extend_from_slice(s);
+    }
+    let total: u64 = files.map_or(len, |f| f.iter().map(|x| x.1).sum());
+    let pieces = total.div_ceil(PIECE_LENGTH as u64).max(1) as usize;
+    let mut out = b"d4:infod".to_vec();
+    match files {
+        Some(files) => {
+            bstr(&mut out, b"files");
+            out.push(b'l');
+            for (path, len) in files {
+                out.extend_from_slice(format!("d6:lengthi{len}e4:pathl").as_bytes());
+                for c in *path {
+                    bstr(&mut out, c.as_bytes());
+                }
+                out.extend_from_slice(b"ee");
+            }
+            out.push(b'e');
+        }
+        None => out.extend_from_slice(format!("6:lengthi{len}e").as_bytes()),
+    }
+    bstr(&mut out, b"name");
+    bstr(&mut out, name.as_bytes());
+    out.extend_from_slice(format!("12:piece lengthi{PIECE_LENGTH}e").as_bytes());
+    bstr(&mut out, b"pieces");
+    bstr(&mut out, &vec![0u8; 20 * pieces]);
+    out.extend_from_slice(b"ee");
+    out
+}

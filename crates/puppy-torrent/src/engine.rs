@@ -40,7 +40,8 @@ pub struct TorrentEngineOptions {
     /// Port for incoming peer connections on `0.0.0.0`; an OS-assigned port is used if it
     /// cannot be bound. 0: always OS-assigned.
     pub listen_port: u16,
-    /// Reserved: seeding stops at completion (ratio 0) in this version.
+    /// Seeding policy. `0.0` (the default): stop at completion. Reserved: any value
+    /// above 0 currently means "keep seeding until removed" (no ratio tracking yet).
     pub seed_ratio: f32,
     /// puppy's data dir; the engine keeps its own files under `<data_dir>/torrent/` and
     /// copies of added `.torrent` files in `<data_dir>/torrents/<id>.torrent`.
@@ -113,6 +114,30 @@ pub(crate) enum Slot {
 
 type Torrents = HashMap<DownloadId, Entry>;
 
+/// A torrent's status inputs, taken under the torrents lock (see [`Shared::view`]).
+pub(crate) enum View {
+    Pending(DownloadStatus),
+    Managed {
+        handle: ManagedTorrentHandle,
+        name: String,
+        path: PathBuf,
+    },
+}
+
+impl View {
+    /// The status (reads librqbit's stats: call without the torrents lock).
+    pub(crate) fn status(self) -> DownloadStatus {
+        match self {
+            View::Pending(st) => st,
+            View::Managed { handle, name, path } => {
+                let stats = map::Stats::from(&handle.stats());
+                let name = handle.name().unwrap_or(name);
+                map::status(&stats, name, path)
+            }
+        }
+    }
+}
+
 /// State shared by the engine, its poll task and the magnet tasks.
 pub(crate) struct Shared {
     session: Arc<Session>,
@@ -127,14 +152,15 @@ impl Shared {
         self.torrents.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The status of `e` (`None` while its `.torrent` is being added).
-    pub(crate) fn entry_status(&self, e: &Entry) -> Option<DownloadStatus> {
+    /// What is needed to compute `e`'s status, taken under the torrents lock; librqbit's
+    /// stats are then read outside it (`None` while its `.torrent` is being added).
+    pub(crate) fn view(e: &Entry) -> Option<View> {
         let pending = |state| {
-            Some(map::pending_status(
+            Some(View::Pending(map::pending_status(
                 state,
                 e.name.clone(),
                 e.layout.path.clone(),
-            ))
+            )))
         };
         match &e.slot {
             Slot::Adding => None,
@@ -144,11 +170,11 @@ impl Shared {
                 reason: reason.clone(),
                 transient: *transient,
             }),
-            Slot::Managed(h) => {
-                let stats = map::Stats::from(&h.stats());
-                let name = h.name().unwrap_or_else(|| e.name.clone());
-                Some(map::status(&stats, name, e.layout.path.clone()))
-            }
+            Slot::Managed(h) => Some(View::Managed {
+                handle: h.clone(),
+                name: e.name.clone(),
+                path: e.layout.path.clone(),
+            }),
         }
     }
 
@@ -202,6 +228,11 @@ impl Shared {
     /// Starts fetching a magnet's metadata (then downloading) in the background; returns
     /// the slot to store for it. Call with the torrents lock held, so the task cannot
     /// look for its slot before it is stored.
+    ///
+    /// When the task ends: if its slot is still current it installs the torrent (or the
+    /// failure); if the download was paused meanwhile (`Held`) it installs the torrent
+    /// and pauses it; if the download was removed (or superseded) it returns the handle
+    /// to whoever took the slot (`remove`/`pause` abort and await the task).
     fn spawn_resolve(
         self: &Arc<Self>,
         id: DownloadId,
@@ -212,43 +243,42 @@ impl Shared {
         let session = self.session.clone();
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
-            let res = session
-                .add_torrent(AddTorrent::from_url(uri), Some(opts))
-                .await;
-            let added = match &res {
-                Ok(AddTorrentResponse::Added(_, h)) => Some(h.clone()),
-                _ => None,
-            };
+            let outcome = resolve_and_add(&session, uri, opts).await;
+            let added = outcome.as_ref().ok().cloned();
             let Some(shared) = weak.upgrade() else {
                 return added;
             };
-            let mut map = shared.lock();
-            let current = map
-                .get_mut(&id)
-                .filter(|e| matches!(e.slot, Slot::Resolving { r#gen: g, .. } if g == r#gen));
-            let Some(e) = current else {
-                // Paused or removed meanwhile: whoever took the slot handles the torrent.
-                return added;
-            };
-            e.slot = match res {
-                Ok(AddTorrentResponse::Added(_, h)) => Slot::Managed(h),
-                Ok(AddTorrentResponse::AlreadyManaged(..)) => Slot::PendingFailed {
-                    reason: DUPLICATE.into(),
-                    transient: false,
-                },
-                Ok(AddTorrentResponse::ListOnly(_)) => Slot::PendingFailed {
-                    reason: "unexpected list-only answer from librqbit".into(),
-                    transient: false,
-                },
-                Err(err) => {
-                    let reason = format!("fetching the torrent metadata: {err:#}");
-                    tracing::info!(id, "{reason}");
-                    Slot::PendingFailed {
-                        transient: map::is_transient_error(&reason),
-                        reason,
+            let to_pause = {
+                let mut map = shared.lock();
+                let Some(e) = map.get_mut(&id) else {
+                    return added; // removed: the remover deletes it
+                };
+                match (settle(&e.slot, r#gen), outcome) {
+                    (Settle::Current, Ok(h)) => {
+                        e.slot = Slot::Managed(h);
+                        None
                     }
+                    (Settle::Current, Err(f)) => {
+                        tracing::info!(id, "{}", f.reason);
+                        e.slot = Slot::PendingFailed {
+                            reason: f.reason,
+                            transient: f.transient,
+                        };
+                        None
+                    }
+                    (Settle::Paused, Ok(h)) => {
+                        e.slot = Slot::Managed(h.clone());
+                        Some(h)
+                    }
+                    (Settle::Paused, Err(_)) => None, // stays paused; resume retries
+                    (Settle::Stale, _) => return added,
                 }
             };
+            if let Some(h) = to_pause
+                && let Err(e) = shared.pause_managed(&h).await
+            {
+                tracing::warn!(id, "pausing a torrent paused while resolving: {e}");
+            }
             None
         });
         Slot::Resolving { r#gen, task }
@@ -293,6 +323,102 @@ impl Shared {
                 task.abort();
             }
         }
+    }
+}
+
+/// How a finished metadata task relates to its download's current slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// Still the download's fetch: install the result.
+    Current,
+    /// Paused while fetching: keep the torrent, paused.
+    Paused,
+    /// Superseded by another fetch (or another state): hand the torrent back.
+    Stale,
+}
+
+fn settle(slot: &Slot, task_gen: u64) -> Settle {
+    match slot {
+        Slot::Resolving { r#gen, .. } if *r#gen == task_gen => Settle::Current,
+        Slot::Held => Settle::Paused,
+        _ => Settle::Stale,
+    }
+}
+
+/// Why a magnet could not be added.
+struct ResolveFailure {
+    reason: String,
+    transient: bool,
+}
+
+impl ResolveFailure {
+    fn new(reason: String) -> Self {
+        let transient = map::is_transient_error(&reason);
+        Self { reason, transient }
+    }
+
+    fn permanent(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            transient: false,
+        }
+    }
+}
+
+/// Fetches a magnet's metadata without adding it (`list_only`: nothing is written),
+/// checks its file names ([`source::validate_layout`]), then adds it for real from the
+/// fetched torrent bytes (no second metadata fetch; the peers already seen are reused).
+async fn resolve_and_add(
+    session: &Arc<Session>,
+    uri: String,
+    mut opts: AddTorrentOptions,
+) -> Result<ManagedTorrentHandle, ResolveFailure> {
+    let list_opts = AddTorrentOptions {
+        list_only: true,
+        output_folder: opts.output_folder.clone(),
+        initial_peers: opts.initial_peers.clone(),
+        ..Default::default()
+    };
+    let listed = match session
+        .add_torrent(AddTorrent::from_url(uri), Some(list_opts))
+        .await
+    {
+        Ok(AddTorrentResponse::ListOnly(listed)) => listed,
+        Ok(_) => {
+            return Err(ResolveFailure::permanent(
+                "unexpected answer from librqbit to a list-only add",
+            ));
+        }
+        Err(e) => {
+            return Err(ResolveFailure::new(format!(
+                "fetching the torrent metadata: {e:#}"
+            )));
+        }
+    };
+    source::validate_layout(&listed.info).map_err(|e| {
+        ResolveFailure::permanent(match e {
+            EngineError::Invalid(m) => m,
+            other => other.to_string(),
+        })
+    })?;
+    opts.only_files = listed.only_files;
+    let mut peers = opts.initial_peers.take().unwrap_or_default();
+    for p in listed.seen_peers {
+        if !peers.contains(&p) {
+            peers.push(p);
+        }
+    }
+    opts.initial_peers = (!peers.is_empty()).then_some(peers);
+    match session
+        .add_torrent(AddTorrent::from_bytes(listed.torrent_bytes), Some(opts))
+        .await
+    {
+        Ok(AddTorrentResponse::Added(_, h)) => Ok(h),
+        Ok(AddTorrentResponse::AlreadyManaged(..)) => Err(ResolveFailure::permanent(DUPLICATE)),
+        Ok(AddTorrentResponse::ListOnly(_)) => Err(ResolveFailure::permanent(
+            "unexpected list-only answer from librqbit",
+        )),
+        Err(e) => Err(ResolveFailure::new(format!("{e:#}"))),
     }
 }
 
@@ -675,7 +801,11 @@ impl Engine for TorrentEngine {
                     Ok(h)
                 }
                 Slot::Resolving { task, .. } => Err(task),
-                Slot::Held | Slot::PendingFailed { .. } | Slot::Adding => return Ok(()),
+                // A failed magnet stays failed (with its reason); nothing runs.
+                other @ (Slot::Held | Slot::PendingFailed { .. } | Slot::Adding) => {
+                    e.slot = other;
+                    return Ok(());
+                }
             }
         };
         let task = match taken {
@@ -683,28 +813,23 @@ impl Engine for TorrentEngine {
             Err(task) => task,
         };
         task.abort();
-        // The metadata may have arrived just before the abort: keep that torrent, paused.
+        // A task that finished meanwhile installed its torrent (paused) itself; it only
+        // hands one back if the download was removed or superseded meanwhile: drop that
+        // torrent from librqbit, keeping any files.
         if let Ok(Some(h)) = task.await {
-            let kept = {
-                let mut map = self.shared.lock();
-                match map.get_mut(&id) {
-                    Some(e) if matches!(e.slot, Slot::Held) => {
-                        e.slot = Slot::Managed(h.clone());
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if kept {
-                self.shared.pause_managed(&h).await?;
-            } else {
-                // Removed (or re-resumed) meanwhile: nobody wants this one.
-                let _ = self
-                    .shared
-                    .session
-                    .delete(TorrentIdOrHash::Id(h.id()), true)
-                    .await;
-            }
+            let _ = self
+                .shared
+                .session
+                .delete(TorrentIdOrHash::Id(h.id()), false)
+                .await;
+        }
+        // The abort may have interrupted the task's own pause of an installed torrent.
+        let installed = match self.shared.lock().get(&id).map(|e| &e.slot) {
+            Some(Slot::Managed(h)) => Some(h.clone()),
+            _ => None,
+        };
+        if let Some(h) = installed {
+            self.shared.pause_managed(&h).await?;
         }
         Ok(())
     }
@@ -757,23 +882,27 @@ impl Engine for TorrentEngine {
             }
             Slot::Held | Slot::PendingFailed { .. } | Slot::Adding => None,
         };
-        if let Some(h) = handle {
-            self.shared
-                .delete_managed(&h, &e.layout, delete_files)
-                .await?;
-        }
+        let deleted = match handle {
+            Some(h) => {
+                self.shared
+                    .delete_managed(&h, &e.layout, delete_files)
+                    .await
+            }
+            None => Ok(()),
+        };
+        // The download is gone either way: drop its stored copy before reporting.
         match std::fs::remove_file(self.shared.stored_torrent(id)) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
                 tracing::warn!(id, "removing the stored .torrent copy: {err}");
             }
             _ => {}
         }
-        Ok(())
+        deleted
     }
 
     fn status(&self, id: DownloadId) -> Option<DownloadStatus> {
-        let map = self.shared.lock();
-        self.shared.entry_status(map.get(&id)?)
+        let view = Shared::view(self.shared.lock().get(&id)?)?;
+        Some(view.status())
     }
 
     fn detail(&self, _id: DownloadId) -> Option<EngineDetail> {
@@ -879,6 +1008,28 @@ mod tests {
             ok
         });
         assert!(rebound, "{addr} still held by the failed attempt");
+    }
+
+    #[tokio::test]
+    async fn finished_metadata_task_settles_by_slot() {
+        let task = || tokio::spawn(async { None });
+        let resolving = |g| Slot::Resolving {
+            r#gen: g,
+            task: task(),
+        };
+        assert_eq!(settle(&resolving(3), 3), Settle::Current);
+        assert_eq!(settle(&resolving(4), 3), Settle::Stale, "superseded fetch");
+        assert_eq!(
+            settle(&Slot::Held, 3),
+            Settle::Paused,
+            "paused while fetching"
+        );
+        let failed = Slot::PendingFailed {
+            reason: "x".into(),
+            transient: true,
+        };
+        assert_eq!(settle(&failed, 3), Settle::Stale);
+        assert_eq!(settle(&Slot::Adding, 3), Settle::Stale);
     }
 
     #[test]

@@ -153,6 +153,10 @@ pub(crate) fn is_transient_error(msg: &str) -> bool {
         "resolve",
     ];
     let m = msg.to_lowercase();
+    // No peer source at all (DHT off, no trackers, no peers): retrying cannot help.
+    if m.contains("no known way to resolve peers") {
+        return false;
+    }
     if STORAGE.iter().any(|k| m.contains(k)) {
         return false;
     }
@@ -275,7 +279,6 @@ mod tests {
     fn error_classification() {
         for transient in [
             "input address stream exhausted, no way to discover torrent metainfo",
-            "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
             "error connecting to tracker: connection refused",
             "timed out",
         ] {
@@ -287,6 +290,7 @@ mod tests {
             "error decoding torrent",
             "path traversal in torrent name detected",
             "something unexpected",
+            "fetching the torrent metadata: no known way to resolve peers (no DHT, no trackers, no initial_peers)",
         ] {
             assert!(!is_transient_error(permanent), "{permanent}");
         }

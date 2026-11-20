@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use librqbit::{Magnet, torrent_from_bytes};
+use librqbit::{Magnet, ValidatedTorrentMetaV1Info, torrent_from_bytes};
 use puppy_core::engine::EngineError;
-use puppy_core::fsutil::sanitize_filename;
+use puppy_core::fsutil::{is_reserved_windows_name, sanitize_filename};
 
 /// Largest `.torrent` file accepted (real ones are well under 1 MiB).
 pub(crate) const MAX_TORRENT_FILE: u64 = 16 * 1024 * 1024;
@@ -73,6 +73,7 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
     let info_hash = meta.info_hash.as_string();
     let single = meta.info.data.files.is_none();
     let info = meta.info.data.validate().map_err(|e| invalid(&e))?;
+    validate_layout(&info)?;
     let single_file = single
         .then(|| {
             info.iter_file_details()
@@ -90,6 +91,56 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
         total_bytes: info.lengths().total_length(),
         single_file,
     })
+}
+
+/// Refuses file paths that are unsafe on any OS puppy supports, beyond what librqbit's
+/// `validate()` checks (`..`, separators, empty names): every component of every file
+/// path must be one plain name with no `:` (Windows drive prefix such as `C:evil`, which
+/// replaces the base dir when joined; NTFS alternate data streams), no control
+/// characters, and no Windows device name (`con.txt`, `NUL`, `COM1`...). Applied on every
+/// platform, so a torrent behaves the same everywhere.
+pub(crate) fn validate_layout<B: AsRef<[u8]>>(
+    info: &ValidatedTorrentMetaV1Info<B>,
+) -> Result<(), EngineError> {
+    for file in info.iter_file_details() {
+        for component in file.filename.iter_components() {
+            if let Some(why) = unsafe_component(&component) {
+                return Err(EngineError::Invalid(format!(
+                    "unsafe file name in torrent: {:?} ({why})",
+                    file.filename.to_vec().join("/")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why `c` is not a safe file name component, if it is not.
+fn unsafe_component(c: &str) -> Option<&'static str> {
+    use std::path::Component;
+    if c.is_empty() || c == "." || c == ".." {
+        return Some("empty or relative component");
+    }
+    if c.contains(['/', '\\']) {
+        return Some("path separator");
+    }
+    if c.contains(':') {
+        return Some("':' (drive prefix or alternate data stream)");
+    }
+    if c.chars().any(char::is_control) {
+        return Some("control character");
+    }
+    if is_reserved_windows_name(c) {
+        return Some("reserved Windows device name");
+    }
+    let mut parts = Path::new(c).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return Some("not a plain name");
+    }
+    None
 }
 
 /// Reads a `.torrent` file (at most [`MAX_TORRENT_FILE`] bytes).
@@ -112,6 +163,10 @@ pub(crate) async fn read_torrent_file(path: &Path) -> Result<Vec<u8>, EngineErro
 }
 
 /// Where a torrent's files go.
+///
+/// Folders are named after the torrent (or magnet `dn`/hash) only, so two different
+/// torrents with the same name in the same output dir share a folder (and a file with the
+/// same path inside it would be overwritten: librqbit adds with `overwrite`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Layout {
     /// Passed to librqbit as `output_folder`: it writes the torrent's files (their paths
@@ -214,6 +269,26 @@ mod tests {
                 matches!(&err, EngineError::Invalid(m) if m.starts_with("not a valid torrent")),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn unsafe_components() {
+        for bad in [
+            "C:evil", "a:b", "con.txt", "CON", "nul", "com1.log", "LPT9", "a\u{1}b", "", ".", "..",
+            "a/b", "a\\b",
+        ] {
+            assert!(unsafe_component(bad).is_some(), "{bad:?} accepted");
+        }
+        for ok in [
+            "a.bin",
+            "console.txt",
+            "com10",
+            ".hidden",
+            "Some Show S01",
+            "файл",
+        ] {
+            assert_eq!(unsafe_component(ok), None, "{ok:?} refused");
         }
     }
 

@@ -527,8 +527,12 @@ async fn magnet_without_peers_stays_starting_and_removable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn magnet_metadata_failure_is_transient_and_retryable() {
-    // No peer source at all (test mode: no DHT, no trackers): the fetch fails.
-    let env = Env::new(Vec::new()).await;
+    // The only peer refuses connections: the fetch fails, but could work later.
+    let refused = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let env = Env::new(vec![refused]).await;
     let uri = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
     env.add(1, env.req(Source::Magnet { uri })).await.unwrap();
     let st = env
@@ -537,14 +541,65 @@ async fn magnet_metadata_failure_is_transient_and_retryable() {
         })
         .await;
     assert!(
-        matches!(&st.state, DownloadState::Failed { transient: true, reason } if reason.contains("metadata")),
+        matches!(&st.state, DownloadState::Failed { transient: true, reason }
+            if reason.starts_with("fetching the torrent metadata")),
         "{st:?}"
     );
+    // Pausing a failed magnet keeps the failure.
+    env.engine.pause(1).await.unwrap();
+    assert_eq!(env.status(1).state, st.state);
     env.engine.resume(1).await.expect("retry");
     env.wait(1, "failed again", |s| {
         matches!(s.state, DownloadState::Failed { .. })
     })
     .await;
+    env.engine.remove(1, true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_without_any_peer_source_fails_permanently() {
+    // Test mode has no DHT and no trackers; with no peers either nothing can ever work.
+    let env = Env::new(Vec::new()).await;
+    let uri = format!("magnet:?xt=urn:btih:{}", "cd".repeat(20));
+    env.add(1, env.req(Source::Magnet { uri })).await.unwrap();
+    let st = env
+        .wait(1, "failed", |s| {
+            matches!(s.state, DownloadState::Failed { .. })
+        })
+        .await;
+    assert!(
+        matches!(&st.state, DownloadState::Failed { transient: false, reason }
+            if reason.contains("no known way to resolve peers")),
+        "{st:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_with_unsafe_file_names_is_refused_before_writing() {
+    // A seeder serving a torrent with a file named like a Windows device: the magnet's
+    // metadata is fetched, checked and refused before anything is written.
+    let seeder = Seeder::start(&[("dir/con.txt", 20 * KIB), ("dir/ok.bin", 20 * KIB)]).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    let added = env
+        .add(
+            1,
+            env.req(Source::Magnet {
+                uri: seeder.magnet.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let st = env
+        .wait(1, "failed", |s| {
+            matches!(s.state, DownloadState::Failed { .. })
+        })
+        .await;
+    assert!(
+        matches!(&st.state, DownloadState::Failed { transient: false, reason }
+            if reason.starts_with("unsafe file name in torrent")),
+        "{st:?}"
+    );
+    assert!(!added.path.exists(), "files written for a refused torrent");
     env.engine.remove(1, true).await.unwrap();
 }
 
@@ -638,4 +693,54 @@ async fn unknown_ids_are_not_found() {
         env.add(9, env.req(http)).await,
         Err(EngineError::Unsupported(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsafe_file_names_are_refused_on_every_os() {
+    let env = Env::new(Vec::new()).await;
+    // Sanity: the crafted format itself is accepted.
+    let ok = support::craft_torrent("fine", 0, Some(&[(&["dir", "a.bin"], 100)]));
+    let ok_path = env.dir.path().join("ok.torrent");
+    std::fs::write(&ok_path, ok).unwrap();
+    env.add(1, env.req(Source::TorrentFile { path: ok_path }))
+        .await
+        .expect("a well-formed crafted torrent is accepted");
+    env.engine.remove(1, true).await.unwrap();
+
+    let cases: [(&str, Vec<u8>); 5] = [
+        (
+            "drive prefix",
+            support::craft_torrent("x", 0, Some(&[(&["C:evil"], 10)])),
+        ),
+        (
+            "device name",
+            support::craft_torrent("x", 0, Some(&[(&["sub", "con.txt"], 10)])),
+        ),
+        (
+            "stream",
+            support::craft_torrent("x", 0, Some(&[(&["a:b"], 10)])),
+        ),
+        (
+            "single-file drive prefix",
+            support::craft_torrent("C:evil", 10, None),
+        ),
+        (
+            "single-file device name",
+            support::craft_torrent("NUL", 10, None),
+        ),
+    ];
+    for (i, (what, bytes)) in cases.into_iter().enumerate() {
+        let id = 10 + i as DownloadId;
+        let path = env.dir.path().join(format!("{i}.torrent"));
+        std::fs::write(&path, bytes).unwrap();
+        match env.add(id, env.req(Source::TorrentFile { path })).await {
+            Err(EngineError::Invalid(m)) => {
+                assert!(m.starts_with("unsafe file name in torrent"), "{what}: {m}")
+            }
+            other => panic!("{what}: accepted: {other:?}"),
+        }
+        assert!(env.engine.status(id).is_none());
+        assert!(!env.stored(id).exists());
+    }
+    assert!(!env.dir.path().join("C:evil").exists());
 }

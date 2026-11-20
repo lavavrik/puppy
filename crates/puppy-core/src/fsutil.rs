@@ -27,8 +27,9 @@ pub fn sanitize_filename(raw: &str) -> String {
     truncate_name(&name, MAX_NAME_BYTES)
 }
 
-/// Windows device names (CON, NUL, COM1..9, ...) are reserved with or without an extension.
-fn is_reserved_windows_name(name: &str) -> bool {
+/// Whether `name` is a Windows device name (CON, NUL, COM1..9, ...), reserved with or
+/// without an extension.
+pub fn is_reserved_windows_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end();
     let up = stem.to_ascii_uppercase();
     matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
