@@ -101,6 +101,22 @@ enum Command {
         /// Wait until the downloads end (exit code as for `puppy wait`).
         #[arg(long)]
         wait: bool,
+        /// Torrent: download only these files, by number as `puppy files` shows
+        /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable.
+        #[arg(long = "files", value_name = "SPEC")]
+        files: Vec<String>,
+        /// Torrent: wait for you to pick the files with `puppy select` (with
+        /// `--wait`, the wait ends at once with exit 5).
+        #[arg(long)]
+        choose: bool,
+        /// Torrent: stop seeding at this upload ratio (`0` never, `default`: the
+        /// daemon's `seed_ratio`).
+        #[arg(long, value_name = "RATIO")]
+        seed_ratio: Option<String>,
+        /// Torrent: stop seeding after this long (`90m`, `2h`; `0` never,
+        /// `default`: the daemon's `seed_time`).
+        #[arg(long, value_name = "DURATION")]
+        seed_time: Option<String>,
     },
     /// List downloads.
     Ls {
@@ -113,6 +129,32 @@ enum Command {
             value_name = "STATE"
         )]
         state: Vec<StateFilter>,
+    },
+    /// List a torrent's files, numbered from 1.
+    Files {
+        /// The torrent's id (see `puppy ls`).
+        id: String,
+    },
+    /// Choose which files of a torrent to download (`puppy add --choose` waits for this).
+    Select {
+        /// The torrent's id.
+        id: String,
+        /// File numbers or ranges as `puppy files` shows them (`1,3-5`), and/or
+        /// globs (`*.mkv`).
+        #[arg(required = true, value_name = "SPEC")]
+        specs: Vec<String>,
+    },
+    /// Set when a torrent stops seeding. Replaces its whole policy: what you leave
+    /// out goes back to the daemon's `seed_ratio` / `seed_time`.
+    Seed {
+        /// The torrent's id.
+        id: String,
+        /// Stop at this upload ratio (`0` never, `default`: the daemon's setting).
+        #[arg(long, value_name = "RATIO")]
+        ratio: Option<String>,
+        /// Stop after seeding this long (`90m`, `2h`; `0` never, `default`).
+        #[arg(long, value_name = "DURATION")]
+        time: Option<String>,
     },
     /// Show everything about one download.
     Info {
@@ -212,6 +254,10 @@ fn main() -> ExitCode {
                 cookie,
                 referer,
                 wait,
+                files,
+                choose,
+                seed_ratio,
+                seed_time,
             }) => {
                 cli::add::run(
                     &Ctx::from_env(cli.json)?,
@@ -224,6 +270,10 @@ fn main() -> ExitCode {
                         headers,
                         cookie,
                         referer,
+                        files,
+                        choose,
+                        seed_ratio,
+                        seed_time,
                     },
                     wait,
                 )
@@ -231,6 +281,19 @@ fn main() -> ExitCode {
             }
             Some(Command::Ls { state }) => cli::list::ls(&Ctx::from_env(cli.json)?, state).await,
             Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, &id).await,
+            Some(Command::Files { id }) => cli::files::files(&Ctx::from_env(cli.json)?, &id).await,
+            Some(Command::Select { id, specs }) => {
+                cli::files::select(&Ctx::from_env(cli.json)?, &id, &specs).await
+            }
+            Some(Command::Seed { id, ratio, time }) => {
+                cli::seed::seed(
+                    &Ctx::from_env(cli.json)?,
+                    &id,
+                    ratio.as_deref(),
+                    time.as_deref(),
+                )
+                .await
+            }
             Some(Command::Pause { ids }) => act(cli.json, cli::control::Action::Pause, ids).await,
             Some(Command::Resume { ids }) => act(cli.json, cli::control::Action::Resume, ids).await,
             Some(Command::Restart { ids }) => {
@@ -287,9 +350,17 @@ async fn act(json: bool, action: cli::control::Action, ids: Vec<String>) -> Resu
 async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
     // Undocumented, for puppy's own tests of the real binary: the torrent engine stays
     // off the network (no DHT, trackers, LSD or UPnP; listening on 127.0.0.1).
+    // `PUPPY_TORRENT_TEST_PEERS` (comma-separated `ip:port`) are handed to every torrent.
     let torrent_test = (std::env::var_os("PUPPY_TORRENT_TEST_MODE").as_deref()
         == Some("1".as_ref()))
-    .then(TorrentTestOptions::default);
+    .then(|| TorrentTestOptions {
+        initial_peers: std::env::var("PUPPY_TORRENT_TEST_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|a| a.trim().parse().ok())
+            .collect(),
+        ..TorrentTestOptions::default()
+    });
     let outcome = run_daemon(DaemonOptions {
         idle_exit: idle_exit.map(Duration::from_secs),
         torrent_test,

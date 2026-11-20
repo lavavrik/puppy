@@ -3,8 +3,10 @@
 
 pub mod add;
 pub mod control;
+pub mod files;
 pub mod list;
 pub mod output;
+pub mod seed;
 pub mod wait;
 
 use anyhow::Context;

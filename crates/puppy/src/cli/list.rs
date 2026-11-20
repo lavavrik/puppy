@@ -51,6 +51,10 @@ pub enum StateFilter {
     Failed,
     /// Failed, and puppy will retry it.
     Retrying,
+    /// Torrent waiting for you to pick its files (`puppy select`).
+    Choosing,
+    /// Torrent uploading after completion.
+    Seeding,
     Attention,
 }
 
@@ -63,6 +67,8 @@ impl StateFilter {
                 | (StateFilter::Active, WireState::Active)
                 | (StateFilter::Paused, WireState::Paused)
                 | (StateFilter::Completed, WireState::Completed)
+                | (StateFilter::Choosing, WireState::ChoosingFiles)
+                | (StateFilter::Seeding, WireState::Seeding { .. })
                 | (
                     StateFilter::Failed,
                     WireState::Failed {
@@ -96,15 +102,23 @@ pub async fn ls(ctx: &Ctx, states: Vec<StateFilter>) -> Result<(), CliError> {
     let rows: Vec<Vec<String>> = downloads
         .iter()
         .map(|d| {
-            let progress = percent(d.done_bytes, d.total_bytes)
-                .map_or("—".to_string(), |p| format!("{:.0}%", p * 100.0));
+            let progress = match &d.state {
+                WireState::Seeding { .. } => "100%".to_string(),
+                WireState::ChoosingFiles => "—".to_string(),
+                _ => percent(d.done_bytes, d.total_bytes)
+                    .map_or("—".to_string(), |p| format!("{:.0}%", p * 100.0)),
+            };
+            let mut name = d.name.clone();
+            if let (WireState::ChoosingFiles, Some(note)) = (&d.state, &d.note) {
+                name = format!("{name}  ({note})");
+            }
             vec![
                 d.id.to_string(),
                 state_word(&d.state).to_string(),
                 progress,
                 speed(d.down_bps),
                 eta(d.eta_secs),
-                d.name.clone(),
+                name,
             ]
         })
         .collect();
@@ -139,6 +153,11 @@ pub fn state_word(s: &WireState) -> &'static str {
         WireState::NeedsAttention { .. } => "attention",
         WireState::Unknown => "unknown",
     }
+}
+
+/// A whole-seconds duration as `1h 5m`.
+fn dur(secs: u64) -> String {
+    humantime::format_duration(std::time::Duration::from_secs(secs)).to_string()
 }
 
 #[derive(Serialize)]
@@ -199,6 +218,33 @@ pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     );
     kv("source", display_safe(&d.source).into_owned());
     kv("state", state);
+    if let WireState::Seeding {
+        uploaded,
+        ratio,
+        seeded_secs,
+        ratio_target,
+        time_target_secs,
+    } = &d.state
+    {
+        kv("uploaded", bytes(*uploaded));
+        kv(
+            "seed ratio",
+            match ratio_target {
+                Some(t) => format!("{ratio:.2} (stops at {t})"),
+                None => format!("{ratio:.2} (no ratio limit)"),
+            },
+        );
+        kv(
+            "seeded",
+            match time_target_secs {
+                Some(t) => format!("{} (stops at {})", dur(*seeded_secs), dur(*t)),
+                None => format!("{} (no time limit)", dur(*seeded_secs)),
+            },
+        );
+    }
+    if let Some(note) = &d.note {
+        kv("note", display_safe(note).into_owned());
+    }
     kv("size", d.total_bytes.map_or("—".to_string(), bytes));
     kv("downloaded", bytes(d.done_bytes));
     kv("speed", speed(d.down_bps));

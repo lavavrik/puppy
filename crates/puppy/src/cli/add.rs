@@ -1,9 +1,11 @@
 //! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files or stdin.
 
+use super::files::parse_spec;
 use super::output::{err, json, out};
+use super::seed;
 use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
-use puppy_core::types::{AddRequest, DownloadId, RequestContext};
+use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, Source};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
 use puppy_tui::format::parse_rate;
 use serde::Serialize;
@@ -23,6 +25,14 @@ pub struct AddArgs {
     pub headers: Vec<String>,
     pub cookie: Option<String>,
     pub referer: Option<String>,
+    /// `--files` specs (torrents only): numbers, ranges and globs.
+    pub files: Vec<String>,
+    /// `--choose`: wait for `puppy select` (torrents only).
+    pub choose: bool,
+    /// `--seed-ratio` (torrents only).
+    pub seed_ratio: Option<String>,
+    /// `--seed-time` (torrents only).
+    pub seed_time: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -176,6 +186,21 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
             "--name needs exactly one source".to_string(),
         ));
     }
+    if args.choose && !args.files.is_empty() {
+        return Err(CliError::Usage(
+            "--choose and --files do not go together: choose now, or choose later".into(),
+        ));
+    }
+    let choice = if args.choose {
+        FileChoice::Ask
+    } else if args.files.is_empty() {
+        FileChoice::All
+    } else {
+        FileChoice::Select {
+            selection: parse_spec(&args.files)?,
+        }
+    };
+    let seed = seed::policy(args.seed_ratio.as_deref(), args.seed_time.as_deref())?;
     let sources = expand_sources(args.sources)?;
     if args.name.is_some() && sources.len() != 1 {
         return Err(CliError::Usage(
@@ -206,6 +231,24 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         }
     }
 
+    if choice != FileChoice::All || seed.is_some() {
+        let flags = if args.choose {
+            "--choose"
+        } else if !args.files.is_empty() {
+            "--files"
+        } else {
+            "--seed-ratio/--seed-time"
+        };
+        if let Some((shown, _)) = parsed
+            .iter()
+            .find(|(_, s)| matches!(s, Source::Http { .. }))
+        {
+            return Err(CliError::Usage(format!(
+                "{flags} only applies to torrents, but {shown} is not one"
+            )));
+        }
+    }
+
     let mut added = Vec::new();
     if !parsed.is_empty() {
         let client = ctx.client().await?;
@@ -215,8 +258,8 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                 output_dir: output_dir.clone(),
                 filename: args.name.clone(),
                 context: context.clone(),
-                files: Default::default(),
-                seed: None,
+                files: choice.clone(),
+                seed: seed.clone(),
             };
             match client.add(req, args.paused, limit).await {
                 Ok(id) => {

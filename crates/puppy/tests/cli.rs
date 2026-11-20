@@ -1066,3 +1066,324 @@ async fn incompatible_daemon_hint_and_stop() {
     assert_eq!(out.trim(), "stopped");
     tokio::time::timeout(TIMEOUT, fake).await.unwrap().unwrap();
 }
+
+// ---- torrent file selection and seeding (through the real binary, local seeder) ----
+
+// The torrent engine's local seeder harness (librqbit is a dev-dependency here only).
+#[path = "../../puppy-torrent/tests/support/mod.rs"]
+mod support;
+
+use support::{MULTI_NAME, Seeder};
+
+const KIB_USIZE: usize = 1024;
+/// A multi-file torrent of ~1 MiB.
+const MULTI: &[(&str, usize)] = &[
+    ("a.bin", 600 * KIB_USIZE),
+    ("sub/b.bin", 400 * KIB_USIZE + 123),
+];
+
+/// An environment whose daemon (and so every torrent) knows the seeders, with a
+/// connection held open so the daemon does not idle-exit between commands.
+async fn torrent_env(seeders: &[&Seeder]) -> (Env, puppy_client::Client) {
+    let mut env = Env::new();
+    env.peers = seeders.iter().map(|s| s.addr).collect();
+    let c = env.spawn_client().await.unwrap();
+    (env, c)
+}
+
+/// Writes the seeder's `.torrent` into the test home; returns its path.
+fn torrent_path(env: &Env, seeder: &Seeder) -> String {
+    let path = env
+        .home
+        .path()
+        .join(format!("{}.torrent", seeder.info_hash_hex));
+    std::fs::write(&path, &seeder.torrent_bytes).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// Runs `args`, expecting exit `code`; returns (stdout, stderr).
+fn run_code(env: &Env, args: &[&str], code: i32) -> (String, String) {
+    let (status, out, err) = env.run(args);
+    assert_eq!(status.code(), Some(code), "{args:?}: out {out}, err {err}");
+    (out, err)
+}
+
+/// `puppy --json add ...`: the id of the one torrent added.
+fn add_torrent(env: &Env, args: &[&str]) -> String {
+    let mut all = vec!["--json", "add"];
+    all.extend(args);
+    let (out, _) = run_code(env, &all, 0);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    v["added"][0]["id"].to_string()
+}
+
+/// Polls `puppy --json ls` until the download's state word is `state`.
+fn wait_ls_state(env: &Env, id: &str, state: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let all = snapshots(env, &["--json", "ls"]);
+        let d = all
+            .into_iter()
+            .find(|d| d["id"] == id.parse::<u64>().unwrap())
+            .unwrap();
+        let kind = d["state"]["kind"].as_str().unwrap_or("").to_string();
+        if kind == state {
+            return d;
+        }
+        assert!(std::time::Instant::now() < deadline, "never {state}: {d}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn assert_only_b_downloaded(env: &Env) {
+    let folder = env.dl_dir().join(MULTI_NAME);
+    assert!(
+        std::fs::read(folder.join("sub/b.bin")).unwrap()
+            == support::content("sub/b.bin", MULTI[1].1),
+        "the selected file differs"
+    );
+    let a = std::fs::metadata(folder.join("a.bin")).map_or(0, |m| m.len());
+    assert!(a < MULTI[0].1 as u64, "the unselected file was downloaded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_files_spec_and_files_listing() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let dl = env.dl_dir();
+    let dl = dl.to_str().unwrap();
+
+    // Usage errors, before anything is added.
+    for bad in [
+        &["--files", "0"][..],
+        &["--files", "3-1"],
+        &["--files", ""],
+        &["--files", "1", "--choose"],
+        &["--seed-ratio", "lots"],
+        &["--seed-time", "5"],
+    ] {
+        let mut args = vec!["add", &torrent];
+        args.extend(bad);
+        run_code(&env, &args, 2);
+    }
+    let (_, err) = run_code(
+        &env,
+        &["add", "--files", "1", "http://127.0.0.1:9/x.bin"],
+        2,
+    );
+    assert!(err.contains("only applies to torrents"), "{err}");
+    assert!(snapshots(&env, &["--json", "ls"]).is_empty());
+
+    // A glob selects `sub/b.bin` only.
+    let id = add_torrent(&env, &["-o", dl, "--files", "sub/*", &torrent]);
+    run_code(&env, &["wait", &id], 0);
+    assert_only_b_downloaded(&env);
+
+    // `puppy files`: numbered from 1; JSON has 0-based `index` and 1-based `number`.
+    let (out, _) = run_code(&env, &["--json", "files", &id], 0);
+    let files: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(files.len(), 2, "{out}");
+    for (i, f) in files.iter().enumerate() {
+        assert_eq!(f["index"], i);
+        assert_eq!(f["number"], i + 1);
+    }
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert!(
+        paths.contains(&"a.bin") && paths.contains(&"sub/b.bin"),
+        "{out}"
+    );
+    assert!(files.iter().all(|f| f["size"].as_u64().unwrap() > 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn choose_then_select() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let dl = env.dl_dir();
+    let id = add_torrent(&env, &["-o", dl.to_str().unwrap(), "--choose", &torrent]);
+    wait_ls_state(&env, &id, "choosing_files");
+
+    // The text listing: header, then `#  SIZE  PATH` rows numbered from 1.
+    let (out, _) = run_code(&env, &["files", &id], 0);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(lines[0].starts_with('#') && lines[0].contains("SIZE") && lines[0].contains("PATH"));
+    assert!(
+        lines[1].starts_with('1') && lines[2].starts_with('2'),
+        "{out}"
+    );
+    let number_of_b = lines
+        .iter()
+        .find(|l| l.ends_with("sub/b.bin"))
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .expect("b.bin listed");
+
+    // Bad choices keep it choosing: out of range is a usage error, unknown id exit 3.
+    let (_, err) = run_code(&env, &["select", &id, "9"], 2);
+    assert!(err.contains("out of range"), "{err}");
+    run_code(&env, &["select", &id, "0"], 2);
+    run_code(&env, &["select", "999", "1"], 3);
+    run_code(&env, &["files", "999"], 3);
+    wait_ls_state(&env, &id, "choosing_files");
+
+    run_code(&env, &["select", &id, &number_of_b], 0);
+    run_code(&env, &["wait", &id], 0);
+    assert_only_b_downloaded(&env);
+    // The choice is made once.
+    run_code(&env, &["select", &id, "1"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_on_choosing_exits_5() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let (out, err) = run_code(&env, &["--json", "add", "--choose", "--wait", &torrent], 5);
+    assert!(err.contains("choose files: puppy select"), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["final"][0]["state"]["kind"], "choosing_files", "{out}");
+    let id = v["added"][0]["id"].to_string();
+    let (_, err) = run_code(&env, &["wait", &id], 5);
+    assert!(err.contains(&format!("puppy select {id}")), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_seeding_exits_0() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let dl = env.dl_dir();
+    let (out, _) = run_code(
+        &env,
+        &["add", "--wait", "-o", dl.to_str().unwrap(), &torrent],
+        0,
+    );
+    assert!(out.contains("completed"), "{out}");
+    seeder.assert_downloaded_into(&dl);
+    let id = out
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    // Done downloading, now seeding (the default ratio of 1.0 is not reached).
+    let d = wait_ls_state(&env, id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], 1.0);
+    run_code(&env, &["wait", id], 0);
+    let (out, _) = run_code(&env, &["info", id], 0);
+    assert!(out.contains("seeding") && out.contains("stops at"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_command_overrides() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let dl = env.dl_dir();
+    let id = add_torrent(
+        &env,
+        &[
+            "-o",
+            dl.to_str().unwrap(),
+            "--seed-ratio",
+            "2.5",
+            "--seed-time",
+            "45m",
+            &torrent,
+        ],
+    );
+    let d = wait_ls_state(&env, &id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], 2.5, "{d}");
+    assert_eq!(d["state"]["time_target_secs"], 45 * 60, "{d}");
+
+    // `seed` replaces the whole policy: the time goes back to the daemon's 2h.
+    let (out, _) = run_code(&env, &["seed", &id, "--ratio", "0"], 0);
+    assert!(out.contains("ratio off"), "{out}");
+    let d = wait_ls_state(&env, &id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], serde_json::Value::Null, "{d}");
+    assert_eq!(d["state"]["time_target_secs"], 2 * 3600, "{d}");
+
+    run_code(&env, &["seed", &id, "--ratio", "3", "--time", "10m"], 0);
+    let d = wait_ls_state(&env, &id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], 3.0, "{d}");
+    assert_eq!(d["state"]["time_target_secs"], 600, "{d}");
+    run_code(
+        &env,
+        &["seed", &id, "--ratio", "default", "--time", "default"],
+        0,
+    );
+    let d = wait_ls_state(&env, &id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], 1.0, "{d}");
+
+    // Usage errors; unknown id.
+    run_code(&env, &["seed", &id], 2);
+    run_code(&env, &["seed", &id, "--time", "tomorrow"], 2);
+    run_code(&env, &["seed", "999", "--ratio", "1"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_torrent_downloads_have_no_files_or_seed_policy() {
+    let server = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        len: 16 * KIB,
+        ..Default::default()
+    })
+    .await;
+    let env = Env::new();
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&server, "f.bin"), false, None).await.unwrap();
+    wait_completed(&c, id).await;
+    let id = id.to_string();
+    for args in [
+        vec!["files", &id],
+        vec!["select", &id, "1"],
+        vec!["seed", &id, "--ratio", "1"],
+    ] {
+        let (_, err) = run_code(&env, &args, 1);
+        assert!(err.contains("Unsupported"), "{args:?}: {err}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_new_states() {
+    let one = Seeder::start(MULTI).await;
+    let two = Seeder::start(&[("only.bin", 40 * KIB_USIZE)]).await;
+    let (env, _c) = torrent_env(&[&one, &two]).await;
+    let dl = env.dl_dir();
+    let dl = dl.to_str().unwrap();
+    let choosing = add_torrent(&env, &["-o", dl, "--choose", &torrent_path(&env, &one)]);
+    let seeding = add_torrent(&env, &["-o", dl, &torrent_path(&env, &two)]);
+    wait_ls_state(&env, &choosing, "choosing_files");
+    wait_ls_state(&env, &seeding, "seeding");
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        snapshots(&env, args)
+            .iter()
+            .map(|d| d["id"].to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["--json", "ls", "--state", "choosing"]),
+        std::slice::from_ref(&choosing)
+    );
+    assert_eq!(
+        ids(&["--json", "ls", "--state", "seeding"]),
+        std::slice::from_ref(&seeding)
+    );
+    assert_eq!(ids(&["--json", "ls", "-s", "choosing,seeding"]).len(), 2);
+    // `done` is completed only: a seeding torrent is not in it.
+    assert!(ids(&["--json", "ls", "--state", "done"]).is_empty());
+
+    let (out, _) = run_code(&env, &["ls"], 0);
+    let row = |id: &str| {
+        out.lines()
+            .find(|l| l.split_whitespace().next() == Some(id))
+            .unwrap_or_else(|| panic!("no row {id}: {out}"))
+            .to_string()
+    };
+    assert!(row(&choosing).contains("choosing"), "{out}");
+    let s = row(&seeding);
+    assert!(s.contains("seeding") && s.contains("100%"), "{out}");
+}

@@ -2812,11 +2812,14 @@ name = "puppy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",
  "fs4",
+ "humantime",
  "libc",
+ "librqbit",
  "puppy-client",
  "puppy-core",
  "puppy-daemon",

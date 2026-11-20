@@ -32,6 +32,8 @@ pub fn socket_name() -> SocketName {
 pub struct Env {
     pub home: tempfile::TempDir,
     pub socket: SocketName,
+    /// Local seeders every torrent of the daemon starts with (`PUPPY_TORRENT_TEST_PEERS`).
+    pub peers: Vec<std::net::SocketAddr>,
 }
 
 impl Env {
@@ -39,6 +41,7 @@ impl Env {
         Env {
             home: tempfile::tempdir().unwrap(),
             socket: socket_name(),
+            peers: Vec::new(),
         }
     }
 
@@ -56,7 +59,9 @@ impl Env {
             SocketName::Path(p) => p.to_str().unwrap().to_string(),
             SocketName::Pipe(n) => n.clone(),
         };
+        let peers: Vec<String> = self.peers.iter().map(|p| p.to_string()).collect();
         vec![
+            ("PUPPY_TORRENT_TEST_PEERS", peers.join(",")),
             ("PUPPY_HOME", self.home.path().to_str().unwrap().to_string()),
             ("PUPPY_SOCKET", socket),
             ("PUPPY_IDLE_EXIT", "1".to_string()),

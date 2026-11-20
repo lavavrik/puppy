@@ -136,6 +136,12 @@ puppy add --name b.iso --paused URL         # under another name, without starti
 puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
 puppy add - < urls.txt                      # one source per line from stdin (# comments)
 puppy add --wait URL                        # add, then wait like `puppy wait`
+puppy add --files 1,3-5 --files '*.mkv' T   # torrent: only these files (1-based numbers, ranges, globs)
+puppy add --choose T                        # torrent: wait for `puppy select` to pick the files
+puppy add --seed-ratio 2 --seed-time 6h T   # torrent: seeding limits for this one (`default` inherits)
+puppy files 3                               # a torrent's files: `#  SIZE  PATH`, numbered from 1
+puppy select 3 2-4 'docs/*'                 # choose files of a torrent that is waiting for it
+puppy seed 3 --ratio 3 --time 0             # change when torrent 3 stops seeding
 puppy status                                # "3 downloads, 1 active"
 puppy ls                                    # table of downloads
 puppy ls --state active,queued              # only these states
@@ -165,6 +171,10 @@ JSON value (`watch` excepted):
 - `wait`: `{"final":[…snapshots…],"missing":[ids…]}`.
 - `pause`, `resume`, `restart`, `rm`, `move`, `limit <ID>`: one result per id,
   e.g. `[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`.
+- `files`: `[{"index","number","path","size"}…]` (`index` is the protocol's
+  0-based one, `number` the 1-based one the CLI uses).
+- `select`: `{"id","selection":{"indices","globs"}}` (0-based indices);
+  `seed`: `{"id","policy":{"ratio","time_secs"}}`.
 - `stop`: `{"stopped":true}` or `{"running":false}`.
 - `watch --json` prints NDJSON: one event per line (`snapshot`, `added`,
   `completed`, `failed`, `removed`, `needs_attention`), snapshots included, so
@@ -172,7 +182,8 @@ JSON value (`watch` excepted):
   `14:02:11 completed 3 a.iso` and leaves out snapshots.
 
 `ls --state` takes `queued`, `starting`, `active`, `paused`, `completed` (or
-`done`), `failed` (for good), `retrying` and `attention`. Piped `ls` output
+`done`; completed only, not seeding), `choosing`, `seeding`, `failed` (for
+good), `retrying` and `attention`. Piped `ls` output
 (no terminal, no `COLUMNS`) never truncates names. `add -` reads UTF-8 or
 UTF-16 (with a BOM) from stdin. If an incompatible puppy daemon (another
 version) is running, commands say so; `puppy stop` stops it.
@@ -180,6 +191,29 @@ version) is running, commands say so; `puppy stop` stops it.
 `wait` treats a transient failure (e.g. the server answering 503) as not yet
 ended, since puppy retries it on its own: it keeps waiting and shows
 `retrying in m:ss`. Ctrl-C stops waiting (exit 130); the downloads keep going.
+
+A torrent that is waiting for you to pick its files (`add --choose`, or a
+magnet whose files are not known until its metadata arrives) shows as
+`choosing`; `wait` and `add --wait` end at once with exit 5 and the hint
+`choose files: puppy select <id> …` (so `add --choose --wait` always exits 5).
+A torrent that has finished downloading and is uploading shows as `seeding`
+(100%), and counts as finished for `wait` (exit 0). A note puppy attaches to a
+download (for example a file pattern that matched nothing) appears after the
+name of a `choosing` row in `ls`, and as `note` in `info`.
+
+File specs (`add --files`, `select`) are numbers (`3`), ranges (`2-5`) and
+globs (`*.mkv`, `sub/*`), separated by commas or spaces; numbers are the 1-based
+ones `puppy files` prints. `0`, empty ranges (`5-2`) and numbers past the last
+file are usage errors (exit 2); for a magnet the file list is not known when
+adding, so the daemon rejects those. `--files` and `--choose` cannot be
+combined, and neither (nor `--seed-*`) applies to a non-torrent source. `puppy
+files` on a download that is not a torrent, or one that already completed
+(and so left the torrent engine), fails with exit 1 and the daemon's message.
+
+`puppy seed <id>` **replaces the torrent's whole seeding policy**: `--ratio R`
+and `--time DUR` (`90m`, `2h`, ...) set a limit, `0` turns that limit off, and
+`default` (or leaving the option out) goes back to the daemon's `seed_ratio` /
+`seed_time`. At least one of the two options is required.
 
 Exit codes (with several ids, the highest wins):
 
@@ -209,8 +243,14 @@ dht = true            # find peers through the DHT
 upnp = false          # ask the router to forward listen_port (UPnP)
 lsd = true            # find peers on the local network (local service discovery)
 listen_port = 42069   # incoming peer connections; an OS-assigned port if busy
-seed_ratio = 0.0      # reserved: v1 stops at completion (see below)
+seed_ratio = 1.0      # stop seeding at this upload/download ratio; 0 = never
+seed_time = "2h"      # ... or after seeding this long; 0 = never
 ```
+
+A finished torrent keeps seeding until the ratio or the time is reached,
+whichever comes first; with both at `0` it stops at completion, as it did
+before seeding existed. Both can be set per torrent (`puppy add --seed-ratio
+… --seed-time …`, `puppy seed`), and are shown by `puppy info`.
 
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening
@@ -232,8 +272,12 @@ is taken goes into a folder of its own (`file.iso (1)/file.iso`). The torrent
 engine starts (and opens its ports) only once the first torrent is added.
 Things to know about v1:
 
-- **No seeding after completion**: a finished torrent is stopped and shown as
-  completed. `seed_ratio` is reserved for a later version.
+- **Seeding**: a finished torrent seeds (state `seeding`) until `seed_ratio`
+  or `seed_time` is reached, then shows as completed. Seeding torrents never
+  occupy one of the `max_active` download slots.
+- **Choosing files**: `puppy add --files SPEC` downloads only some files of a
+  torrent; `--choose` (or the file picker) waits for you in the `choosing`
+  state first. See "Command line".
 - **Piece map is an approximation**: the detail pane's piece map is derived
   from per-file progress (assuming each file fills in order), not from the
   exact set of verified pieces.
