@@ -97,8 +97,8 @@ pub async fn ls(ctx: &Ctx, states: Vec<StateFilter>) -> Result<(), CliError> {
             ColWidth::Fixed(6),
             ColWidth::Fixed(9),
             ColWidth::Fixed(8),
-            ColWidth::Fixed(11),
-            ColWidth::Fixed(7),
+            ColWidth::Fixed(12),
+            ColWidth::Fixed(8),
             ColWidth::Flex,
         ],
     );
@@ -167,7 +167,7 @@ pub async fn info(ctx: &Ctx, id: DownloadId) -> Result<(), CliError> {
         }
         _ => {}
     }
-    let kv = |k: &str, v: String| out(format_args!("{k:<11}{v}"));
+    let kv = |k: &str, v: String| out(format_args!("{k:<12}{v}"));
     kv("id", d.id.to_string());
     kv("name", d.name.clone());
     kv(

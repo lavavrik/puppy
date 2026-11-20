@@ -289,3 +289,184 @@ async fn add_with_closed_stdout_still_adds_all() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(snapshots(&env, &["--json", "ls"]).len(), 2);
 }
+
+// ---- control commands ----
+
+async fn slow_server() -> puppy_testserver::TestServer {
+    puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        len: 1 << 24,
+        bytes_per_sec: Some(2000),
+        ..Default::default()
+    })
+    .await
+}
+
+fn state_of(env: &Env, id: u64) -> String {
+    let all = snapshots(env, &["ls", "--json"]);
+    let d = all.iter().find(|d| d["id"] == id).expect("download listed");
+    d["state"]["kind"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_resume_by_id() {
+    let env = Env::new();
+    let s = slow_server().await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    let (status, out, err) = env.run(&["pause", &id.to_string()]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("paused {id}"));
+    assert_eq!(state_of(&env, id), "paused");
+    let (status, out, err) = env.run(&["resume", &id.to_string()]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("resumed {id}"));
+    assert_ne!(state_of(&env, id), "paused");
+    let (status, out, _) = env.run(&["--json", "pause", &id.to_string()]);
+    assert!(status.success());
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v[0]["id"], id);
+    assert_eq!(v[0]["ok"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_all_skips_completed() {
+    let env = Env::new();
+    let fast = puppy_testserver::TestServer::start(Default::default()).await;
+    let s = slow_server().await;
+    let c = env.spawn_client().await.unwrap();
+    let done = c.add(env.req(&fast, "f.bin"), false, None).await.unwrap();
+    wait_completed(&c, done).await;
+    let paused = c.add(env.paused_req("p.bin"), true, None).await.unwrap();
+    let slow = c.add(env.req(&s, "s.bin"), false, None).await.unwrap();
+    let (status, out, err) = env.run(&["pause", "all"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("paused {slow}"));
+    assert_eq!(state_of(&env, done), "completed");
+    assert_eq!(state_of(&env, paused), "paused");
+    let (status, out, _) = env.run(&["pause", "all"]);
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(out.trim(), "nothing to pause");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_valid_and_unknown_ids() {
+    let env = Env::new();
+    let s = slow_server().await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    let (status, out, err) = env.run(&["pause", &id.to_string(), "99", "abc"]);
+    assert_eq!(status.code(), Some(3), "{err}");
+    assert_eq!(out.trim(), format!("paused {id}"));
+    assert!(err.contains("99"), "{err}");
+    assert!(err.contains("abc"), "{err}");
+    assert_eq!(state_of(&env, id), "paused");
+    let (status, _, err) = env.run(&["pause", "abc"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    // An explicit id in the wrong state: message, code 1.
+    let (status, _, err) = env.run(&["restart", &id.to_string()]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(err.contains(&id.to_string()), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rm_delete_files_removes_file() {
+    let env = Env::new();
+    let fast = puppy_testserver::TestServer::start(Default::default()).await;
+    let c = env.spawn_client().await.unwrap();
+    let a = c.add(env.req(&fast, "a.bin"), false, None).await.unwrap();
+    let b = c.add(env.req(&fast, "b.bin"), false, None).await.unwrap();
+    wait_completed(&c, a).await;
+    wait_completed(&c, b).await;
+    let (status, out, err) = env.run(&["rm", &a.to_string(), "--delete-files"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("removed {a} (files deleted)"));
+    assert!(!env.dl_dir().join("a.bin").exists());
+    let (status, out, err) = env.run(&["rm", &b.to_string()]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("removed {b}"));
+    assert!(env.dl_dir().join("b.bin").exists());
+    assert!(snapshots(&env, &["ls", "--json"]).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_reorders_queue() {
+    let env = Env::new();
+    let s = slow_server().await;
+    let c = env.spawn_client().await.unwrap();
+    let (status, _, err) = env.run(&["max-active", "1"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let mut ids = vec![];
+    for n in ["a", "b", "c"] {
+        ids.push(c.add(env.req(&s, n), false, None).await.unwrap());
+    }
+    let pos = |env: &Env, id: u64| {
+        let all = snapshots(env, &["ls", "--json"]);
+        all.iter().find(|d| d["id"] == id).unwrap()["queue_position"].as_u64()
+    };
+    assert!(pos(&env, ids[2]) > pos(&env, ids[1]));
+    let (status, out, err) = env.run(&["move", &ids[2].to_string(), "0"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains("moved"), "{out}");
+    assert!(pos(&env, ids[2]) < pos(&env, ids[1]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limit_per_download_and_global() {
+    let env = Env::new();
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.paused_req("a.bin"), true, None).await.unwrap();
+    let (status, out, err) = env.run(&["limit", &id.to_string(), "500K"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains("500"), "{out}");
+    let all = snapshots(&env, &["ls", "--json"]);
+    assert_eq!(all[0]["limit"], 500 * 1024);
+    let (status, _, err) = env.run(&["limit", &id.to_string(), "none"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(snapshots(&env, &["ls", "--json"])[0]["limit"].is_null());
+    let (status, _, err) = env.run(&["limit", &id.to_string(), "banana"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    let (status, _, _) = env.run(&["limit", &id.to_string()]);
+    assert_eq!(status.code(), Some(2));
+    let (status, _, _) = env.run(&["limit", "--global", &id.to_string(), "1M"]);
+    assert_eq!(status.code(), Some(2));
+    let (status, _, err) = env.run(&["limit", "99", "1M"]);
+    assert_eq!(status.code(), Some(3), "{err}");
+
+    let (status, _, err) = env.run(&["limit", "--global", "--down", "1M"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let (status, _, err) = env.run(&["limit", "--global", "--up", "200K"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let (status, out, err) = env.run(&["--json", "limit", "--global"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["global_down_limit"], 1 << 20, "{out}");
+    assert_eq!(v["global_up_limit"], 200 * 1024, "{out}");
+    let (status, out, _) = env.run(&["limit", "--global"]);
+    assert!(status.success());
+    assert!(out.contains("download") && out.contains("upload"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_active_zero_is_usage() {
+    let env = Env::new();
+    let (status, _, err) = env.run(&["max-active", "0"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    let (status, out, err) = env.run(&["max-active", "2"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), "max-active 2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_when_running_then_not_running() {
+    let env = Env::new();
+    let c = env.spawn_client().await.unwrap();
+    let (status, out, err) = env.run(&["stop"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), "stopped");
+    drop(c);
+    env.wait_daemon_gone(std::time::Duration::from_secs(10))
+        .await;
+    let (status, out, err) = env.run(&["stop"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains("not running"), "{out}");
+}

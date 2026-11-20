@@ -115,6 +115,60 @@ enum Command {
         /// The download's id (see `puppy ls`).
         id: u64,
     },
+    /// Pause downloads (ids, or `all`).
+    Pause {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
+    /// Resume paused or failed downloads (ids, or `all`).
+    Resume {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
+    /// Restart failed or attention-needing downloads from scratch (ids, or `all`).
+    Restart {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
+    /// Remove downloads.
+    Rm {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+        /// Also delete the downloaded files.
+        #[arg(long)]
+        delete_files: bool,
+    },
+    /// Move a queued download to a queue position (0 is first).
+    Move { id: String, position: usize },
+    /// Limit one download's speed, or the global speed with `--global`.
+    Limit {
+        /// The download's id.
+        id: Option<String>,
+        /// Speed limit, e.g. `500K`, `2M`; `0` or `none` for no limit.
+        rate: Option<String>,
+        /// Set (or, with neither --down nor --up, show) the global limits.
+        #[arg(long)]
+        global: bool,
+        /// Global download limit.
+        #[arg(long, value_name = "RATE")]
+        down: Option<String>,
+        /// Global upload limit.
+        #[arg(long, value_name = "RATE")]
+        up: Option<String>,
+    },
+    /// Set how many downloads run at once.
+    MaxActive { n: u16 },
+    /// Stop the background daemon.
+    Stop,
+}
+
+/// `all` (any case) alone means every download; otherwise the ids as given.
+fn targets(ids: Vec<String>) -> cli::control::Targets {
+    if ids.len() == 1 && ids[0].eq_ignore_ascii_case("all") {
+        cli::control::Targets::All
+    } else {
+        cli::control::Targets::Ids(ids)
+    }
 }
 
 fn main() -> ExitCode {
@@ -163,6 +217,40 @@ fn main() -> ExitCode {
             .map(|_| ()),
             Some(Command::Ls { state }) => cli::list::ls(&Ctx::from_env(cli.json)?, state).await,
             Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, id).await,
+            Some(Command::Pause { ids }) => act(cli.json, cli::control::Action::Pause, ids).await,
+            Some(Command::Resume { ids }) => act(cli.json, cli::control::Action::Resume, ids).await,
+            Some(Command::Restart { ids }) => {
+                act(cli.json, cli::control::Action::Restart, ids).await
+            }
+            Some(Command::Rm { ids, delete_files }) => {
+                cli::control::rm(&Ctx::from_env(cli.json)?, ids, delete_files).await
+            }
+            Some(Command::Move { id, position }) => {
+                cli::control::move_to(&Ctx::from_env(cli.json)?, id, position).await
+            }
+            Some(Command::Limit {
+                id,
+                rate,
+                global,
+                down,
+                up,
+            }) => {
+                cli::control::limit(
+                    &Ctx::from_env(cli.json)?,
+                    cli::control::LimitArgs {
+                        id,
+                        rate,
+                        global,
+                        down,
+                        up,
+                    },
+                )
+                .await
+            }
+            Some(Command::MaxActive { n }) => {
+                cli::control::max_active(&Ctx::from_env(cli.json)?, n).await
+            }
+            Some(Command::Stop) => cli::control::stop(&Ctx::from_env(cli.json)?).await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
     });
@@ -171,12 +259,17 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             match &e {
+                CliError::Reported(_) => {}
                 CliError::Other(e) => err(format_args!("puppy: {e:#}")),
                 e => err(format_args!("puppy: {e}")),
             }
             ExitCode::from(e.exit_code())
         }
     }
+}
+
+async fn act(json: bool, action: cli::control::Action, ids: Vec<String>) -> Result<(), CliError> {
+    cli::control::act(&Ctx::from_env(json)?, action, targets(ids)).await
 }
 
 async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {

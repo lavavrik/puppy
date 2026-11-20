@@ -84,6 +84,8 @@ impl Env {
         for (k, v) in self.vars() {
             cmd.env(k, v);
         }
+        // Table widths must not depend on the developer's shell.
+        cmd.env("COLUMNS", "100");
         cmd
     }
 

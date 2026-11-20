@@ -2,6 +2,7 @@
 //! pipe-safe output.
 
 pub mod add;
+pub mod control;
 pub mod list;
 pub mod output;
 
@@ -48,6 +49,9 @@ pub enum CliError {
     /// A waited-for download needs attention (exit 5).
     #[error("{0}")]
     Attention(String),
+    /// Already reported per item; only the exit code remains.
+    #[error("")]
+    Reported(u8),
     /// Anything else: daemon or operation errors (exit 1).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -67,12 +71,12 @@ impl CliError {
             CliError::UnknownId(_) => 3,
             CliError::Failed(_) => 4,
             CliError::Attention(_) => 5,
+            CliError::Reported(c) => *c,
         }
     }
 }
 
 /// The exit code for several outcomes: the highest wins (0 for none).
-#[allow(dead_code)] // used by the multi-id commands
 pub fn worst(codes: impl IntoIterator<Item = u8>) -> u8 {
     codes.into_iter().max().unwrap_or(0)
 }
