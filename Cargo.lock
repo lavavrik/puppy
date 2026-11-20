@@ -2909,6 +2909,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "librqbit",
+ "librqbit-dualstack-sockets",
  "puppy-core",
  "tempfile",
  "tokio",

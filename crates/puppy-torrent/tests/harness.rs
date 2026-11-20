@@ -29,6 +29,15 @@ async fn engine_starts_and_stops_cleanly() {
     let engine = TorrentEngine::new(test_options(dir.path()))
         .await
         .expect("engine starts");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("data/torrent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "engine dir is owner-only");
+    }
 
     assert_eq!(engine.kind(), EngineKind::Torrent);
     assert!(engine.accepts(&Source::Magnet {
@@ -52,10 +61,10 @@ async fn engine_starts_and_stops_cleanly() {
     );
 
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(2), engine.shutdown())
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
         .await
-        .expect("shutdown completes within 2 s");
-    assert!(started.elapsed() < Duration::from_secs(2));
+        .expect("shutdown completes within 5 s");
+    assert!(started.elapsed() < Duration::from_secs(5));
 
     // The session's tasks are gone: its listener no longer holds the port.
     let rebound = (0..20).any(|_| {

@@ -12,6 +12,8 @@ tokio-util.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# Same version librqbit 9.1 uses: its bind errors are this crate's `Error::Bind`.
+librqbit-dualstack-sockets = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true
