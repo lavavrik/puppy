@@ -17,7 +17,7 @@
 - librqbit is used **only** inside `crates/puppy-torrent`; no librqbit type appears in any public signature outside that crate.
 - Seeding policy v1 (conservative, per spec): stop at completion — when a torrent finishes, pause it and report `Completed`; config `torrent.seed_ratio` (default `0.0`) reserved for later (documented, not implemented beyond 0).
 - DHT enabled by default (config `torrent.dht = true`), trackers enabled, UPnP **off** by default (`torrent.upnp = false`), listen port range `torrent.listen_port` default `42069` (TCP+uTP per librqbit defaults; falls back to an OS-assigned port if busy).
-- Per-download torrent limits: librqbit supports them only at add time (`AddTorrentOptions.ratelimits`). Runtime `set_download_limit` on a torrent ⇒ `EngineError::Unsupported("per-torrent limits can only be set before the torrent starts")`; the limit stored by the daemon is applied on the next (re)add/restore. The dashboard shows the reason in a toast.
+- Per-download torrent limits (the dashboard already blocks `l` for started torrents and maps `ErrorCode::Unsupported` to a friendly toast): librqbit supports them only at add time (`AddTorrentOptions.ratelimits`). Runtime `set_download_limit` on a torrent ⇒ `EngineError::Unsupported("per-torrent limits can only be set before the torrent starts")`; the limit stored by the daemon is applied on the next (re)add/restore. The dashboard shows the reason in a toast.
 - Global limits: download budget from the daemon's divider ⇒ `session.ratelimits.set_download_bps`; global upload limit ⇒ `set_upload_bps` (new trait method, Task 1).
 - Piece map: librqbit does not expose the have-bitfield publicly. Ruling: `EngineDetail::Torrent.have` is synthesised from per-file progress (`stats().file_progress`) mapped onto piece ranges (a piece counts as had when the byte range it covers is within downloaded bytes of the files it overlaps, assuming in-order fill within each file); `piece_count` from torrent lengths. Documented as an approximation; a future own engine gives exact data.
 - Cross-platform; tests must not touch the real network: DHT and trackers disabled in tests, peers given explicitly via `initial_peers` to a local seeder session created in the test.
@@ -55,6 +55,7 @@ crates/puppy-daemon/src/lifecycle.rs     register TorrentEngine
 
 **Files:** `crates/puppy-core/src/engine.rs`, `crates/puppy-daemon/src/{config.rs, manager/commands.rs, manager/mod.rs}`.
 **Produces:** `fn set_global_upload_budget(&self, bps: Option<u64>) {}` default method on `Engine`; the Manager calls it on every engine whenever the global up limit changes and at start. `TorrentConfig { dht: bool /*true*/, upnp: bool /*false*/, listen_port: u16 /*42069*/, seed_ratio: f32 /*0.0*/ }` as `Config.torrent` (`#[serde(default)]`, TOML table `[torrent]`).
+- [ ] Step 0 (carry-over from Plan 3 re-review): the dashboard sparkline heading shows the real window displayed (`speed · last N s`, N = samples actually drawn); render test.
 - [ ] Tests: `global_up_limit_reaches_engines` (fake engine records calls), `config_torrent_table_defaults_and_overrides`.
 - [ ] Commit `feat: upload budget in Engine trait; torrent config`.
 
