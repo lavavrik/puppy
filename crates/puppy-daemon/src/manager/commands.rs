@@ -4,7 +4,8 @@ use super::schedule::JobKind;
 use super::{Effects, Entry, Inner, Manager, ManagerError, State, normalize_limit, now_unix};
 use crate::store::{StoredDownload, StoredState};
 use puppy_core::engine::EngineError;
-use puppy_core::types::{AddRequest, DownloadId, DownloadState};
+use puppy_core::http::resume::{part_path, sidecar_path};
+use puppy_core::types::{AddRequest, DownloadId, DownloadState, Source};
 use puppy_proto::{Event, Settings};
 
 type Result<T> = std::result::Result<T, ManagerError>;
@@ -16,6 +17,25 @@ fn entry_mut(st: &mut State, id: DownloadId) -> Result<&mut Entry> {
         ));
     }
     st.entries.get_mut(&id).ok_or(ManagerError::NotFound(id))
+}
+
+/// Only failed downloads or downloads needing attention, with no job in flight, can
+/// be restarted.
+fn check_restartable(e: &Entry) -> Result<()> {
+    if !matches!(
+        e.state,
+        DownloadState::Failed { .. } | DownloadState::NeedsAttention { .. }
+    ) {
+        return Err(ManagerError::InvalidState(
+            "only failed downloads or downloads needing attention can be restarted".into(),
+        ));
+    }
+    if e.job.is_some() {
+        return Err(ManagerError::InvalidState(
+            "the download is being restored; try again shortly".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Engine errors that only mean the engine no longer holds the download.
@@ -213,24 +233,34 @@ impl Manager {
 
     /// NeedsAttention/Failed ⇒ drops the engine's files and starts over (same id, fresh
     /// probe), through the queue.
+    ///
+    /// A download the engine does not hold (e.g. its restore failed) but whose files
+    /// are known has its partial files (`.part`, `.part.puppy`) deleted first.
     pub async fn restart(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
+        let stale = {
+            let mut st = inner.lock();
+            let e = entry_mut(&mut st, id)?;
+            check_restartable(e)?;
+            match (&e.rec.request.source, &e.rec.path) {
+                (Source::Http { .. }, Some(path)) if !e.held => Some(path.clone()),
+                _ => None,
+            }
+        };
+        if let Some(final_path) = stale {
+            for p in [part_path(&final_path), sidecar_path(&final_path)] {
+                match tokio::fs::remove_file(&p).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(path = %p.display(), "cannot delete: {e}"),
+                }
+            }
+        }
         let job = {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
-            if !matches!(
-                e.state,
-                DownloadState::Failed { .. } | DownloadState::NeedsAttention { .. }
-            ) {
-                return Err(ManagerError::InvalidState(
-                    "only failed downloads or downloads needing attention can be restarted".into(),
-                ));
-            }
-            if e.job.is_some() {
-                return Err(ManagerError::InvalidState(
-                    "the download is being restored; try again shortly".into(),
-                ));
-            }
+            // Checked again: the state may have changed while the files were deleted.
+            check_restartable(e)?;
             e.reset_retry();
             let job = if e.held {
                 Inner::begin_job(id, e, JobKind::Reset)

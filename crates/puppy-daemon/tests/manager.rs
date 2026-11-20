@@ -624,6 +624,8 @@ struct Gated {
     pauses: AtomicUsize,
     pause_permits: tokio::sync::Semaphore,
     fail_limit: AtomicBool,
+    /// `add` fails at once (before the `before` gate).
+    fail_add: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -641,6 +643,9 @@ impl Engine for Gated {
         mode: puppy_core::engine::StartMode,
         opts: puppy_core::engine::AddOptions,
     ) -> Result<puppy_core::engine::Added, puppy_core::engine::EngineError> {
+        if self.fail_add.swap(false, Ordering::SeqCst) {
+            return Err(puppy_core::engine::EngineError::Invalid("injected".into()));
+        }
         self.before.acquire().await.unwrap().forget();
         let r = self.inner.add(id, req, mode, opts).await;
         self.after.acquire().await.unwrap().forget();
@@ -693,6 +698,14 @@ impl Env {
     }
 
     async fn gated_manager_with(&self, f: impl FnOnce(&mut Config)) -> (Arc<Manager>, Arc<Gated>) {
+        self.gated_manager_full(f, false).await
+    }
+
+    async fn gated_manager_full(
+        &self,
+        f: impl FnOnce(&mut Config),
+        fail_add: bool,
+    ) -> (Arc<Manager>, Arc<Gated>) {
         let gated = Arc::new(Gated {
             inner: HttpEngine::new(http_cfg(&self.dl_dir())).unwrap(),
             before: tokio::sync::Semaphore::new(0),
@@ -701,6 +714,7 @@ impl Env {
             pauses: AtomicUsize::new(0),
             pause_permits: tokio::sync::Semaphore::new(0),
             fail_limit: AtomicBool::new(false),
+            fail_add: AtomicBool::new(fail_add),
         });
         let mut cfg = Config {
             download_dir: self.dl_dir(),
@@ -1232,4 +1246,49 @@ async fn shutdown_pause_phase_is_bounded() {
     assert_eq!(v["downloads"][0]["state"]["kind"], "active", "{v:#}");
     // Stop the transfer the abandoned pause left running.
     gated.inner.pause(id).await.unwrap();
+}
+
+/// Restarting a download the engine does not hold (its restore failed) deletes the
+/// partial files at its old path before starting over.
+#[tokio::test]
+async fn restart_of_unheld_download_deletes_its_partial_files() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    std::fs::create_dir_all(env.dl_dir()).unwrap();
+    let final_path = env.dl_dir().join("a.bin");
+    let part = env.dl_dir().join("a.bin.part");
+    let sidecar = env.dl_dir().join("a.bin.part.puppy");
+    std::fs::write(&part, b"partial").unwrap();
+    std::fs::write(&sidecar, b"{}").unwrap();
+    let rec = puppy_daemon::StoredDownload {
+        id: 1,
+        request: env.req(&s, "a.bin"),
+        limit: None,
+        state: puppy_daemon::StoredState::Paused,
+        name: Some("a.bin".into()),
+        path: Some(final_path.clone()),
+        total_bytes: Some(64 * KIB),
+        created_unix: 1,
+        finished_unix: None,
+    };
+    let st = puppy_daemon::PersistedState {
+        next_id: 2,
+        order: vec![1],
+        downloads: vec![rec],
+        ..Default::default()
+    };
+    Store::new(env.state_path()).save_now(&st).await.unwrap();
+    let (m, gated) = env.gated_manager_full(|_| {}, true).await;
+    wait_state(&m, 1, |s| matches!(s, WireState::Failed { .. })).await;
+    assert!(part.exists() && sidecar.exists());
+    m.restart(1).await.unwrap();
+    assert!(!part.exists(), "partial file left behind");
+    assert!(!sidecar.exists(), "sidecar left behind");
+    assert_eq!(snap(&m, 1).path, None);
+    // Starts over under the same name.
+    gated.before.add_permits(1);
+    gated.after.add_permits(1);
+    wait_completed(&m, 1).await;
+    assert_file(&final_path, 64 * KIB, 0);
+    m.shutdown().await;
 }

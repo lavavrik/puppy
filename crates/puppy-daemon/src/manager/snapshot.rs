@@ -5,9 +5,16 @@ use puppy_core::engine::EngineKind;
 use puppy_core::types::{DownloadId, DownloadState, EngineDetail, Source};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Totals};
 
-/// How a source is shown: the URL, the magnet URI or the .torrent path.
+/// How a source is shown: the URL (with any password masked), the magnet URI or the
+/// .torrent path.
 fn source_display(source: &Source) -> String {
     match source {
+        Source::Http { url } if url.password().is_some() => {
+            let mut shown = url.clone();
+            // Only fails for URLs that cannot have credentials, which this one has.
+            let _ = shown.set_password(Some("***"));
+            shown.to_string()
+        }
         Source::Http { url } => url.to_string(),
         Source::Magnet { uri } => uri.clone(),
         Source::TorrentFile { path } => path.display().to_string(),
@@ -158,5 +165,32 @@ impl Manager {
                 .count()
         });
         Ok(inner.snap(id, e, pos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(url: &str) -> Source {
+        Source::Http {
+            url: url.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn passwords_are_masked() {
+        assert_eq!(
+            source_display(&http("https://user:s3cret@host/f.bin?x=1")),
+            "https://user:***@host/f.bin?x=1"
+        );
+        assert_eq!(
+            source_display(&http("https://user@host/f.bin")),
+            "https://user@host/f.bin"
+        );
+        assert_eq!(
+            source_display(&http("http://host/f.bin")),
+            "http://host/f.bin"
+        );
     }
 }
