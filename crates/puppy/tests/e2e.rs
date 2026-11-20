@@ -78,13 +78,6 @@ impl Env {
         .expect("connect_or_spawn hung")
     }
 
-    async fn client(&self) -> Client {
-        tokio::time::timeout(TIMEOUT, Client::connect(&self.socket, "e2e"))
-            .await
-            .expect("connect hung")
-            .expect("connect")
-    }
-
     /// `puppy <args>` with this test's environment.
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
@@ -124,18 +117,30 @@ impl Env {
 
     /// Whether some daemon holds this home's lock.
     fn lock_held(&self) -> bool {
+        self.try_lock_held()
+            .unwrap_or_else(|e| panic!("cannot test the lock: {e}"))
+    }
+
+    fn try_lock_held(&self) -> std::io::Result<bool> {
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.paths().lock_file)
-            .unwrap();
+            .open(self.paths().lock_file)?;
         match fs4::FileExt::try_lock(&f) {
-            Ok(()) => false,
-            Err(fs4::TryLockError::WouldBlock) => true,
-            Err(fs4::TryLockError::Error(e)) => panic!("cannot test the lock: {e}"),
+            Ok(()) => Ok(false),
+            Err(fs4::TryLockError::WouldBlock) => Ok(true),
+            Err(fs4::TryLockError::Error(e)) => Err(e),
         }
+    }
+
+    /// The pid of a live daemon of this home: the pid file is only trusted while the
+    /// lock is held (a crashed daemon leaves a stale file whose pid may since belong
+    /// to an unrelated process).
+    fn live_daemon_pid(&self) -> Option<u32> {
+        let pid = self.daemon_pid()?;
+        self.try_lock_held().ok()?.then_some(pid)
     }
 
     /// Waits until the daemon is gone: lock free, pid file and socket file removed.
@@ -186,9 +191,10 @@ impl Env {
 }
 
 impl Drop for Env {
-    /// Never leaks a daemon: asks it to shut down, then kills it if it is still there.
+    /// Never leaks a daemon: asks it to shut down, then kills it if it still holds
+    /// the lock. A stale pid file (no lock holder) is never acted on.
     fn drop(&mut self) {
-        if self.daemon_pid().is_some() {
+        if self.live_daemon_pid().is_some() {
             let socket = self.socket.clone();
             let _ = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -205,10 +211,10 @@ impl Drop for Env {
             })
             .join();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while self.daemon_pid().is_some() && Instant::now() < deadline {
+            while self.live_daemon_pid().is_some() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            if let Some(pid) = self.daemon_pid() {
+            if let Some(pid) = self.live_daemon_pid() {
                 eprintln!("killing daemon {pid} that did not shut down");
                 kill(pid);
             }
@@ -221,7 +227,8 @@ impl Drop for Env {
 
 #[cfg(unix)]
 fn kill(pid: u32) {
-    // SAFETY: plain syscall; the pid comes from a pid file only a live daemon keeps.
+    // SAFETY: plain syscall. Only called with the pid recorded by the daemon that
+    // holds this test home's lock right now, i.e. a live puppy daemon.
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
 }
 
@@ -372,12 +379,13 @@ async fn no_args_prints_summary() {
     let (status, out, err) = env.run(&[]);
     assert!(status.success(), "{status:?}: {err}");
     assert_eq!(out, "0 downloads, 0 active\n");
-    // It started a daemon; add something and ask again.
-    let c = env.client().await;
+    // It started a daemon (which may already have idle-exited): add something and
+    // ask again.
+    let c = env.spawn_client().await.unwrap();
     c.add(env.paused_req("a.bin"), true, None).await.unwrap();
     let (status, out, err) = env.run(&[]);
     assert!(status.success(), "{status:?}: {err}");
-    assert_eq!(out, "1 downloads, 0 active\n");
+    assert_eq!(out, "1 download, 0 active\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -440,4 +448,22 @@ async fn sigterm_shuts_down_gracefully() {
         serde_json::from_str(&std::fs::read_to_string(env.paths().state_file).unwrap()).unwrap();
     assert_eq!(state["downloads"][0]["id"], id, "{state:#}");
     drop(c);
+}
+
+/// The cleanup guard never kills the process a stale pid file names (a crashed
+/// daemon's pid may since belong to an unrelated process).
+#[cfg(unix)]
+#[test]
+fn cleanup_ignores_stale_pid_file() {
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    let env = Env::new();
+    std::fs::write(env.paths().pid_file, format!("{}\n", bystander.id())).unwrap();
+    assert!(!env.lock_held());
+    drop(env);
+    // A signal is delivered asynchronously: give a kill time to land.
+    std::thread::sleep(Duration::from_millis(500));
+    let alive = bystander.try_wait().unwrap().is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    assert!(alive, "the cleanup killed an unrelated process");
 }

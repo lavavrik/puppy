@@ -17,7 +17,9 @@ pub struct Paths {
     pub config_dir: PathBuf,
     pub socket: SocketName,
     pub lock_file: PathBuf,
-    /// Holds the running daemon's process id (for tests and tooling).
+    /// Holds the running daemon's process id (for tests and tooling). A daemon that
+    /// crashed leaves it behind, so it names a live daemon only while `lock_file` is
+    /// locked; never act on it (e.g. kill) without checking the lock.
     pub pid_file: PathBuf,
     pub state_file: PathBuf,
     pub log_dir: PathBuf,

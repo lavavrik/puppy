@@ -87,6 +87,23 @@ creating log-on tasks from an elevated prompt ("Run as administrator"); the
 task still runs as you, with limited rights. To start it now without logging
 off: `schtasks /Run /TN puppy`.
 
+Tasks created by `schtasks /Create` keep Task Scheduler's default settings:
+they are stopped after running for 72 hours, and they do not start (or are
+stopped) on battery power. Both are wrong for a daemon. Either untick these in
+the task's Settings and Conditions tabs (`taskschd.msc`), or create the task with
+PowerShell instead, which lets you turn them off up front:
+
+```powershell
+$action   = New-ScheduledTaskAction -Execute "$env:USERPROFILE\.cargo\bin\puppy.exe" -Argument "daemon"
+$trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName puppy -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited
+```
+
+`-ExecutionTimeLimit 0` means no time limit. Remove it with
+`Unregister-ScheduledTask -TaskName puppy -Confirm:$false`, or with the
+`schtasks` commands below.
+
 Without administrator rights, use the Startup folder instead: press Win+R, open
 `shell:startup`, and create a shortcut there with the target
 `"%USERPROFILE%\.cargo\bin\puppy.exe" daemon` and Run set to "Minimized" (the

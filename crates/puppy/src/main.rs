@@ -72,7 +72,7 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Placeholder for the dashboard: `N downloads, X active`.
+/// Placeholder for the dashboard: `N downloads, X active` (`1 download, …`).
 async fn summary() -> anyhow::Result<()> {
     let paths = Paths::resolve().context("cannot set up puppy's directories")?;
     let exe = std::env::current_exe().context("cannot find the puppy executable")?;
@@ -82,6 +82,8 @@ async fn summary() -> anyhow::Result<()> {
         .iter()
         .filter(|d| matches!(d.state, DownloadState::Starting | DownloadState::Active))
         .count();
-    println!("{} downloads, {active} active", downloads.len());
+    let n = downloads.len();
+    let noun = if n == 1 { "download" } else { "downloads" };
+    println!("{n} {noun}, {active} active");
     Ok(())
 }

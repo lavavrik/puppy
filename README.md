@@ -1,10 +1,11 @@
 # puppy
 
-A modern terminal download manager written in Rust: a fresh successor to
-[aria2](https://aria2.github.io/), for HTTP(S) and BitTorrent. A background
-daemon owns every download and the queue, so downloads keep going when the UI
-is closed; `puppy` talks to it over a per-user local socket. It runs on Linux,
-macOS and Windows, on x86_64 and aarch64.
+A modern terminal download manager written in Rust, meant as a fresh successor
+to [aria2](https://aria2.github.io/). It downloads over HTTP(S) today;
+BitTorrent and the full-screen dashboard are in progress. A background daemon
+owns every download and the queue, so downloads keep going when no client is
+open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
+and Windows, on x86_64 and aarch64.
 
 ## Status
 
