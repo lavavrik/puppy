@@ -49,9 +49,16 @@ impl Action {
     /// Whether `all` acts on a download in this state.
     fn applies(self, s: &WireState) -> bool {
         match self {
+            // A retrying (transient) failure too: pausing cancels the retry.
             Action::Pause => matches!(
                 s,
-                WireState::Queued | WireState::Starting | WireState::Active
+                WireState::Queued
+                    | WireState::Starting
+                    | WireState::Active
+                    | WireState::Failed {
+                        transient: true,
+                        ..
+                    }
             ),
             Action::Resume => matches!(s, WireState::Paused | WireState::Failed { .. }),
             Action::Restart => {
@@ -124,6 +131,11 @@ fn parse_id(s: &str) -> Result<DownloadId, Outcome> {
             2,
         )
     })
+}
+
+/// An id given as an argument (`info`): a bad one is a usage error.
+pub fn parse_id_arg(s: &str) -> Result<DownloadId, CliError> {
+    parse_id(s).map_err(|o| CliError::Usage(o.message))
 }
 
 /// Prints every outcome and returns the command's result: the worst code wins.
@@ -343,19 +355,19 @@ pub async fn stop(ctx: &Ctx) -> Result<(), CliError> {
             json(&json!({ "running": false }));
         }
     };
-    let client = match Client::connect(&ctx.paths.socket, "puppy-cli").await {
-        Ok(c) => c,
+    match Client::connect(&ctx.paths.socket, "puppy-cli").await {
         Err(ClientError::Io(_)) => {
             say(false, "puppy is not running");
             return Ok(());
         }
+        // A daemon of another protocol version cannot be asked normally.
+        Err(e) if super::is_mismatch(&e) => Client::shutdown_incompatible(&ctx.paths).await?,
         Err(e) => return Err(e.into()),
-    };
-    match client.call(Request::Shutdown).await {
-        Ok(_) | Err(ClientError::Disconnected) => {}
-        Err(e) => return Err(e.into()),
+        Ok(client) => match client.call(Request::Shutdown).await {
+            Ok(_) | Err(ClientError::Disconnected) => {}
+            Err(e) => return Err(e.into()),
+        },
     }
-    drop(client);
     let deadline = Instant::now() + STOP_WAIT;
     loop {
         match Client::connect(&ctx.paths.socket, "puppy-cli").await {

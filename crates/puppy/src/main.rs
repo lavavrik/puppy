@@ -117,7 +117,7 @@ enum Command {
     /// Show everything about one download.
     Info {
         /// The download's id (see `puppy ls`).
-        id: u64,
+        id: String,
     },
     /// Pause downloads (ids, or `all`).
     Pause {
@@ -230,7 +230,7 @@ fn main() -> ExitCode {
                 .await
             }
             Some(Command::Ls { state }) => cli::list::ls(&Ctx::from_env(cli.json)?, state).await,
-            Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, id).await,
+            Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, &id).await,
             Some(Command::Pause { ids }) => act(cli.json, cli::control::Action::Pause, ids).await,
             Some(Command::Resume { ids }) => act(cli.json, cli::control::Action::Resume, ids).await,
             Some(Command::Restart { ids }) => {

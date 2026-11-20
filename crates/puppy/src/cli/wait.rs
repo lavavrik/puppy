@@ -4,11 +4,14 @@
 use super::list::attention_text;
 use super::output::{err, json, out, stdout_closed};
 use super::{CliError, Ctx, report_error, worst};
+use crossterm::cursor::MoveToColumn;
+use crossterm::terminal::{Clear, ClearType};
 use puppy_client::Client;
 use puppy_core::types::DownloadId;
 use puppy_proto::{DownloadSnapshot, Event, ReplyData, Request, WireState};
 use puppy_tui::format::{self, display_safe};
-use std::collections::{BTreeSet, HashMap};
+use serde::Serialize;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 
@@ -19,8 +22,26 @@ const WATCH_INTERVAL_MS: u64 = 1000;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Exit code after Ctrl-C (128 + SIGINT, as shells report it).
 const INTERRUPTED: u8 = 130;
-/// Erases the current terminal line.
-const CLEAR_LINE: &str = "\r\x1b[2K";
+
+/// Erases the current line of stderr (works on Windows consoles without VT too).
+fn clear_line() {
+    let _ = crossterm::execute!(
+        std::io::stderr().lock(),
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine)
+    );
+}
+
+/// How a wait ended: the exit codes, and for `--json` the final snapshots of the waited
+/// downloads that still exist (`final`) and the ids that do not (`missing`).
+#[derive(Serialize, Default)]
+pub struct Waited {
+    #[serde(skip)]
+    codes: Vec<u8>,
+    #[serde(rename = "final")]
+    finals: Vec<DownloadSnapshot>,
+    missing: Vec<DownloadId>,
+}
 
 fn lost() -> CliError {
     CliError::Other(anyhow::anyhow!("lost connection to puppy"))
@@ -34,12 +55,12 @@ async fn ctrl_c() {
 }
 
 /// Runs `f` until it ends or Ctrl-C (exit 130). The downloads keep going either way.
-pub async fn interruptible(f: impl Future<Output = Result<(), CliError>>) -> Result<(), CliError> {
+pub async fn interruptible<T>(f: impl Future<Output = Result<T, CliError>>) -> Result<T, CliError> {
     tokio::select! {
         r = f => r,
         () = ctrl_c() => {
             if std::io::stderr().is_terminal() {
-                let _ = write!(std::io::stderr().lock(), "{CLEAR_LINE}");
+                clear_line();
             }
             err("puppy: interrupted; the downloads keep running");
             Err(CliError::Reported(INTERRUPTED))
@@ -47,11 +68,19 @@ pub async fn interruptible(f: impl Future<Output = Result<(), CliError>>) -> Res
     }
 }
 
-/// Adds `r`'s exit code to `codes`, printing its error unless it was already reported.
-pub fn collect(codes: &mut Vec<u8>, r: Result<(), CliError>) {
-    if let Err(e) = r {
-        report_error(&e);
-        codes.push(e.exit_code());
+/// Takes in how a wait ended: its codes (or, for an error, its code after printing it
+/// unless already reported). Returns what the wait found, if it got that far.
+pub fn absorb(codes: &mut Vec<u8>, r: Result<Waited, CliError>) -> Option<Waited> {
+    match r {
+        Ok(w) => {
+            codes.extend(&w.codes);
+            Some(w)
+        }
+        Err(e) => {
+            report_error(&e);
+            codes.push(e.exit_code());
+            None
+        }
     }
 }
 
@@ -154,7 +183,8 @@ struct Progress {
 impl Progress {
     fn show(&mut self, line: &str) {
         if self.tty {
-            let _ = write!(std::io::stderr().lock(), "{CLEAR_LINE}{line}");
+            clear_line();
+            let _ = write!(std::io::stderr().lock(), "{line}");
             self.shown = true;
             self.frame += 1;
         }
@@ -162,7 +192,7 @@ impl Progress {
 
     fn clear(&mut self) {
         if self.shown {
-            let _ = write!(std::io::stderr().lock(), "{CLEAR_LINE}");
+            clear_line();
             self.shown = false;
         }
     }
@@ -182,6 +212,8 @@ struct Waiter<'a> {
     last: HashMap<DownloadId, DownloadSnapshot>,
     codes: Vec<u8>,
     progress: Progress,
+    /// Paused ids already told about.
+    told_paused: HashSet<DownloadId>,
 }
 
 impl Waiter<'_> {
@@ -220,6 +252,11 @@ impl Waiter<'_> {
                     } else if let (true, WireState::Failed { reason, .. }) = (first, &d.state) {
                         let reason = reason.clone();
                         self.retrying(id, &reason);
+                    } else if d.state == WireState::Paused && self.told_paused.insert(id) {
+                        self.progress.clear();
+                        err(format_args!(
+                            "puppy: {id} is paused; waiting until it is resumed"
+                        ));
                     }
                     self.last.insert(id, d);
                 }
@@ -268,13 +305,13 @@ impl Waiter<'_> {
 
 /// Waits until every download in `ids` has ended: completed (0), failed for good (4),
 /// needs attention (5), or removed / unknown (3); the worst code wins. A transient
-/// failure is not an end: puppy retries it. With `--json`, prints the final snapshots
-/// (as a JSON array) of the ones that still exist.
+/// failure is not an end: puppy retries it. With `--json`, the result also holds the
+/// final snapshots of the ones that still exist, and the ids of those that do not.
 pub async fn until_done(
     ctx: &Ctx,
     client: &mut Client,
     ids: &[DownloadId],
-) -> Result<(), CliError> {
+) -> Result<Waited, CliError> {
     let mut unique = Vec::new();
     for id in ids {
         if !unique.contains(id) {
@@ -293,6 +330,7 @@ pub async fn until_done(
             shown: false,
             frame: 0,
         },
+        told_paused: HashSet::new(),
     };
     // Subscribed first: whatever happens after this snapshot arrives as an event.
     w.snapshot(client.list().await?, true);
@@ -303,16 +341,20 @@ pub async fn until_done(
         };
         w.event(ev);
     }
+    let mut waited = Waited {
+        codes: std::mem::take(&mut w.codes),
+        ..Waited::default()
+    };
     if ctx.json {
         let all = client.list().await?;
-        let finals: Vec<&DownloadSnapshot> = w
-            .ids
-            .iter()
-            .filter_map(|id| all.iter().find(|d| d.id == *id))
-            .collect();
-        json(&finals);
+        for id in &w.ids {
+            match all.iter().find(|d| d.id == *id) {
+                Some(d) => waited.finals.push(d.clone()),
+                None => waited.missing.push(*id),
+            }
+        }
     }
-    finish(&w.codes)
+    Ok(waited)
 }
 
 /// `wait <ID>...`: waits for downloads to end; ids that do not parse fail with code 2.
@@ -330,12 +372,16 @@ pub async fn wait(ctx: &Ctx, ids: Vec<String>) -> Result<(), CliError> {
             }
         }
     }
+    let mut waited = None;
     if !parsed.is_empty() {
-        let mut client = ctx.client().await?;
-        collect(
-            &mut codes,
-            interruptible(until_done(ctx, &mut client, &parsed)).await,
-        );
+        let r = match ctx.client().await {
+            Ok(mut client) => interruptible(until_done(ctx, &mut client, &parsed)).await,
+            Err(e) => Err(e),
+        };
+        waited = absorb(&mut codes, r);
+    }
+    if ctx.json {
+        json(&waited.unwrap_or_default());
     }
     finish(&codes)
 }

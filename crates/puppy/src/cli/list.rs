@@ -1,14 +1,15 @@
 //! Listing commands: `status`, `ls` and `info`.
 
+use super::control::parse_id_arg;
 use super::output::{ColWidth, json, out, table};
 use super::{CliError, Ctx};
 use crate::cli::ClientError;
 use clap::ValueEnum;
-use puppy_core::types::{DownloadId, EngineDetail};
+use puppy_core::types::EngineDetail;
 use puppy_proto::WireState;
 use puppy_proto::{DownloadSnapshot, ErrorCode, ReplyData, Request, WireAttention};
-use puppy_tui::format::percent;
 use puppy_tui::format::{bytes, eta, speed};
+use puppy_tui::format::{display_safe, percent};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -44,8 +45,12 @@ pub enum StateFilter {
     Starting,
     Active,
     Paused,
+    #[value(alias = "done")]
     Completed,
+    /// Failed for good (not being retried).
     Failed,
+    /// Failed, and puppy will retry it.
+    Retrying,
     Attention,
 }
 
@@ -58,7 +63,20 @@ impl StateFilter {
                 | (StateFilter::Active, WireState::Active)
                 | (StateFilter::Paused, WireState::Paused)
                 | (StateFilter::Completed, WireState::Completed)
-                | (StateFilter::Failed, WireState::Failed { .. })
+                | (
+                    StateFilter::Failed,
+                    WireState::Failed {
+                        transient: false,
+                        ..
+                    }
+                )
+                | (
+                    StateFilter::Retrying,
+                    WireState::Failed {
+                        transient: true,
+                        ..
+                    }
+                )
                 | (StateFilter::Attention, WireState::NeedsAttention { .. })
         )
     }
@@ -137,7 +155,8 @@ pub(super) fn attention_text(r: &WireAttention) -> String {
 }
 
 /// Everything about one download: key/value lines, or `{"download":…,"detail":…}`.
-pub async fn info(ctx: &Ctx, id: DownloadId) -> Result<(), CliError> {
+pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
+    let id = parse_id_arg(id)?;
     let reply = ctx.client().await?.call(Request::Get { id }).await;
     let (d, detail) = match reply {
         Ok(ReplyData::Download { download, detail }) => (download, detail),
@@ -161,7 +180,7 @@ pub async fn info(ctx: &Ctx, id: DownloadId) -> Result<(), CliError> {
     }
     let mut state = state_word(&d.state).to_string();
     match &d.state {
-        WireState::Failed { reason, .. } => state = format!("{state}: {reason}"),
+        WireState::Failed { reason, .. } => state = format!("{state}: {}", display_safe(reason)),
         WireState::NeedsAttention { reason } => {
             state = format!("{state}: {}", attention_text(reason));
         }
@@ -169,14 +188,14 @@ pub async fn info(ctx: &Ctx, id: DownloadId) -> Result<(), CliError> {
     }
     let kv = |k: &str, v: String| out(format_args!("{k:<12}{v}"));
     kv("id", d.id.to_string());
-    kv("name", d.name.clone());
+    kv("name", display_safe(&d.name).into_owned());
     kv(
         "path",
-        d.path
-            .as_ref()
-            .map_or("—".to_string(), |p| p.display().to_string()),
+        d.path.as_ref().map_or("—".to_string(), |p| {
+            display_safe(&p.display().to_string()).into_owned()
+        }),
     );
-    kv("source", d.source.clone());
+    kv("source", display_safe(&d.source).into_owned());
     kv("state", state);
     kv("size", d.total_bytes.map_or("—".to_string(), bytes));
     kv("downloaded", bytes(d.done_bytes));

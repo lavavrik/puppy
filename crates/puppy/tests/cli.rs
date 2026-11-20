@@ -102,8 +102,115 @@ async fn add_json_lists_ids_and_sources() {
     let (status, out, err) = env.run(&["--json", "add", "--paused", &u1, &u2]);
     assert!(status.success(), "{err}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v[0]["id"], 1);
-    assert_eq!(v[1]["source"], u2.as_str());
+    assert_eq!(v["added"][0]["id"], 1);
+    assert_eq!(v["added"][1]["source"], u2.as_str());
+    assert_eq!(v["failed"], serde_json::json!([]));
+}
+
+/// Failures are part of the one JSON value, not just stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_json_reports_failures_in_the_object() {
+    let env = Env::new();
+    let u1 = url_of(&env, "a");
+    let (status, out, _) = env.run(&["--json", "add", "--paused", &u1, "nope"]);
+    assert_eq!(status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["added"][0]["id"], 1);
+    assert_eq!(v["failed"][0]["source"], "nope");
+    assert!(v["failed"][0]["error"].is_string(), "{out}");
+    assert_eq!(v["failed"][0]["code"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_wait_json_is_one_value() {
+    let env = Env::new();
+    let s = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let url = s.url("/file.bin").to_string();
+    let dir = env.dl_dir();
+    let (status, out, err) = env.run(&[
+        "--json",
+        "add",
+        "--wait",
+        "-o",
+        dir.to_str().unwrap(),
+        &url,
+        "nope",
+    ]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(v["added"][0]["id"], 1, "{out}");
+    assert_eq!(v["failed"][0]["source"], "nope", "{out}");
+    assert_eq!(v["final"][0]["state"]["kind"], "completed", "{out}");
+    assert_eq!(v["missing"], serde_json::json!([]), "{out}");
+}
+
+/// Runs `puppy <args>` with `input` on stdin: (status, stdout, stderr).
+fn run_stdin(env: &Env, args: &[&str], input: &[u8]) -> (std::process::ExitStatus, String, String) {
+    use std::io::Write;
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_f = env.home.path().join(format!("so-{n}"));
+    let err_f = env.home.path().join(format!("se-{n}"));
+    let mut child = env
+        .command(args)
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&out_f).unwrap())
+        .stderr(std::fs::File::create(&err_f).unwrap())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let status = wait_exit(child, TIMEOUT);
+    (
+        status,
+        std::fs::read_to_string(out_f).unwrap(),
+        std::fs::read_to_string(err_f).unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_stdin_bom_and_utf16() {
+    let env = Env::new();
+    let (u1, u2, u3) = (url_of(&env, "a"), url_of(&env, "b"), url_of(&env, "c"));
+    let mut utf8 = b"\xEF\xBB\xBF".to_vec();
+    utf8.extend(format!("{u1}\n").bytes());
+    let units = |s: String| s.encode_utf16().collect::<Vec<u16>>();
+    let mut le = vec![0xFF, 0xFE];
+    le.extend(
+        units(format!("{u2}\r\n"))
+            .iter()
+            .flat_map(|u| u.to_le_bytes()),
+    );
+    let mut be = vec![0xFE, 0xFF];
+    be.extend(
+        units(format!("{u3}\r\n"))
+            .iter()
+            .flat_map(|u| u.to_be_bytes()),
+    );
+    for input in [utf8, le, be] {
+        let (status, out, err) = run_stdin(&env, &["add", "--paused", "-"], &input);
+        assert_eq!(status.code(), Some(0), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
+    let all = snapshots(&env, &["--json", "ls"]);
+    let sources: Vec<&str> = all.iter().map(|d| d["source"].as_str().unwrap()).collect();
+    assert_eq!(sources, [u1, u2, u3].map(|u| u.leak() as &str));
+    // Truncated UTF-16 (a lone byte after the BOM, an unpaired surrogate).
+    for bad in [vec![0xFF, 0xFE, 0x41], vec![0xFF, 0xFE, 0x00, 0xD8]] {
+        let (status, out, err) = run_stdin(&env, &["add", "--paused", "-"], &bad);
+        assert_eq!(status.code(), Some(2), "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("stdin is not valid UTF-16"), "{err}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_empty_stdin_is_usage() {
+    let env = Env::new();
+    let (status, out, err) = run_stdin(&env, &["add", "-"], b"\n# only a comment\n");
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("no sources on stdin"), "{err}");
+    assert!(!env.lock_held(), "a usage error must not start a daemon");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -111,27 +218,7 @@ async fn add_stdin_mixed_lines() {
     let env = Env::new();
     let (u1, u2) = (url_of(&env, "a"), url_of(&env, "b"));
     let input = format!("\r\n# c\n \"{u1}\"\r\nnot a url\n{u2}\n");
-    let out_f = env.home.path().join("o");
-    let err_f = env.home.path().join("e");
-    let mut child = env
-        .command(&["add", "--paused", "-"])
-        .stdin(Stdio::piped())
-        .stdout(std::fs::File::create(&out_f).unwrap())
-        .stderr(std::fs::File::create(&err_f).unwrap())
-        .spawn()
-        .unwrap();
-    {
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-    }
-    let status = wait_exit(child, TIMEOUT);
-    let out = std::fs::read_to_string(out_f).unwrap();
-    let err = std::fs::read_to_string(err_f).unwrap();
+    let (status, out, err) = run_stdin(&env, &["add", "--paused", "-"], input.as_bytes());
     assert_eq!(status.code(), Some(1), "{err}");
     assert_eq!(out.lines().count(), 2, "{out}");
     assert!(err.contains("not a url"), "{err}");
@@ -216,7 +303,9 @@ async fn ls_state_filter() {
         names(&["--json", "ls", "--state", "paused,completed"]).len(),
         2
     );
+    assert_eq!(names(&["--json", "ls", "--state", "done"]), ["done.bin"]);
     assert!(names(&["--json", "ls", "--state", "failed"]).is_empty());
+    assert!(names(&["--json", "ls", "--state", "retrying"]).is_empty());
     let (status, _, _) = env.run(&["ls", "--state", "bogus"]);
     assert_eq!(status.code(), Some(2));
 }
@@ -621,8 +710,14 @@ async fn wait_already_terminal_states() {
     assert_eq!(status.code(), Some(3), "{err}");
     let (status, out, err) = timed(&["--json", "wait", &done.to_string()]);
     assert_eq!(status.code(), Some(0), "{err}");
-    let v: Vec<puppy_proto::DownloadSnapshot> = serde_json::from_str(&out).unwrap();
-    assert_eq!(v[0].state, puppy_proto::WireState::Completed);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["final"][0]["state"]["kind"], "completed", "{out}");
+    assert_eq!(v["missing"], serde_json::json!([]), "{out}");
+    let (status, out, _) = timed(&["--json", "wait", &done.to_string(), &gone.to_string()]);
+    assert_eq!(status.code(), Some(3));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["final"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(v["missing"], serde_json::json!([gone]), "{out}");
     let (status, _, _) = timed(&["wait", "abc"]);
     assert_eq!(status.code(), Some(2));
 }
@@ -783,4 +878,191 @@ async fn watch_human_lines() {
     let _ = child.kill();
     let _ = child.wait();
     reader.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_state_retrying_is_not_failed() {
+    let env = Env::new();
+    let s = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        fail_status: Some(503),
+        ..small_server_cfg()
+    })
+    .await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "t.bin"), false, None).await.unwrap();
+    wait_transient(&c, id).await;
+    assert_eq!(
+        snapshots(&env, &["--json", "ls", "--state", "retrying"]).len(),
+        1
+    );
+    assert!(snapshots(&env, &["--json", "ls", "--state", "failed"]).is_empty());
+}
+
+async fn wait_transient(c: &puppy_client::Client, id: u64) {
+    // `wait_state` panics on failures; poll by hand.
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let d = snapshot(c, id).await;
+        if matches!(
+            d.state,
+            puppy_proto::WireState::Failed {
+                transient: true,
+                ..
+            }
+        ) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "never failed");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_all_includes_retrying() {
+    let env = Env::new();
+    let s = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        fail_status: Some(503),
+        ..small_server_cfg()
+    })
+    .await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "t.bin"), false, None).await.unwrap();
+    wait_transient(&c, id).await;
+    let (status, out, err) = env.run(&["pause", "all"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), format!("paused {id}"));
+    assert_eq!(state_of(&env, id), "paused");
+}
+
+/// Piped output (no COLUMNS, not a terminal) never truncates names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ls_piped_does_not_truncate_names() {
+    let env = Env::new();
+    let long = "n".repeat(150);
+    let u = url_of(&env, "x");
+    let (status, _, err) = env.run(&["add", "--paused", "--name", &long, &u]);
+    assert!(status.success(), "{err}");
+    let out_f = env.home.path().join("ls-out");
+    let status = env
+        .command(&["ls"])
+        .env_remove("COLUMNS")
+        .stdout(std::fs::File::create(&out_f).unwrap())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = std::fs::read_to_string(out_f).unwrap();
+    assert!(out.contains(&long), "{out}");
+    assert!(!out.contains('…'), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_on_paused_says_so_once() {
+    let env = Env::new();
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.paused_req("p.bin"), true, None).await.unwrap();
+    let err_f = env.home.path().join("wait-err");
+    let mut child = env
+        .command(&["wait", &id.to_string()])
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err_f).unwrap())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    let _ = child.wait();
+    let err = std::fs::read_to_string(err_f).unwrap();
+    let msg = format!("puppy: {id} is paused; waiting until it is resumed");
+    assert_eq!(err.matches(&msg).count(), 1, "{err}");
+}
+
+/// The daemon going away while waiting: exit 1, "lost connection".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_daemon_disconnect_exit_1() {
+    let env = Env::new();
+    let s = slow_server().await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    let out_f = env.home.path().join("wait-out");
+    let err_f = env.home.path().join("wait-err");
+    let child = env
+        .command(&["wait", &id.to_string()])
+        .stdout(std::fs::File::create(&out_f).unwrap())
+        .stderr(std::fs::File::create(&err_f).unwrap())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let _ = c.call(puppy_proto::Request::Shutdown).await;
+    let status = wait_exit(child, TIMEOUT);
+    let err = std::fs::read_to_string(err_f).unwrap();
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(err.contains("lost connection"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn info_bad_id_and_unsafe_text() {
+    let env = Env::new();
+    let (status, _, err) = env.run(&["info", "abc"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("\"abc\" is not a download id"), "{err}");
+    let u = url_of(&env, "x");
+    let (status, _, err) = env.run(&["add", "--paused", "--name", "a\u{1b}[31mb", &u]);
+    assert!(status.success(), "{err}");
+    let (status, out, err) = env.run(&["info", "1"]);
+    assert!(status.success(), "{err}");
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+}
+
+/// A daemon speaking another protocol: every command says so; `stop` stops it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incompatible_daemon_hint_and_stop() {
+    use puppy_proto::{Envelope, ErrorCode, MsgReader, Reply, ReplyData, Request, ServerMsg};
+    use tokio::io::BufReader;
+    let env = Env::new();
+    let path = match &env.socket {
+        puppy_daemon::SocketName::Path(p) => p.clone(),
+        _ => unreachable!(),
+    };
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let sock = path.clone();
+    let fake = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut rd = MsgReader::new(BufReader::new(rd));
+            while let Ok(Some(msg)) = rd.next::<Envelope<Request>>().await {
+                let result = match msg.body {
+                    Request::Hello { .. } => Reply::Err {
+                        code: ErrorCode::ProtocolMismatch,
+                        message: "protocol mismatch".into(),
+                    },
+                    Request::Shutdown => Reply::Ok {
+                        data: ReplyData::Done,
+                    },
+                    _ => continue,
+                };
+                let stop = matches!(result, Reply::Ok { .. });
+                let reply = ServerMsg::Response {
+                    req_id: msg.req_id,
+                    result,
+                };
+                puppy_proto::write_msg(&mut wr, &reply).await.unwrap();
+                if stop {
+                    let _ = std::fs::remove_file(&sock);
+                    return;
+                }
+            }
+        }
+    });
+    let hint = "an incompatible puppy daemon is running \u{2014} run `puppy stop` first";
+    for args in [&["ls"][..], &["status"], &["info", "1"], &["wait", "1"]] {
+        let (status, _, err) = env.run(args);
+        assert_eq!(status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.trim_end().ends_with(hint), "{args:?}: {err}");
+    }
+    let (status, out, err) = env.run(&["stop"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), "stopped");
+    tokio::time::timeout(TIMEOUT, fake).await.unwrap().unwrap();
 }

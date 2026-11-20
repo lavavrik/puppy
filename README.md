@@ -153,16 +153,29 @@ puppy watch                                 # print events as they happen, until
 puppy stop                                  # stop the daemon
 ```
 
-`--json` (anywhere on the line) makes any command print JSON instead: the
-protocol's own types (`ls` prints an array of download snapshots, `info`
-`{"download":…,"detail":…}`, `limit --global` the settings). Commands that act
-on several ids print one result per id, e.g.
-`[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`. `wait`
-prints the final snapshots once done. `watch --json` prints NDJSON: one event
-per line (`snapshot`, `added`, `completed`, `failed`, `removed`,
-`needs_attention`), snapshots included, so `puppy --json watch | jq` works;
-without `--json` it prints lines like `14:02:11 completed 3 a.iso` and leaves
-out snapshots.
+The text formats are for people and may change; scripts should use `--json`
+(anywhere on the line), which prints the protocol's own types as exactly one
+JSON value (`watch` excepted):
+
+- `ls`: an array of download snapshots; `info`: `{"download":…,"detail":…}`;
+  `limit --global`: the settings; `status`: `{"downloads":N,"active":N}`.
+- `add`: `{"added":[{"id","source"}…],"failed":[{"source","error","code"}…]}`;
+  with `--wait` also `"final"` (the snapshots once done) and `"missing"`
+  (ids that no longer exist).
+- `wait`: `{"final":[…snapshots…],"missing":[ids…]}`.
+- `pause`, `resume`, `restart`, `rm`, `move`, `limit <ID>`: one result per id,
+  e.g. `[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`.
+- `stop`: `{"stopped":true}` or `{"running":false}`.
+- `watch --json` prints NDJSON: one event per line (`snapshot`, `added`,
+  `completed`, `failed`, `removed`, `needs_attention`), snapshots included, so
+  `puppy --json watch | jq` works; without `--json` it prints lines like
+  `14:02:11 completed 3 a.iso` and leaves out snapshots.
+
+`ls --state` takes `queued`, `starting`, `active`, `paused`, `completed` (or
+`done`), `failed` (for good), `retrying` and `attention`. Piped `ls` output
+(no terminal, no `COLUMNS`) never truncates names. `add -` reads UTF-8 or
+UTF-16 (with a BOM) from stdin. If an incompatible puppy daemon (another
+version) is running, commands say so; `puppy stop` stops it.
 
 `wait` treats a transient failure (e.g. the server answering 503) as not yet
 ended, since puppy retries it on its own: it keeps waiting and shows

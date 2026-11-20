@@ -51,8 +51,26 @@ pub enum CliError {
     Other(#[from] anyhow::Error),
 }
 
+/// Whether `e` says the daemon speaks another protocol version.
+pub fn is_mismatch(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Daemon {
+            code: puppy_proto::ErrorCode::ProtocolMismatch,
+            ..
+        }
+    ) || matches!(e, ClientError::Protocol(m) if m.starts_with("unexpected hello reply"))
+}
+
+/// What to do about an incompatible daemon.
+const MISMATCH_HINT: &str =
+    "an incompatible puppy daemon is running \u{2014} run `puppy stop` first";
+
 impl From<ClientError> for CliError {
     fn from(e: ClientError) -> Self {
+        if is_mismatch(&e) {
+            return CliError::Other(anyhow::anyhow!("{e}; {MISMATCH_HINT}"));
+        }
         CliError::Other(e.into())
     }
 }

@@ -1,7 +1,7 @@
 //! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files or stdin.
 
 use super::output::{err, json, out};
-use super::wait::{collect, finish, interruptible, until_done};
+use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
 use puppy_core::types::{AddRequest, DownloadId, RequestContext};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
@@ -31,6 +31,50 @@ struct Added {
     source: String,
 }
 
+/// A source that could not be added (`code` is the exit code it contributes).
+#[derive(Serialize)]
+struct Failed {
+    source: String,
+    error: String,
+    code: u8,
+}
+
+/// `puppy --json add`: the one JSON value, with `final`/`missing` after `--wait`.
+#[derive(Serialize)]
+struct AddJson<'a> {
+    added: &'a [Added],
+    failed: &'a [Failed],
+    #[serde(flatten)]
+    waited: Option<&'a Waited>,
+}
+
+/// Decodes stdin text: strips a UTF-8 BOM, decodes UTF-16 (LE or BE) after its BOM,
+/// else UTF-8 (invalid bytes replaced).
+fn decode_stdin(bytes: &[u8]) -> Result<String, CliError> {
+    let utf16 = |rest: &[u8], le: bool| -> Result<String, CliError> {
+        let bad = || CliError::Usage("stdin is not valid UTF-16".into());
+        if !rest.len().is_multiple_of(2) {
+            return Err(bad());
+        }
+        let units = rest.as_chunks::<2>().0.iter().map(|c| {
+            if le {
+                u16::from_le_bytes(*c)
+            } else {
+                u16::from_be_bytes(*c)
+            }
+        });
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|_| bad())
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => Ok(String::from_utf8_lossy(rest).into_owned()),
+        _ => Ok(String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
 /// Splits `Name: value` at the first `:`.
 fn parse_header(h: &str) -> Result<(String, String), CliError> {
     match h.split_once(':') {
@@ -54,39 +98,56 @@ fn expand_sources(sources: Vec<String>) -> Result<Vec<String>, CliError> {
         std::io::stdin()
             .read_to_end(&mut text)
             .map_err(|e| anyhow::anyhow!("cannot read stdin: {e}"))?;
-        for line in String::from_utf8_lossy(&text).lines() {
+        for line in decode_stdin(&text)?.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
                 all.push(line.to_string());
             }
         }
     }
+    if all.is_empty() {
+        return Err(CliError::Usage("no sources on stdin".into()));
+    }
     Ok(all)
 }
 
-/// What `add` did: the ids it added, and its exit code (1 if some sources could not be
-/// added; they were reported on stderr).
-#[derive(Debug)]
+/// What `add` did, and its exit code (1 if some sources could not be added; they were
+/// reported on stderr).
 pub struct AddOutcome {
-    pub ids: Vec<DownloadId>,
+    added: Vec<Added>,
+    failed: Vec<Failed>,
     pub code: u8,
 }
 
-/// `add`, then with `wait` waits for the added downloads; the worst code wins.
+/// `add`, then with `wait` waits for the added downloads; the worst code wins. With
+/// `--json` prints one value: `{"added":…,"failed":…}` plus `"final"`/`"missing"` after
+/// a wait.
 pub async fn run(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<(), CliError> {
     if wait && args.paused {
         return Err(CliError::Usage(
             "--wait and --paused do not go together: a paused download never ends".into(),
         ));
     }
-    let added = add(ctx, args).await?;
-    let mut codes = vec![added.code];
-    if wait && !added.ids.is_empty() {
-        let mut client = ctx.client().await?;
-        collect(
-            &mut codes,
-            interruptible(until_done(ctx, &mut client, &added.ids)).await,
-        );
+    let outcome = add(ctx, args).await?;
+    let mut codes = vec![outcome.code];
+    let mut waited = None;
+    if wait {
+        waited = Some(Waited::default());
+        if !outcome.added.is_empty() {
+            let ids: Vec<DownloadId> = outcome.added.iter().map(|a| a.id).collect();
+            let r = match ctx.client().await {
+                Ok(mut client) => interruptible(until_done(ctx, &mut client, &ids)).await,
+                Err(e) => Err(e),
+            };
+            waited = absorb(&mut codes, r).or(waited);
+        }
+    }
+    if ctx.json {
+        json(&AddJson {
+            added: &outcome.added,
+            failed: &outcome.failed,
+            waited: waited.as_ref(),
+        });
     }
     finish(&codes)
 }
@@ -129,14 +190,18 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
     };
 
     // Parse everything first: usage-level problems should not leave a half-done add.
-    let mut failures = 0usize;
+    let mut failed = Vec::new();
     let mut parsed = Vec::new();
     for s in &sources {
         match parse_source(s) {
             Ok(source) => parsed.push((unquote(s).to_string(), source)),
             Err(e) => {
                 err(format_args!("puppy: {s}: {e}"));
-                failures += 1;
+                failed.push(Failed {
+                    source: s.clone(),
+                    error: e.to_string(),
+                    code: 1,
+                });
             }
         }
     }
@@ -163,24 +228,45 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                 }
                 Err(e) => {
                     err(format_args!("puppy: {shown}: {e}"));
-                    failures += 1;
+                    failed.push(Failed {
+                        source: shown,
+                        error: e.to_string(),
+                        code: 1,
+                    });
                 }
             }
         }
     }
-    if ctx.json {
-        json(&added);
-    }
     let mut code = 0;
-    if failures > 0 {
-        let total = added.len() + failures;
+    if !failed.is_empty() {
+        let total = added.len() + failed.len();
         err(format_args!(
-            "puppy: {failures} of {total} sources could not be added"
+            "puppy: {} of {total} sources could not be added",
+            failed.len()
         ));
         code = 1;
     }
     Ok(AddOutcome {
-        ids: added.into_iter().map(|a| a.id).collect(),
+        added,
+        failed,
         code,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_encodings() {
+        assert_eq!(decode_stdin(b"a\nb").unwrap(), "a\nb");
+        assert_eq!(decode_stdin(b"\xEF\xBB\xBFa").unwrap(), "a");
+        assert_eq!(
+            decode_stdin(&[0xFF, 0xFE, b'a', 0, b'\n', 0]).unwrap(),
+            "a\n"
+        );
+        assert_eq!(decode_stdin(&[0xFE, 0xFF, 0, b'a']).unwrap(), "a");
+        assert!(decode_stdin(&[0xFF, 0xFE, 0x41]).is_err());
+        assert!(decode_stdin(&[0xFF, 0xFE, 0x00, 0xD8]).is_err());
+    }
 }

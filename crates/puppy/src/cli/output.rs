@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthStr;
 
 /// Width of the gap between table columns.
 const GAP: usize = 2;
-/// Terminal width assumed when it cannot be found (output is piped).
-const DEFAULT_WIDTH: usize = 100;
+/// A flexible column is never squeezed below this many columns.
+const MIN_FLEX: usize = 12;
 
 /// Whether a write failed because the reader went away.
 fn is_closed_pipe(e: &std::io::Error) -> bool {
@@ -68,22 +68,23 @@ pub enum ColWidth {
     Flex,
 }
 
-/// Terminal width: `COLUMNS`, else the terminal's when stdout is one, else 100.
-fn terminal_width() -> usize {
+/// Terminal width: `COLUMNS`, else the terminal's when stdout is one, else `None`
+/// (piped: nothing is truncated).
+fn terminal_width() -> Option<usize> {
     if let Some(n) = std::env::var("COLUMNS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
     {
-        return n;
+        return Some(n);
     }
     if std::io::stdout().is_terminal()
         && let Ok((cols, _)) = crossterm::terminal::size()
         && cols > 0
     {
-        return cols as usize;
+        return Some(cols as usize);
     }
-    DEFAULT_WIDTH
+    None
 }
 
 /// Prints a table (header line, then rows) with columns aligned by display width.
@@ -103,13 +104,13 @@ fn cell(text: &str, width: usize, pad: bool) -> String {
     s
 }
 
-/// The table's lines for a terminal `term_width` columns wide. Trailing spaces are
-/// trimmed.
+/// The table's lines for a terminal `term_width` columns wide (`None`: unbounded, flex
+/// columns fit their widest cell). Trailing spaces are trimmed.
 pub fn render_table(
     headers: &[&str],
     rows: &[Vec<String>],
     widths: &[ColWidth],
-    term_width: usize,
+    term_width: Option<usize>,
 ) -> Vec<String> {
     let n = headers.len().min(widths.len());
     let fixed: usize = widths[..n]
@@ -120,8 +121,20 @@ pub fn render_table(
         })
         .sum();
     let flex_cols = widths[..n].iter().filter(|w| **w == ColWidth::Flex).count();
-    let left = term_width.saturating_sub(fixed + GAP * n.saturating_sub(1));
-    let flex = left.checked_div(flex_cols).unwrap_or(0).max(1);
+    let flex = match term_width {
+        Some(w) => {
+            let left = w.saturating_sub(fixed + GAP * n.saturating_sub(1));
+            left.checked_div(flex_cols).unwrap_or(0).max(MIN_FLEX)
+        }
+        None => headers
+            .iter()
+            .copied()
+            .chain(rows.iter().flatten().map(String::as_str))
+            .map(|c| display_safe(c).width())
+            .max()
+            .unwrap_or(0)
+            .max(MIN_FLEX),
+    };
     let widths: Vec<usize> = widths[..n]
         .iter()
         .map(|w| match w {
@@ -161,7 +174,7 @@ mod tests {
             &["ID", "NAME", "X"],
             &rows(&[&["1", "日本語ファイル名.iso", "a"], &["22", "plain", "b"]]),
             &[ColWidth::Fixed(3), ColWidth::Fixed(10), ColWidth::Fixed(1)],
-            100,
+            Some(100),
         );
         assert_eq!(lines[0], "ID   NAME        X");
         // Wide chars count two columns: 4 of them and the ellipsis fill 9 of the 10.
@@ -178,9 +191,29 @@ mod tests {
             &["A", "B"],
             &rows(&[&["x", "0123456789abcdef"]]),
             &[ColWidth::Fixed(3), ColWidth::Flex],
-            12,
+            Some(22),
         );
-        // 12 - 3 - 2 gap = 7 for the flex column.
-        assert_eq!(lines[1], "x    012345…");
+        // 22 - 3 - 2 gap = 17 for the flex column.
+        assert_eq!(lines[1], "x    0123456789abcdef");
+        // Squeezed: the flex column keeps at least MIN_FLEX.
+        let lines = render_table(
+            &["A", "B"],
+            &rows(&[&["x", "0123456789abcdef"]]),
+            &[ColWidth::Fixed(3), ColWidth::Flex],
+            Some(12),
+        );
+        assert_eq!(lines[1], "x    0123456789a…");
+    }
+
+    #[test]
+    fn unbounded_width_never_truncates() {
+        let long = "n".repeat(150);
+        let lines = render_table(
+            &["A", "B"],
+            &rows(&[&["x", &long]]),
+            &[ColWidth::Fixed(3), ColWidth::Flex],
+            None,
+        );
+        assert_eq!(lines[1], format!("x    {long}"));
     }
 }
