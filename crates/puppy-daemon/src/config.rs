@@ -118,8 +118,15 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// `Config::default` reads the environment (the Downloads folder), which other
+    /// tests change.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn config_missing_is_default() {
+        let _env = env_lock();
         let d = tempfile::tempdir().unwrap();
         let c = Config::load(&d.path().join("nope.toml")).unwrap();
         assert_eq!(c, Config::default());
@@ -127,6 +134,7 @@ mod tests {
 
     #[test]
     fn config_partial_fills_defaults() {
+        let _env = env_lock();
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("c.toml");
         std::fs::write(&p, "max_active = 5\n").unwrap();
@@ -138,6 +146,7 @@ mod tests {
 
     #[test]
     fn config_invalid_reports_error() {
+        let _env = env_lock();
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("c.toml");
         std::fs::write(&p, "theme = \"dark\"\nmax_active = [oops\n").unwrap();
@@ -151,6 +160,7 @@ mod tests {
 
     #[test]
     fn http_config_maps_fields() {
+        let _env = env_lock();
         let c = Config {
             connections: 4,
             proxy: Some("http://127.0.0.1:3128".parse().unwrap()),

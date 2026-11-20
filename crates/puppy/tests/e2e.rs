@@ -193,6 +193,17 @@ impl Env {
 impl Drop for Env {
     /// Never leaks a daemon: asks it to shut down, then kills it if it still holds
     /// the lock. A stale pid file (no lock holder) is never acted on.
+    ///
+    /// Known windows (time-of-check to time-of-use), acceptable for a test guard:
+    /// - Between `live_daemon_pid` seeing the lock held and `kill`, the daemon may exit
+    ///   and its pid be reused by an unrelated process, which would then be killed. The
+    ///   daemon only gets here after ignoring a shutdown for 10 s, so it is hung, not
+    ///   exiting.
+    /// - The pid file is written after the lock is taken and removed before it is
+    ///   released, so a lock holder without a pid file (just starting or stopping) is
+    ///   not killed; one that is hung in that window leaks.
+    /// - A daemon another test process started for the same home could be targeted;
+    ///   homes are per-test tempdirs, so none exists.
     fn drop(&mut self) {
         if self.live_daemon_pid().is_some() {
             let socket = self.socket.clone();
@@ -371,6 +382,50 @@ async fn restart_daemon_resumes_download() {
     assert!(first.done_bytes > 0, "progress restored: {first:?}");
     wait_completed(&c, id).await;
     env.assert_file("a.bin", len);
+}
+
+/// A daemon killed outright mid-transfer: the next client starts a new one, which
+/// resumes the download from its files, and ids keep growing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigkill_mid_transfer_then_respawn_completes() {
+    let env = Env::new();
+    let len = 1024 * KIB;
+    let s = TestServer::start(ServerCfg {
+        len,
+        bytes_per_sec: Some(64 * KIB),
+        ..ServerCfg::default()
+    })
+    .await;
+    let c = env.spawn_client().await.unwrap();
+    let first = c.add(env.paused_req("p.bin"), true, None).await.unwrap();
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_state(&c, id, "transferring", |d| {
+        d.state == WireState::Active && d.done_bytes > 0
+    })
+    .await;
+    // Let the debounced state save and a sidecar flush land, as they would in use.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let pid = env.live_daemon_pid().expect("a daemon runs");
+    drop(c);
+    // SAFETY: plain syscall on the daemon this test started (its lock is held).
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + TIMEOUT;
+    while env.lock_held() {
+        assert!(Instant::now() < deadline, "the killed daemon kept its lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    s.set_cfg(|cfg| cfg.bytes_per_sec = None);
+    let c = env.spawn_client().await.unwrap();
+    assert_ne!(env.live_daemon_pid(), Some(pid));
+    wait_completed(&c, id).await;
+    env.assert_file("a.bin", len);
+    let next = c.add(env.paused_req("q.bin"), true, None).await.unwrap();
+    assert!(
+        next > id && next > first,
+        "id {next} reused (had {first}, {id})"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

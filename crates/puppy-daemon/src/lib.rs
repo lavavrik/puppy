@@ -13,3 +13,8 @@ pub use config::{Config, ConfigError};
 pub use manager::{Manager, ManagerError};
 pub use paths::{Paths, SocketName};
 pub use store::{PersistedState, RuntimeSettings, Store, StoreError, StoredDownload, StoredState};
+
+/// Serializes unit tests that read or change the process environment (paths, config
+/// defaults).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

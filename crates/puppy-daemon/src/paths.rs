@@ -196,9 +196,7 @@ fn create_private_dir(p: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::ENV_LOCK;
 
     /// Run `f` with the given env vars set/unset, restoring afterwards.
     fn with_env<R>(vars: &[(&str, Option<&Path>)], f: impl FnOnce() -> R) -> R {

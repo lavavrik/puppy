@@ -419,6 +419,26 @@ async fn no_idle_exit_while_downloading() {
     assert_eq!(len, 256 * KIB);
 }
 
+/// A download still being probed (`Starting`) is work: no idle exit meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_idle_exit_while_starting() {
+    let env = Env::new();
+    let s = server(|c| c.stall_headers = true).await;
+    let d = env.start(Some(Duration::from_millis(300))).await;
+    let id = {
+        let mut c = env.client().await;
+        let id = c.add(env.req(&s, "a.bin")).await;
+        assert_eq!(c.get(id).await.0, WireState::Starting);
+        id
+    };
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!d.is_finished(), "exited while a download was starting");
+    let mut c = env.client().await;
+    assert_eq!(c.get(id).await.0, WireState::Starting);
+    drop(c);
+    shutdown(&env, d).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_persists_and_pauses() {
     let env = Env::new();

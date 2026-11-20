@@ -1,9 +1,16 @@
 //! Splits the global download speed limit across download engines.
 
-/// Splits a global download limit across engines in proportion to their active download counts.
-/// Engines with 0 active still get a small share so a newly started download isn't unlimited before the next rebalance.
+/// Splits a global download limit across engines in proportion to their active
+/// download counts. `None` (and `Some(0)`, which the token buckets also treat as
+/// unlimited) gives every engine `None`.
+///
+/// Engines with no active download still get a small share, so a download they start
+/// is not unlimited until the next rebalance. The shares may therefore add up to more
+/// than `global` (each idle engine's share is extra; with nothing active every engine
+/// gets all of it): the total can overshoot until the manager rebalances, which it does
+/// whenever it starts a download and at least once a second.
 pub fn divide(global: Option<u64>, active_per_engine: &[usize]) -> Vec<Option<u64>> {
-    let Some(global) = global else {
+    let Some(global) = global.filter(|&g| g > 0) else {
         return vec![None; active_per_engine.len()];
     };
     let total: u128 = active_per_engine.iter().map(|&a| a as u128).sum();
@@ -34,6 +41,8 @@ mod tests {
     fn unlimited() {
         assert_eq!(divide(None, &[2, 1]), vec![None, None]);
         assert_eq!(divide(None, &[]), Vec::<Option<u64>>::new());
+        // 0 means unlimited, not "1 byte/s".
+        assert_eq!(divide(Some(0), &[2, 0]), vec![None, None]);
     }
 
     #[test]
