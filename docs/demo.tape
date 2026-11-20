@@ -1,8 +1,12 @@
-# Regenerate with: vhs docs/demo.tape   (needs vhs, python3, and `puppy` on PATH)
+# Regenerate with: vhs docs/demo.tape   (needs vhs, python3 and `puppy` on PATH)
 #
-# Serves two large sparse files from a throwaway directory on localhost:8000 and
-# runs the dashboard against an isolated PUPPY_HOME so the recording never touches
-# real downloads.
+# Everything is isolated: PUPPY_HOME (config, data, socket, daemon) and the download
+# directory (set through a throwaway config.toml) live in temp dirs that are deleted at
+# the end. The files come from docs/demo_server.py, a throttled (about 4 MiB/s per
+# connection), range-capable server on a free local port, so there is time to pause and
+# resume. The recording ends by deleting both downloads in the dashboard and quitting;
+# the daemon (started with PUPPY_IDLE_EXIT=1) then idle-exits on its own, and the
+# cleanup waits for that before removing the temp dirs.
 
 Output docs/demo.gif
 
@@ -14,9 +18,10 @@ Set Padding 12
 Set TypingSpeed 60ms
 
 Hide
-Type "export PUPPY_HOME=$(mktemp -d) DEMO=$(mktemp -d) && clear" Enter
-Type "truncate -s 4G $DEMO/ubuntu-24.04-desktop.iso && truncate -s 2G $DEMO/dataset.tar.zst" Enter
-Type "(cd $DEMO && python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &) ; sleep 1; clear" Enter
+Type "export PUPPY_HOME=$(mktemp -d) DEMO=$(mktemp -d) PUPPY_IDLE_EXIT=1" Enter
+Type "mkdir -p $PUPPY_HOME/config && printf 'download_dir = \"%s\"\n' $DEMO/out > $PUPPY_HOME/config/config.toml" Enter
+Type "python3 docs/demo_server.py $DEMO/port ubuntu-24.04-desktop.iso=1G dataset.tar.zst=768M & sleep 1" Enter
+Type "PORT=$(cat $DEMO/port) || { echo 'demo server failed to start'; exit 1; }; clear" Enter
 Show
 
 Type "puppy" Enter
@@ -25,16 +30,16 @@ Sleep 1.5s
 # Add two downloads.
 Type "a"
 Sleep 500ms
-Type "http://127.0.0.1:8000/ubuntu-24.04-desktop.iso"
+Type "http://127.0.0.1:$PORT/ubuntu-24.04-desktop.iso"
 Sleep 500ms
 Enter
 Sleep 1s
 Type "a"
 Sleep 500ms
-Type "http://127.0.0.1:8000/dataset.tar.zst"
+Type "http://127.0.0.1:$PORT/dataset.tar.zst"
 Sleep 500ms
 Enter
-Sleep 2s
+Sleep 3s
 
 # Move around; the detail pane follows the selection.
 Type "j"
@@ -48,13 +53,23 @@ Sleep 2s
 Type "r"
 Sleep 2s
 
-# Help, then quit (the daemon keeps running).
+# Help.
 Type "?"
 Sleep 3s
 Escape
 Sleep 500ms
+
+# Delete both downloads (confirm each), then quit; the daemon idle-exits afterwards.
+Type "d"
+Sleep 800ms
+Enter
+Sleep 1s
+Type "d"
+Sleep 800ms
+Enter
+Sleep 1s
 Type "q"
 Sleep 500ms
 
 Hide
-Type "pkill -f 'http.server 8000'; puppy daemon --idle-exit 1 >/dev/null 2>&1; rm -rf $DEMO" Enter
+Type "sleep 3; kill %1; rm -rf $PUPPY_HOME $DEMO; clear" Enter

@@ -135,15 +135,10 @@ async fn dashboard(theme: Option<ThemeArg>) -> anyhow::Result<()> {
     let config = Config::load(&paths.config_file())?;
     let choice = match theme {
         Some(t) => t.into(),
-        None => match config.theme.as_str() {
-            "auto" => ThemeChoice::Auto,
-            "dark" => ThemeChoice::Dark,
-            "light" => ThemeChoice::Light,
-            other => {
-                eprintln!("puppy: unknown theme {other:?} in config.toml; using \"auto\"");
-                ThemeChoice::Auto
-            }
-        },
+        None => config.theme.parse().unwrap_or_else(|e| {
+            eprintln!("puppy: {e} in config.toml; using \"auto\"");
+            ThemeChoice::Auto
+        }),
     };
     let theme = Theme::detect(choice, &|k| std::env::var(k).ok());
     let exe = std::env::current_exe().context("cannot find the puppy executable")?;

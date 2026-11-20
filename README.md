@@ -29,12 +29,48 @@ In progress: BitTorrent support (.torrent files and magnet links).
 Scriptable subcommands (`puppy add`, `puppy ls`, …) and browser integration
 come later.
 
-## Screenshot
+## Demo
 
-![puppy's dashboard](docs/demo.gif)
+A text render of the dashboard (120x32, dark theme, sample data):
 
-Regenerate with `vhs docs/demo.tape` (needs [vhs](https://github.com/charmbracelet/vhs),
-`python3` and `puppy` on your `PATH`).
+```text
+ puppy                                                                                      daemon v0.1.0   ● connected
+╭ Downloads 7 ──────────────────────────────────────────────────────╮╭ Details ────────────────────────────────────────╮
+│▌ ▶ 1 ubuntu-24.04.3-desktop-amd64.iso   █████████             45% ││ ubuntu-24.04.3-desktop-amd64.iso                │
+│▌     11.4 MiB/s · 0:41 · 461.0 MiB / 1.0 GiB · limit 20.0 MiB/s   ││ /home/me/Downloads                              │
+│  ▶ 2 debian-13.2.0-amd64-DVD-1.iso [T]  █████████             45% ││                                                 │
+│      ↓ 11.4 MiB/s  ↑ 400.0 KiB/s · 0:41 · 461.0 MiB / 1.0 GiB     ││ Downloaded 461.0 MiB / 1.0 GiB (45%)            │
+│  … 3 archlinux-2026.11.01-x86_64.iso    █████                 25% ││ Speed      11.4 MiB/s                           │
+│      queued #1 · 256.0 MiB / 1.0 GiB                              ││ ETA        0:41                                 │
+│  ✓ 4 Big Buck Bunny 4K.mkv              ████████████████████ 100% ││ State      ▶ active                             │
+│      completed · 1.0 GiB                                          ││ Limit      20.0 MiB/s                           │
+│  ↻ 5 big-dataset.tar.zst                █████                 25% ││ Source     https://exa…4.04.3-desktop-amd64.iso │
+│      retry in 1:23 · connection reset by peer                     ││                                                 │
+│  ! 6 photos.zip                         █████                 25% ││ Speed history                   peak 17.0 MiB/s │
+│      remote file changed · R restarts                             ││ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    │
+│  ⏸ 7 notes.pdf                          █████                 25% ││ █▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ │
+│      paused · 256.0 MiB / 1.0 GiB                                 ││ ██████▇████████████▇████████████▇████████████▇█ │
+│                                                                   ││                                                 │
+│                                                                   ││ Segments              2 connections · resumable │
+│                                                                   ││ █████████████████████████████▒░░░░░░░░░░░░░░░░░ │
+│                                                                   ││                                                 │
+│                                                                   ││ conn 1 ███████▌                       3.0 MiB/s │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+│                                                                   ││                                                 │
+╰───────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────╯
+ ↓ 14.0 MiB/s  ↑ 400.0 KiB/s · 2 active · 1 queued · 1 paused · 1 done · 2 failed · limit: none · max 3   ▆▆▇▇█▄▄▅▅▆▆▇▇
+ a add  p pause  d delete  l limit  / filter  ? help  q quit
+```
+
+Animated demo: run `vhs docs/demo.tape` (needs [vhs](https://github.com/charmbracelet/vhs),
+`python3` and `puppy` on your `PATH`). It runs in throwaway directories and writes
+`docs/demo.gif`.
 
 ## Build
 
@@ -64,28 +100,28 @@ the dashboard only disconnects; the daemon and its downloads keep running.
 
 ### Keys
 
-| Key                          | Action                                       |
-|------------------------------|----------------------------------------------|
-| `j` / `↓`, `k` / `↑`         | Move down / up                               |
-| `g` / `Home`, `G` / `End`    | Jump to top / bottom                         |
-| `a`                          | Add a download                               |
-| `p`, `r`                     | Pause, resume                                |
-| `d` / `Delete`              | Delete (asks to confirm)                     |
-| `R`                          | Restart (failed or needs-attention only)     |
-| `l`                          | Speed limit for the selected download        |
-| `L`                          | Global speed limits                          |
-| `+` / `-`                    | Raise / lower the number of active downloads |
-| `Shift+↑` / `Shift+↓` (`K` / `J`) | Move in the queue                       |
-| `/`                          | Filter                                       |
-| `Esc`                        | Close popup / clear filter                   |
-| `?`                          | Help                                         |
-| `q` / `Ctrl+C`               | Quit                                         |
+| Key                               | Action |
+|-----------------------------------|---------------------------------------------|
+| `j` / `↓`, `k` / `↑`              | Move down / up |
+| `g` / `Home`, `G` / `End`         | Jump to top / bottom |
+| `a`                               | Add a download |
+| `p`, `r`                          | Pause, resume |
+| `d` / `Delete`                    | Delete (asks to confirm) |
+| `R`                               | Restart (failed or needs-attention only) |
+| `l`                               | Speed limit for the selected download |
+| `L`                               | Global speed limits |
+| `+` / `-`                         | Raise / lower the number of active downloads |
+| `Shift+↑` / `Shift+↓` (`K` / `J`) | Move in the queue |
+| `/`                               | Filter |
+| `Esc`                             | Close popup / clear filter |
+| `?`                               | Help |
+| `q` / `Ctrl+C`                    | Quit |
 
 The footer shows the keys that apply to the current selection.
 
 ### Configuration
 
-Settings go in `config.toml` in the config directory (below). Keys:
+Settings go in `config.toml` (location above). Keys:
 `download_dir`, `connections` (default 8), `max_active` (default 3),
 `global_down_limit`, `global_up_limit` (bytes per second), `theme`
 (`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and

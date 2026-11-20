@@ -126,6 +126,21 @@ pub enum ThemeChoice {
     Light,
 }
 
+impl std::str::FromStr for ThemeChoice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            other => Err(format!(
+                "unknown theme {other:?} (expected auto, dark or light)"
+            )),
+        }
+    }
+}
+
 /// What a piece of text is; the theme decides how it looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Token {
@@ -327,6 +342,14 @@ mod tests {
     }
 
     const TRUE: (&str, &str) = ("COLORTERM", "truecolor");
+
+    #[test]
+    fn theme_choice_from_str() {
+        assert_eq!("dark".parse(), Ok(ThemeChoice::Dark));
+        assert_eq!(" Light ".parse(), Ok(ThemeChoice::Light));
+        assert_eq!("auto".parse(), Ok(ThemeChoice::Auto));
+        assert!("neon".parse::<ThemeChoice>().is_err());
+    }
 
     #[test]
     fn palettes_are_exact() {
