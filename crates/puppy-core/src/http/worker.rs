@@ -104,6 +104,33 @@ pub enum WorkerExit {
     Exhausted(String),
 }
 
+/// While a rate limit applies, body chunks are taken (limiter tokens acquired and the
+/// bytes written) in slices of at most this size, so a low limit gives smooth progress
+/// instead of a long wait followed by a whole network chunk at once.
+pub(crate) const LIMITED_SLICE: usize = 16 * 1024;
+
+impl WorkerCtx {
+    /// How many bytes of a `len`-byte chunk to take at once.
+    pub(crate) fn slice_len(&self, len: usize) -> usize {
+        if self.limiters.iter().any(TokenBucket::is_limited) {
+            len.min(LIMITED_SLICE)
+        } else {
+            len
+        }
+    }
+
+    /// Waits for `n` bytes' worth of tokens from both limiters; `false` if cancelled.
+    pub(crate) async fn acquire(&self, n: u64) -> bool {
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = async {
+                self.limiters[0].acquire(n).await;
+                self.limiters[1].acquire(n).await;
+            } => true,
+        }
+    }
+}
+
 /// Statuses with which an (expired) signed URL typically refuses a request.
 pub(crate) fn is_url_rejected(status: u16) -> bool {
     matches!(status, 401 | 403 | 404 | 410)
@@ -320,46 +347,47 @@ async fn attempt_once(
                 };
             }
         };
-        let cursor = start + seg.done.load(Ordering::Acquire);
-        let want = (chunk.len() as u64).min(seg.end().saturating_sub(cursor));
-        if want == 0 {
-            return Attempt::Exit(WorkerExit::Done);
-        }
-        tokio::select! {
-            _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-            _ = async {
-                ctx.limiters[0].acquire(want).await;
-                ctx.limiters[1].acquire(want).await;
-            } => {}
-        }
-        // Claim under the lock: `end` may have shrunk while waiting for the limiters.
-        let n = {
-            let mut b = seg.lock();
-            let n = (chunk.len() as u64).min(b.end.saturating_sub(cursor));
-            if n > 0 {
-                b.claimed = cursor + n;
+        let mut off = 0;
+        while off < chunk.len() {
+            let len = ctx.slice_len(chunk.len() - off);
+            let cursor = start + seg.done.load(Ordering::Acquire);
+            let want = (len as u64).min(seg.end().saturating_sub(cursor));
+            if want == 0 {
+                return Attempt::Exit(WorkerExit::Done);
             }
-            n
-        };
-        if n == 0 {
-            return Attempt::Exit(WorkerExit::Done);
-        }
-        let buf = chunk.slice(..n as usize);
-        let file = ctx.file.clone();
-        let written = tokio::task::spawn_blocking(move || write_at(&file, &buf, cursor)).await;
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
-            Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
-        }
-        progress = true;
-        seg.done.fetch_add(n, Ordering::Release);
-        debug_assert!(start + seg.done.load(Ordering::Acquire) <= seg.lock().end);
-        let now = Instant::now();
-        meter.record(n, now);
-        seg.bps.store(meter.bps(now), Ordering::Relaxed);
-        if cursor + n >= seg.end() {
-            return Attempt::Exit(WorkerExit::Done);
+            if !ctx.acquire(want).await {
+                return Attempt::Exit(WorkerExit::Cancelled);
+            }
+            // Claim under the lock: `end` may have shrunk while waiting for the limiters.
+            let n = {
+                let mut b = seg.lock();
+                let n = (len as u64).min(b.end.saturating_sub(cursor));
+                if n > 0 {
+                    b.claimed = cursor + n;
+                }
+                n
+            };
+            if n == 0 {
+                return Attempt::Exit(WorkerExit::Done);
+            }
+            let buf = chunk.slice(off..off + n as usize);
+            let file = ctx.file.clone();
+            let written = tokio::task::spawn_blocking(move || write_at(&file, &buf, cursor)).await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
+                Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
+            }
+            progress = true;
+            seg.done.fetch_add(n, Ordering::Release);
+            debug_assert!(start + seg.done.load(Ordering::Acquire) <= seg.lock().end);
+            let now = Instant::now();
+            meter.record(n, now);
+            seg.bps.store(meter.bps(now), Ordering::Relaxed);
+            if cursor + n >= seg.end() {
+                return Attempt::Exit(WorkerExit::Done);
+            }
+            off += n as usize;
         }
     }
 }

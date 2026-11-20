@@ -688,3 +688,60 @@ async fn probe_errors_are_classified() {
     let e = probe("/missing").await.err().expect("probe fails");
     assert!(!e.is_transient(), "{e}");
 }
+
+/// Progress under a low limit, sampled once per second for 4 s after the first byte.
+async fn progress_per_second(f: impl FnOnce(&mut ServerCfg)) -> Vec<u64> {
+    let s = server(f).await;
+    let dir = tempfile::tempdir().unwrap();
+    let c = cfg(dir.path());
+    let (dl, _) = HttpDownload::start_fresh(
+        1,
+        request(&s, dir.path()),
+        AddOptions {
+            limit: Some(32 * KIB),
+            ..AddOptions::default()
+        },
+        build_client(&c).unwrap(),
+        c,
+        TokenBucket::new(None),
+        broadcast::channel(256).0,
+    )
+    .await
+    .unwrap();
+    let mut last = wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT)
+        .await
+        .done_bytes;
+    let mut deltas = Vec::new();
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let done = dl.status().done_bytes;
+        deltas.push(done - last);
+        last = done;
+    }
+    dl.cancel(true).await;
+    deltas
+}
+
+/// A low limit gives smooth progress (every second about the limit's worth), not
+/// stalls followed by bursts of whole network chunks.
+#[tokio::test]
+async fn low_limit_progresses_smoothly() {
+    for (what, deltas) in [
+        ("segmented", progress_per_second(|c| c.len = 4 * MIB).await),
+        (
+            "single stream",
+            progress_per_second(|c| {
+                c.len = 4 * MIB;
+                c.ranges = false;
+            })
+            .await,
+        ),
+    ] {
+        for d in &deltas {
+            assert!(
+                (16 * KIB..=64 * KIB).contains(d),
+                "{what}: per-second progress {deltas:?}"
+            );
+        }
+    }
+}

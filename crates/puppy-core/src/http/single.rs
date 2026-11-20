@@ -121,30 +121,33 @@ async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMet
             continue;
         }
         let cursor = seg.done.load(Ordering::Acquire);
-        let n = chunk.len() as u64;
-        let next = cursor.saturating_add(n);
-        if next > seg.end() {
+        if cursor.saturating_add(chunk.len() as u64) > seg.end() {
             // Longer than announced: the file is not what was probed.
             return Attempt::Exit(WorkerExit::RemoteChanged);
         }
-        tokio::select! {
-            _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-            _ = async {
-                ctx.limiters[0].acquire(n).await;
-                ctx.limiters[1].acquire(n).await;
-            } => {}
+        let mut off = 0;
+        while off < chunk.len() {
+            let len = ctx.slice_len(chunk.len() - off);
+            let cursor = seg.done.load(Ordering::Acquire);
+            let n = len as u64;
+            let next = cursor + n;
+            if !ctx.acquire(n).await {
+                return Attempt::Exit(WorkerExit::Cancelled);
+            }
+            seg.bounds.lock().unwrap_or_else(|e| e.into_inner()).claimed = next;
+            let buf = chunk.slice(off..off + len);
+            let file = ctx.file.clone();
+            let written = tokio::task::spawn_blocking(move || write_at(&file, &buf, cursor)).await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
+                Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
+            }
+            seg.done.store(next, Ordering::Release);
+            let now = Instant::now();
+            meter.record(n, now);
+            seg.bps.store(meter.bps(now), Ordering::Relaxed);
+            off += len;
         }
-        seg.bounds.lock().unwrap_or_else(|e| e.into_inner()).claimed = next;
-        let file = ctx.file.clone();
-        let written = tokio::task::spawn_blocking(move || write_at(&file, &chunk, cursor)).await;
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
-            Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
-        }
-        seg.done.store(next, Ordering::Release);
-        let now = Instant::now();
-        meter.record(n, now);
-        seg.bps.store(meter.bps(now), Ordering::Relaxed);
     }
 }

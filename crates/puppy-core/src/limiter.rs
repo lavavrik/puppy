@@ -56,6 +56,11 @@ impl TokenBucket {
         self.0.changed.notify_waiters();
     }
 
+    /// Whether a rate is set.
+    pub fn is_limited(&self) -> bool {
+        self.0.state.lock().unwrap().rate.is_some()
+    }
+
     pub async fn acquire(&self, n: u64) {
         loop {
             let notified = self.0.changed.notified();
