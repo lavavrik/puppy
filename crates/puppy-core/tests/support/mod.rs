@@ -62,7 +62,11 @@ struct Shared {
     fail_used: AtomicBool,
     get_503_used: AtomicBool,
     requests: Mutex<Vec<HeaderMap>>,
+    /// Request paths, in order.
+    paths: Mutex<Vec<String>>,
     range_requests: Mutex<usize>,
+    /// The only valid `/signed/<n>` (see `/expiring`).
+    signed: AtomicU32,
 }
 
 pub struct TestServer {
@@ -85,7 +89,9 @@ impl TestServer {
             fail_used: AtomicBool::new(false),
             get_503_used: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
+            paths: Mutex::new(Vec::new()),
             range_requests: Mutex::new(0),
+            signed: AtomicU32::new(0),
         });
         let app = Router::new().fallback(handle).with_state(shared.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -115,6 +121,17 @@ impl TestServer {
         f(&mut self.shared.cfg.lock().unwrap());
         self.shared.fail_used.store(false, Ordering::SeqCst);
         self.shared.get_503_used.store(false, Ordering::SeqCst);
+    }
+
+    /// Expires the current `/signed/<n>` URL: `/expiring` now redirects to `<n + 1>` and
+    /// the old one answers 403.
+    pub fn rotate_signed(&self) {
+        self.shared.signed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Paths of every request received, in order.
+    pub fn paths_seen(&self) -> Vec<String> {
+        self.shared.paths.lock().unwrap().clone()
     }
 
     /// Headers of every request received, in order.
@@ -170,7 +187,22 @@ fn parse_range(v: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
 async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     sh.requests.lock().unwrap().push(req.headers().clone());
     let path = req.uri().path().to_string();
-    if path == "/redirect" {
+    sh.paths.lock().unwrap().push(path.clone());
+    // A signed, expiring CDN URL: `/expiring` redirects to the current `/signed/<n>`;
+    // older ones are forbidden. Otherwise served like `/file.bin`.
+    if path == "/expiring" {
+        let n = sh.signed.load(Ordering::SeqCst);
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, format!("/signed/{n}"))
+            .body(Body::empty())
+            .unwrap();
+    }
+    if let Some(n) = path.strip_prefix("/signed/") {
+        if n.parse::<u32>().ok() != Some(sh.signed.load(Ordering::SeqCst)) {
+            return plain(StatusCode::FORBIDDEN);
+        }
+    } else if path == "/redirect" {
         return Response::builder()
             .status(StatusCode::FOUND)
             .header(header::LOCATION, "/file.bin")
@@ -180,7 +212,7 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     if path == "/status/503" {
         return plain(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if path != "/file.bin" {
+    if path != "/file.bin" && !path.starts_with("/signed/") {
         return plain(StatusCode::NOT_FOUND);
     }
     let cfg = sh.cfg.lock().unwrap().clone();

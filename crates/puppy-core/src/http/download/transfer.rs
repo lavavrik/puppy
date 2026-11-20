@@ -21,6 +21,7 @@ enum Outcome {
     Stopped,
     RemoteChanged,
     RangeUnsupported,
+    UrlRejected(u16),
     Fatal(String),
 }
 
@@ -33,6 +34,9 @@ pub(super) fn spawn_run(inner: &Arc<Inner>) -> RunHandle {
 /// One run of the download: transfers until complete, stopped or failed. Shared by fresh
 /// starts and resumes.
 async fn run(inner: Arc<Inner>, cancel: CancellationToken) -> RunEnd {
+    // Progress when the URL was last re-resolved: a fresh URL that is refused again
+    // before any progress is not re-resolved again.
+    let mut reresolved_at: Option<u64> = None;
     loop {
         let next = match transfer(&inner, &cancel).await {
             Outcome::Stopped => return RunEnd::Stopped,
@@ -50,6 +54,31 @@ async fn run(inner: Arc<Inner>, cancel: CancellationToken) -> RunEnd {
                 reason: AttentionReason::RemoteChanged,
             },
             Outcome::Fatal(reason) => DownloadState::Failed { reason },
+            Outcome::UrlRejected(status) => {
+                let done = inner.lock().plan.done_bytes();
+                if reresolved_at.is_some_and(|at| done <= at) {
+                    DownloadState::Failed {
+                        reason: format!("HTTP {status}"),
+                    }
+                } else {
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => return RunEnd::Stopped,
+                        r = inner.reresolve() => r,
+                    };
+                    match result {
+                        Ok(true) => {
+                            reresolved_at = Some(done);
+                            continue;
+                        }
+                        Ok(false) => DownloadState::NeedsAttention {
+                            reason: AttentionReason::RemoteChanged,
+                        },
+                        Err(e) => DownloadState::Failed {
+                            reason: format!("HTTP {status}; re-resolving the URL failed: {e}"),
+                        },
+                    }
+                }
+            }
             Outcome::RangeUnsupported if inner.lock().plan.fell_back => DownloadState::Failed {
                 reason: "server does not honour range requests".into(),
             },
@@ -183,6 +212,7 @@ async fn drive(
                     WorkerExit::Cancelled => return Outcome::Stopped,
                     WorkerExit::RemoteChanged => return Outcome::RemoteChanged,
                     WorkerExit::RangeUnsupported => return Outcome::RangeUnsupported,
+                    WorkerExit::UrlRejected(s) => return Outcome::UrlRejected(s),
                     WorkerExit::Fatal(reason) => return Outcome::Fatal(reason),
                 }
             }
@@ -209,7 +239,7 @@ impl Inner {
         };
         WorkerCtx {
             client: self.client.clone(),
-            url: r.final_url.clone(),
+            url: self.lock().final_url.clone(),
             context: self.request.context.clone(),
             if_range,
             expected_total: r.total,

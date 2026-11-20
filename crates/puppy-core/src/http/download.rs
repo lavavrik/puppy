@@ -10,12 +10,13 @@
 use crate::config::HttpConfig;
 use crate::engine::{AddOptions, Added, EngineError, EngineEvent};
 use crate::http::probe::RemoteInfo;
+use crate::http::probe::probe;
 use crate::http::resume::{
     HttpResumeState, VERSION, context_hash, part_path, sidecar_path, without_context,
 };
 use crate::http::segments::{Segment, plan_segments};
 use crate::http::validate::{Validation, validate_remote};
-use crate::http::worker::SegmentShared;
+use crate::http::worker::{SegmentShared, is_url_rejected};
 use crate::limiter::TokenBucket;
 use crate::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
@@ -53,6 +54,7 @@ struct Inner {
     global: TokenBucket,
     limit: TokenBucket,
     events: broadcast::Sender<EngineEvent>,
+    /// Facts from the probe; `final_url` is only the initial value of `Shared::final_url`.
     remote: RemoteInfo,
     final_path: PathBuf,
     name: String,
@@ -68,6 +70,8 @@ struct Inner {
 struct Shared {
     state: DownloadState,
     plan: Plan,
+    /// Where segment requests go; replaced when an expired redirect target is re-resolved.
+    final_url: url::Url,
 }
 
 struct Plan {
@@ -209,6 +213,7 @@ impl Env {
             path: final_path.clone(),
             total_bytes: remote.total,
         };
+        let final_url = remote.final_url.clone();
         let inner = Arc::new(Inner {
             id: self.id,
             request,
@@ -224,6 +229,7 @@ impl Env {
             st: Mutex::new(Shared {
                 state: DownloadState::Starting,
                 plan,
+                final_url,
             }),
             bps: AtomicU64::new(0),
             control: tokio::sync::Mutex::new(Control::default()),
@@ -273,7 +279,7 @@ impl HttpDownload {
         let (inner, added) = env.build(req, remote, final_path, plan);
         if start_paused {
             // Recorded so a restart can restore it, although nothing was transferred.
-            if let Err(e) = inner.write_initial_sidecar().await {
+            if let Err(e) = inner.write_sidecar().await {
                 inner.set_state(DownloadState::Failed {
                     reason: e.to_string(),
                 });
@@ -451,7 +457,7 @@ impl Inner {
         let state = self.resume_state();
         let part = part_path(&self.final_path);
         let result = tokio::select! {
-            r = validate_remote(&self.client, &self.request.context, &state, &part, &self.cfg) => r,
+            r = self.validate_or_reresolve(&state, &part) => r,
             Ok(()) = interrupt.changed() => {
                 self.set_state(DownloadState::Paused);
                 return Ok(false);
@@ -476,6 +482,63 @@ impl Inner {
         }
     }
 
+    async fn validate_or_reresolve(
+        &self,
+        state: &HttpResumeState,
+        part: &Path,
+    ) -> Result<Validation, EngineError> {
+        let ctx = &self.request.context;
+        match validate_remote(&self.client, ctx, state, part, &self.cfg).await {
+            Err(EngineError::Http { status }) if is_url_rejected(status) => {
+                Ok(match self.reresolve().await? {
+                    true => Validation::Ok,
+                    false => Validation::Changed,
+                })
+            }
+            r => r,
+        }
+    }
+
+    /// The final URL refused a request (401/403/404/410), as an expired signed redirect
+    /// target does. Probes the original source again and adopts its new final URL, in
+    /// memory and in the sidecar, if it serves the same file: same total and the same
+    /// strong ETag, or (no strong ETag) the bytes already downloaded check out.
+    /// `Ok(false)`: the source now serves a different file. `Err`: the probe failed.
+    async fn reresolve(&self) -> Result<bool, EngineError> {
+        let Source::Http { url } = &self.request.source else {
+            return Ok(false);
+        };
+        let read_timeout = Duration::from_millis(self.cfg.read_timeout_ms);
+        let info = probe(&self.client, url, &self.request.context, read_timeout).await?;
+        let r = &self.remote;
+        if info.total != r.total {
+            return Ok(false);
+        }
+        if r.etag_strong {
+            if !(info.etag_strong && info.etag == r.etag) {
+                return Ok(false);
+            }
+        } else if !self.lock().plan.single {
+            // No strong validator: compare the downloaded bytes against the new URL. (A
+            // single stream restarts from zero and checks its length, reusing nothing.)
+            let mut state = self.resume_state();
+            state.final_url = info.final_url.clone();
+            let part = part_path(&self.final_path);
+            let ctx = &self.request.context;
+            if validate_remote(&self.client, ctx, &state, &part, &self.cfg).await? != Validation::Ok
+            {
+                return Ok(false);
+            }
+        }
+        tracing::info!(id = self.id, url = %info.final_url, "re-resolved the download URL");
+        self.lock().final_url = info.final_url;
+        if let Err(e) = self.write_sidecar().await {
+            // The old sidecar only makes a restore re-resolve again.
+            tracing::warn!(id = self.id, "resume sidecar flush failed: {e}");
+        }
+        Ok(true)
+    }
+
     fn task_failed(&self, e: tokio::task::JoinError) {
         self.set_state(DownloadState::Failed {
             reason: format!("download task failed: {e}"),
@@ -494,17 +557,17 @@ impl Inner {
     }
 
     fn resume_state(&self) -> HttpResumeState {
-        let (segments, single_stream) = {
+        let (segments, single_stream, final_url) = {
             let st = self.lock();
             let segs = st.plan.segments.iter().map(SegEntry::snapshot).collect();
-            (segs, st.plan.single)
+            (segs, st.plan.single, st.final_url.clone())
         };
         let r = &self.remote;
         HttpResumeState {
             version: VERSION,
             request: without_context(&self.request),
             context_hash: context_hash(&self.request.context),
-            final_url: r.final_url.clone(),
+            final_url,
             total: r.total,
             etag: r.etag.clone(),
             etag_strong: r.etag_strong,
@@ -515,8 +578,8 @@ impl Inner {
         }
     }
 
-    /// Writes the first sidecar of a download that has not transferred anything.
-    async fn write_initial_sidecar(&self) -> Result<(), EngineError> {
+    /// Writes the sidecar while no transfer is running.
+    async fn write_sidecar(&self) -> Result<(), EngineError> {
         let final_path = self.final_path.clone();
         let file = blocking(move || open_part(&final_path)).await?;
         let result = self.resume_state().flush(&file).await;

@@ -96,7 +96,14 @@ pub enum WorkerExit {
     Cancelled,
     RemoteChanged,
     RangeUnsupported,
+    /// The URL answered 401/403/404/410: possibly an expired signed redirect target.
+    UrlRejected(u16),
     Fatal(String),
+}
+
+/// Statuses with which an (expired) signed URL typically refuses a request.
+pub(crate) fn is_url_rejected(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404 | 410)
 }
 
 /// Result of one request attempt.
@@ -257,6 +264,9 @@ async fn attempt_once(
                 progress: false,
                 why: format!("HTTP {}", s.as_u16()),
             };
+        }
+        s if is_url_rejected(s.as_u16()) => {
+            return Attempt::Exit(WorkerExit::UrlRejected(s.as_u16()));
         }
         s => return Attempt::Exit(WorkerExit::Fatal(format!("HTTP {}", s.as_u16()))),
     }

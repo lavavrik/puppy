@@ -5,7 +5,7 @@
 
 use crate::fsutil::write_at;
 use crate::http::probe::{apply_context, timed};
-use crate::http::worker::{SegmentShared, WorkerCtx, WorkerExit, backoff};
+use crate::http::worker::{SegmentShared, WorkerCtx, WorkerExit, backoff, is_url_rejected};
 use crate::meter::SpeedMeter;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -82,6 +82,9 @@ async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMet
             || s == StatusCode::REQUEST_TIMEOUT =>
         {
             return Attempt::Retry(format!("HTTP {}", s.as_u16()));
+        }
+        s if is_url_rejected(s.as_u16()) => {
+            return Attempt::Exit(WorkerExit::UrlRejected(s.as_u16()));
         }
         s => return Attempt::Exit(WorkerExit::Fatal(format!("HTTP {}", s.as_u16()))),
     }

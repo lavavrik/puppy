@@ -479,3 +479,59 @@ async fn low_limit_does_not_reconnect() {
     assert!(seen <= 2, "reconnected: {seen} requests");
     assert_eq!(s.range_requests(), 1);
 }
+
+async fn expiring_download(f: impl FnOnce(&mut ServerCfg)) {
+    // One connection; the server drops it once at 768 KiB, after the signed URL it was
+    // redirected to has expired, so the reconnect gets 403.
+    let s = server(|c| {
+        c.len = 2 * MIB;
+        c.bytes_per_sec = Some(MIB);
+        c.fail_after_bytes_once = Some(768 * KIB);
+        f(c);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.connections = 1;
+    let mut req = request(&s, dir.path());
+    req.source = Source::Http {
+        url: s.url("/expiring"),
+    };
+    let (tx, _) = broadcast::channel(256);
+    let client = build_client(&c).unwrap();
+    let (dl, added) = HttpDownload::start_fresh(
+        1,
+        req,
+        AddOptions::default(),
+        client,
+        c,
+        TokenBucket::new(None),
+        tx,
+    )
+    .await
+    .unwrap();
+    let st = wait_status(&dl, |s| s.done_bytes >= 128 * KIB, TIMEOUT).await;
+    assert!(st.done_bytes < 768 * KIB, "too late to expire: {st:?}");
+    s.rotate_signed();
+    wait_state(&dl, is_completed, TIMEOUT).await;
+    assert_file(&added.path, 2 * MIB, 0);
+    assert_no_leftovers(&added.path);
+    let paths = s.paths_seen();
+    assert!(paths.iter().any(|p| p == "/signed/1"), "{paths:?}");
+}
+
+#[tokio::test]
+async fn expired_redirect_reresolves_mid_download() {
+    expiring_download(|_| {}).await;
+}
+
+#[tokio::test]
+async fn expired_redirect_reresolves_single_stream() {
+    expiring_download(|c| c.ranges = false).await;
+}
+
+#[tokio::test]
+async fn expired_redirect_reresolves_without_etag() {
+    // No strong validator: the new URL is accepted after a spot check of the bytes so far.
+    expiring_download(|c| c.etag = false).await;
+}

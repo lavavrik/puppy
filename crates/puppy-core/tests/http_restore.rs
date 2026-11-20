@@ -714,3 +714,49 @@ async fn restore_source_mismatch_needs_attention() {
     assert!(part_path(&final_path).exists());
     assert!(sidecar_path(&final_path).exists());
 }
+
+#[tokio::test]
+async fn restore_reresolves_expired_redirect() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&s, dir.path());
+    req.source = Source::Http {
+        url: s.url("/expiring"),
+    };
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    s.set_cfg(|c| c.bytes_per_sec = None);
+    s.rotate_signed();
+
+    let (tx, _) = broadcast::channel(256);
+    let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+    assert_no_leftovers(&added.path);
+    let paths = s.paths_seen();
+    assert!(paths.iter().any(|p| p == "/signed/1"), "{paths:?}");
+}
+
+#[tokio::test]
+async fn reresolve_to_different_file_needs_attention() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&s, dir.path());
+    req.source = Source::Http {
+        url: s.url("/expiring"),
+    };
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    s.set_cfg(|c| c.bytes_per_sec = None);
+    s.rotate_signed();
+    s.set_version(1);
+
+    let (tx, _) = broadcast::channel(256);
+    let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
+    assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
+    assert!(part_path(&added.path).exists());
+}
