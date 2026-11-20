@@ -63,6 +63,7 @@ impl ManagerError {
             ManagerError::NotFound(_) => ErrorCode::NotFound,
             ManagerError::InvalidState(_) => ErrorCode::InvalidState,
             ManagerError::BadRequest(_) => ErrorCode::BadRequest,
+            ManagerError::Engine(EngineError::Unsupported(_)) => ErrorCode::Unsupported,
             ManagerError::Engine(_) => ErrorCode::Engine,
         }
     }
@@ -709,6 +710,14 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!ran.load(Ordering::SeqCst), "a job ran after shutdown");
+    }
+
+    #[test]
+    fn unsupported_engine_error_has_its_own_code() {
+        let e = ManagerError::Engine(EngineError::Unsupported("per-torrent limits"));
+        assert_eq!(e.code(), ErrorCode::Unsupported);
+        let e = ManagerError::Engine(EngineError::Invalid("x".into()));
+        assert_eq!(e.code(), ErrorCode::Engine);
     }
 
     #[test]

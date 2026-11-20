@@ -158,6 +158,8 @@ pub enum ErrorCode {
     InvalidState,
     Engine,
     Internal,
+    /// The download's engine cannot do this (e.g. change a running torrent's limit).
+    Unsupported,
     /// A code this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
@@ -426,6 +428,14 @@ mod tests {
             r#"{"type":"response","req_id":4,"status":"err","code":"not_found","message":"no such id"}"#
         );
         assert_eq!(serde_json::from_str::<ServerMsg>(&s).unwrap(), m);
+    }
+
+    #[test]
+    fn unsupported_error_code_wire_format() {
+        let json = serde_json::to_string(&ErrorCode::Unsupported).unwrap();
+        assert_eq!(json, r#""unsupported""#);
+        let back: ErrorCode = serde_json::from_str(r#""unsupported""#).unwrap();
+        assert_eq!(back, ErrorCode::Unsupported);
     }
 
     #[test]
