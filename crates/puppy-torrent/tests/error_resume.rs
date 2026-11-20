@@ -1,5 +1,5 @@
-//! A fresh torrent failed in librqbit (`Error` state: a disk write failed) resumes in
-//! the same session once the cause is gone. Linux only: the write error is forced with
+//! A fresh torrent failed in librqbit (`Error` state: a disk write failed) shows its
+//! last exact piece map and resumes in the same session once the cause is gone. Linux only: the write error is forced with
 //! a file size limit (`RLIMIT_FSIZE`), which is process-wide, so this binary holds this
 //! one test only.
 #![cfg(target_os = "linux")]
@@ -9,7 +9,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use puppy_core::engine::{AddOptions, Engine, StartMode};
-use puppy_core::types::{AddRequest, DownloadState, RequestContext, Source};
+use puppy_core::types::{AddRequest, DownloadState, EngineDetail, RequestContext, Source};
 use puppy_torrent::{TorrentEngine, TorrentEngineOptions};
 use support::Seeder;
 
@@ -50,7 +50,9 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
     unsafe {
         libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
     }
-    let seeder = Seeder::start(&[("one.iso", LEN)]).await;
+    // Throttled: the torrent is live (with an exact piece map) for a while before the
+    // write past the limit fails.
+    let seeder = Seeder::start_with_limit(&[("one.iso", LEN)], 64 * 1024).await;
     let dir = tempfile::tempdir().unwrap();
     let engine = TorrentEngine::new(TorrentEngineOptions {
         dht: false,
@@ -71,8 +73,6 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
     let out = dir.path().join("out");
     engine.start_session().await.unwrap();
 
-    // No file may grow past 256 KiB: librqbit's write fails, the torrent errors.
-    set_fsize_limit(256 * 1024);
     let req = AddRequest {
         source: Source::TorrentFile { path: torrent },
         output_dir: Some(out.clone()),
@@ -84,17 +84,52 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
     let added = engine
         .add(1, req, StartMode::Fresh, AddOptions::default())
         .await;
-    let failed = async {
+    let (failed, last_seen) = async {
         let added = added.unwrap();
-        wait(&engine, "the write failure", |s| {
-            matches!(s, DownloadState::Failed { .. })
-        })
-        .await;
-        added
+        // Once librqbit has created the file (full length) and has a piece: no write may
+        // reach past the first byte, so the next piece's write fails and the torrent
+        // errors (pieces come in any order).
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(EngineDetail::Torrent { have, .. }) = engine.detail(1)
+                && have.iter().any(|b| *b != 0)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no piece downloaded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        set_fsize_limit(1);
+        // The maps puppy shows while it is live.
+        let mut last_seen = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(EngineDetail::Torrent { have, .. }) = engine.detail(1) {
+                last_seen = have;
+            }
+            let st = engine.status(1).unwrap().state;
+            if matches!(st, DownloadState::Failed { .. }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no write failure: {st:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        (added, last_seen)
     }
     .await;
+    // Failed: librqbit has no piece map; puppy shows the last exact one (the per-file
+    // synthesis would be empty: librqbit reports no file progress in this state).
+    let no_map = engine.piece_dump(1).is_none();
+    let detail = engine.detail(1);
     set_fsize_limit(libc::RLIM_INFINITY);
+    assert!(no_map, "librqbit still has a map");
+    let Some(EngineDetail::Torrent { have, .. }) = detail else {
+        panic!("no detail");
+    };
+    assert!(have.iter().any(|b| *b != 0), "the last exact map is gone");
+    assert_eq!(have, last_seen);
     assert_eq!(failed.path, out.join("one.iso"));
+    seeder.session.ratelimits.set_upload_bps(None);
 
     // Freed: resuming re-adds it over its own files and it completes.
     engine.resume(1).await.expect("resumes in-session");

@@ -100,11 +100,21 @@ pub(crate) async fn poll_once(shared: &Shared) {
                 continue;
             };
             if let Some(o) = &obs {
-                e.seed.observe_upload(o.uploaded);
+                e.seed.observe_upload(o.epoch, o.uploaded);
             }
             let mut record = false;
             let mut stop = false;
             let mut finished_seeding = false;
+            // A restored seeding torrent whose data failed librqbit's check: paused,
+            // needing attention, downloading again on `resume` (and completing again).
+            if e.seed.phase == SeedPhase::Seeding && obs.is_some_and(|o| o.incomplete) {
+                tracing::warn!(id, "{}", crate::engine::RECHECK_FAILED);
+                e.seed.revert_to_downloading();
+                e.completed_sent = false;
+                e.run_wanted = false;
+                stop = true;
+                record = true;
+            }
             let complete = matches!(
                 status.state,
                 DownloadState::Completed | DownloadState::Seeding { .. }
@@ -150,7 +160,8 @@ pub(crate) async fn poll_once(shared: &Shared) {
                 to_stop.push((id, h.clone()));
             }
             if record {
-                records.push((id, e.seed.record(now)));
+                let (seq, rec) = e.seed.record(now);
+                records.push((id, seq, rec));
             }
             if changed(e.last_state.as_ref(), &status.state) {
                 e.last_state = Some(status.state.clone());
@@ -176,8 +187,8 @@ pub(crate) async fn poll_once(shared: &Shared) {
     for id in to_persist {
         shared.persist_choice(id);
     }
-    for (id, rec) in records {
-        shared.write_seed(id, &rec);
+    for (id, seq, rec) in records {
+        shared.write_seed(id, seq, &rec).await;
     }
     for ev in events {
         let _ = shared.events.send(ev);

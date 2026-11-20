@@ -306,3 +306,42 @@ impl Drop for Leecher {
         self.session.cancellation_token().cancel();
     }
 }
+
+/// A second, complete copy of the seeder's torrent in its own session that connects to
+/// `peer` (e.g. puppy, which then downloads from it: an incoming peer, for a torrent
+/// added without peers).
+pub async fn serving_copy(seeder: &Seeder, peer: SocketAddr) -> Leecher {
+    let dir = tempfile::tempdir().unwrap();
+    for (rel, bytes) in seeder.expected_files() {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let session = Session::new_with_opts(dir.path().to_owned(), local_session_options(false, None))
+        .await
+        .expect("serving session starts");
+    let handle = session
+        .add_torrent(
+            AddTorrent::TorrentFileBytes(seeder.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                disable_trackers: true,
+                initial_peers: Some(vec![peer]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("torrent added")
+        .into_handle()
+        .expect("a managed torrent");
+    handle
+        .wait_until_initialized()
+        .await
+        .expect("copy verified");
+    assert!(handle.stats().finished, "the copy is complete");
+    Leecher {
+        session,
+        handle,
+        dir,
+    }
+}

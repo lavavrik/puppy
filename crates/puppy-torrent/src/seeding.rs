@@ -30,7 +30,20 @@ pub(crate) enum SeedPhase {
     Done,
 }
 
-/// The `.seed` sidecar.
+/// The `.seed` sidecar: a torrent's seeding counters, kept across restarts.
+///
+/// Written (atomically, durably) every 30 s while seeding, when seeding starts or stops,
+/// on pause and on shutdown; deleted when the download is forgotten (removed, or
+/// [`Engine::forget`](puppy_core::engine::Engine::forget)). What it says:
+/// - `last_completed_unix: None`: the data was never complete (only `base_uploaded`
+///   matters, uploads while downloading).
+/// - `last_completed_unix: Some`, `stopped: false`: seeding, as of the last write. Only
+///   meaningful while the download is held by the engine or restored into it: a
+///   download dropped by `drop_completed` (the daemon took it as completed) keeps its
+///   record, unchanged, until `forget`, so a record alone does not say it still seeds;
+///   the daemon's own state does.
+/// - `stopped: true`: seeding has ended (target met, both targets 0, or paused): a
+///   restore reports `Completed` and does not seed again.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SeedRecord {
     /// Bytes uploaded in total (every earlier session included).
@@ -59,12 +72,8 @@ impl SeedRecord {
         }
     }
 
-    /// Writes atomically (temporary file, then rename).
-    pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("seed.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a seed record serializes")
     }
 }
 
@@ -122,6 +131,14 @@ pub(crate) struct SeedTracker {
     base_uploaded: u64,
     /// The current session's counter as last seen.
     session_uploaded: u64,
+    /// Bumped whenever puppy folds a session into the base itself ([`Self::fold_session`]):
+    /// counters read before (in an older epoch) are stale and ignored.
+    epoch: u64,
+    /// Folded: the next counter seen is a new session's, taken as is.
+    awaiting_new_session: bool,
+    /// Sequence of the records made ([`Self::record`]): a write older than one already
+    /// written is skipped.
+    record_seq: u64,
     seeded: Duration,
     /// When the seeding time was last advanced (`None`: not counting).
     last_tick: Option<Instant>,
@@ -129,16 +146,22 @@ pub(crate) struct SeedTracker {
     completed_unix: Option<u64>,
     /// `SeedingFinished` still to be sent (seeding found finished at restore).
     pub finish_pending: bool,
+    /// A restored seeding torrent's data failed librqbit's check: it waits (paused,
+    /// `NeedsAttention`) for `resume` to download it again.
+    pub recheck_failed: bool,
 }
 
 /// What a status needs of a tracker (copied under the torrents lock).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SeedView {
     pub phase: SeedPhase,
+    /// The tracker's epoch when the view was taken (see [`SeedTracker::observe_upload`]).
+    pub epoch: u64,
     base_uploaded: u64,
     session_uploaded: u64,
     pub seeded_secs: u64,
     pub targets: Targets,
+    pub recheck_failed: bool,
 }
 
 impl SeedView {
@@ -177,11 +200,15 @@ impl SeedTracker {
             phase: SeedPhase::Downloading,
             base_uploaded: 0,
             session_uploaded: 0,
+            epoch: 0,
+            awaiting_new_session: false,
+            record_seq: 0,
             seeded: Duration::ZERO,
             last_tick: None,
             last_persist: None,
             completed_unix: None,
             finish_pending: false,
+            recheck_failed: false,
         }
     }
 
@@ -218,19 +245,57 @@ impl SeedTracker {
     pub fn view(&self, targets: Targets) -> SeedView {
         SeedView {
             phase: self.phase,
+            epoch: self.epoch,
             base_uploaded: self.base_uploaded,
             session_uploaded: self.session_uploaded,
             seeded_secs: self.seeded.as_secs(),
             targets,
+            recheck_failed: self.recheck_failed,
         }
     }
 
-    /// Takes librqbit's session counter into account (0 when not live).
-    pub fn observe_upload(&mut self, counter: u64) {
-        if counter < self.session_uploaded {
+    /// Takes librqbit's session counter (0 when not live), read in `epoch`, into
+    /// account. A reading from an older epoch (before puppy folded the session it
+    /// belongs to) is ignored. Otherwise a counter below the one last seen is a new
+    /// librqbit session (the previous one ended without puppy, e.g. an error): the
+    /// previous one is folded in. Readers in one epoch apply in order (the poll task).
+    pub fn observe_upload(&mut self, epoch: u64, counter: u64) {
+        if epoch != self.epoch {
+            return;
+        }
+        if self.awaiting_new_session {
+            self.awaiting_new_session = false;
+        } else if counter < self.session_uploaded {
             self.base_uploaded = self.base_uploaded.saturating_add(self.session_uploaded);
         }
         self.session_uploaded = counter;
+    }
+
+    /// The current epoch (take it before reading librqbit's counter).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// puppy ends the librqbit session itself (pause, re-add, shutdown): its counter,
+    /// read in `epoch` just before, is folded into the base, and a new epoch starts.
+    pub fn fold_session(&mut self, epoch: u64, counter: u64) {
+        if epoch == self.epoch {
+            self.session_uploaded = self.session_uploaded.max(counter);
+        }
+        self.base_uploaded = self.base_uploaded.saturating_add(self.session_uploaded);
+        self.session_uploaded = 0;
+        self.epoch += 1;
+        self.awaiting_new_session = true;
+    }
+
+    /// A restored seeding torrent's data failed librqbit's check: back to downloading
+    /// (the upload counted so far stays).
+    pub fn revert_to_downloading(&mut self) {
+        self.recheck_failed = true;
+        self.phase = SeedPhase::Downloading;
+        self.completed_unix = None;
+        self.last_tick = None;
+        self.last_persist = None;
     }
 
     pub fn uploaded(&self) -> u64 {
@@ -287,14 +352,17 @@ impl SeedTracker {
         self.phase != SeedPhase::Downloading || self.uploaded() > 0
     }
 
-    pub fn record(&mut self, now: Instant) -> SeedRecord {
+    /// The record to write now, with its sequence number (see [`Self::record_seq`]).
+    pub fn record(&mut self, now: Instant) -> (u64, SeedRecord) {
         self.last_persist = Some(now);
-        SeedRecord {
+        self.record_seq += 1;
+        let rec = SeedRecord {
             base_uploaded: self.uploaded(),
             seeded_secs: self.seeded.as_secs(),
             last_completed_unix: self.completed_unix,
             stopped: self.phase == SeedPhase::Done,
-        }
+        };
+        (self.record_seq, rec)
     }
 }
 
@@ -359,13 +427,13 @@ mod tests {
     #[test]
     fn uploads_add_up_across_sessions() {
         let mut t = SeedTracker::new(SeedPolicy::default());
-        t.observe_upload(100);
-        t.observe_upload(300);
+        t.observe_upload(0, 100);
+        t.observe_upload(0, 300);
         assert_eq!(t.uploaded(), 300);
-        // Paused: librqbit reports 0; the session's bytes stay counted.
-        t.observe_upload(0);
+        // Stopped without puppy (an error): librqbit reports 0; the bytes stay counted.
+        t.observe_upload(0, 0);
         assert_eq!(t.uploaded(), 300);
-        t.observe_upload(50);
+        t.observe_upload(0, 50);
         assert_eq!(t.uploaded(), 350);
         // A view computes the same without a call in between (new session unseen).
         let v = t.view(Targets {
@@ -374,8 +442,9 @@ mod tests {
         });
         assert_eq!(v.uploaded(80), 380);
         assert_eq!(v.uploaded(10), 360, "a lower counter is a new session");
-        let rec = t.record(Instant::now());
+        let (seq, rec) = t.record(Instant::now());
         assert_eq!(rec.base_uploaded, 350);
+        assert!(t.record(Instant::now()).0 > seq, "sequence increases");
         let back = SeedTracker::restored(SeedPolicy::default(), Some(rec));
         assert_eq!(back.uploaded(), 350);
         assert_eq!(back.phase, SeedPhase::Downloading);
@@ -433,6 +502,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_readings_after_a_fold_are_ignored() {
+        let mut t = SeedTracker::new(SeedPolicy::default());
+        t.observe_upload(0, 100);
+        // The poll reads Y = 200 (epoch 0)...
+        let (poll_epoch, y) = (t.epoch(), 200);
+        // ...pause reads X = 250 > Y, pauses and folds the session...
+        let pause_epoch = t.epoch();
+        t.fold_session(pause_epoch, 250);
+        assert_eq!(t.uploaded(), 250);
+        // ...then the poll's late Y is applied: ignored, not a "new session".
+        t.observe_upload(poll_epoch, y);
+        assert_eq!(
+            t.uploaded(),
+            250,
+            "a stale reading was counted as a session"
+        );
+        // The next session (after resume) counts from 0 on top.
+        t.observe_upload(t.epoch(), 0);
+        t.observe_upload(t.epoch(), 40);
+        assert_eq!(t.uploaded(), 290);
+        // A fold whose reading is older than the poll's: the higher one wins.
+        let e = t.epoch();
+        t.observe_upload(e, 60);
+        t.fold_session(e, 50);
+        assert_eq!(t.uploaded(), 310);
+        // A fold right after another (nothing seen in between): counts the new reading.
+        let e = t.epoch();
+        t.fold_session(e, 5);
+        assert_eq!(t.uploaded(), 315);
+        // Re-add of a failed torrent (counter 0): only the session seen so far.
+        let e = t.epoch();
+        t.observe_upload(e, 7);
+        t.fold_session(e, 0);
+        assert_eq!(t.uploaded(), 322);
+    }
+
+    #[test]
     fn record_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("1.seed");
@@ -442,7 +548,7 @@ mod tests {
             last_completed_unix: Some(9),
             stopped: true,
         };
-        r.write(&path).unwrap();
+        std::fs::write(&path, r.to_bytes()).unwrap();
         assert_eq!(SeedRecord::read(&path), Some(r));
         // Older/partial records: fields default.
         std::fs::write(&path, r#"{"base_uploaded":5}"#).unwrap();

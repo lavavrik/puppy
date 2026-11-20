@@ -19,6 +19,7 @@ use librqbit::{
 use puppy_core::engine::{
     AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode,
 };
+use puppy_core::fsutil;
 use puppy_core::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
     FileChoice, SeedPolicy, Selection, Source, TorrentFile,
@@ -84,7 +85,8 @@ pub struct TorrentEngineOptions {
 ///   (`SeedingFinished` is sent). Both targets 0: paused at completion. `pause` while
 ///   seeding stops seeding too. The counters are kept in `<data_dir>/torrents/<id>.seed`
 ///   (every 30 s while seeding, on changes, pause and shutdown); a restored seeding
-///   torrent goes on seeding (a met target: `Completed` at once).
+///   torrent goes on seeding (a met target: `Completed` at once; data that fails
+///   librqbit's check: paused, `NeedsAttention`, downloaded again on `resume`).
 /// - The piece map is librqbit's own (`api_dump_haves`); see [`map::fallback_map`] for
 ///   when it is not available.
 /// - Unlike the HTTP engine, dropping it stops its torrents (the session goes with it).
@@ -113,6 +115,8 @@ const DUPLICATE: &str = "already downloading this torrent";
 const TORRENT_MISSING: &str = "torrent file missing";
 /// The session could not be started (the details are logged).
 const UNAVAILABLE: &str = "torrent engine unavailable (see daemon log)";
+/// A restored seeding torrent's data failed librqbit's check.
+pub(crate) const RECHECK_FAILED: &str = "data changed on disk; resume to download again";
 /// A fresh add found a file of the torrent already there (librqbit does not overwrite).
 const EXISTS: &str = "refusing to overwrite: a file of this torrent already exists";
 
@@ -155,7 +159,7 @@ pub(crate) struct Entry {
     pub(crate) completed_sent: bool,
     /// The torrent should be running: set by a non-paused add and by `resume`, cleared
     /// by `pause`. librqbit's own paused flag can disagree (see [`Shared::unstick`]).
-    run_wanted: bool,
+    pub(crate) run_wanted: bool,
 }
 
 /// A bytes/s limit as librqbit takes it: `None`/0 is unlimited, above `u32::MAX` clamps.
@@ -213,10 +217,14 @@ pub(crate) enum View {
 /// What the poll task learns from librqbit besides the status.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Observed {
+    /// The seeding tracker's epoch the counter was read in.
+    pub epoch: u64,
     /// librqbit's upload counter of the current live session.
     pub uploaded: u64,
     /// Live and complete: seeding time counts.
     pub seeding_live: bool,
+    /// Past librqbit's check (live or paused) and not complete.
+    pub incomplete: bool,
 }
 
 impl View {
@@ -244,8 +252,11 @@ impl View {
                 let mut st = map::status(&stats, name, path);
                 apply_seed(&mut st, &stats, &seed);
                 let obs = Observed {
+                    epoch: seed.epoch,
                     uploaded: stats.uploaded,
                     seeding_live: stats.finished && stats.phase == map::Phase::Live,
+                    incomplete: !stats.finished
+                        && matches!(stats.phase, map::Phase::Live | map::Phase::Paused),
                 };
                 (st, Some(obs))
             }
@@ -256,9 +267,20 @@ impl View {
 /// The seeding view of a managed torrent's status: stopped seeding ⇒ `Completed`;
 /// complete and seeding (also while librqbit re-checks a restored seeding torrent, and
 /// before the poll task has seen the completion, unless both targets are 0) ⇒
-/// `Seeding`, with its upload speed. An error wins.
+/// `Seeding`, with its upload speed; a restored seeding torrent whose data failed the
+/// check ⇒ `NeedsAttention` (see [`RECHECK_FAILED`]). An error wins.
 fn apply_seed(st: &mut DownloadStatus, s: &map::Stats, seed: &SeedView) {
     if matches!(st.state, DownloadState::Failed { .. }) {
+        return;
+    }
+    let checked = matches!(s.phase, map::Phase::Live | map::Phase::Paused);
+    if seed.recheck_failed || (seed.phase == SeedPhase::Seeding && checked && !s.finished) {
+        st.state = DownloadState::NeedsAttention {
+            reason: AttentionReason::ValidationFailed {
+                detail: RECHECK_FAILED.into(),
+            },
+        };
+        (st.down_bps, st.up_bps, st.eta_secs) = (0, 0, None);
         return;
     }
     let seeding = match seed.phase {
@@ -290,6 +312,9 @@ pub(crate) struct Shared {
     api: std::sync::OnceLock<Api>,
     /// The global seeding targets `(ratio, time)` (see [`TorrentEngine::set_seed_defaults`]).
     seed_defaults: Mutex<(f32, Duration)>,
+    /// Serializes the `.seed` writes; the sequence of the last record written per
+    /// download (see [`Shared::write_seed`]).
+    seed_io: tokio::sync::Mutex<HashMap<DownloadId, u64>>,
     /// The engine's token: the session's tokens are its children, so dropping the
     /// engine stops the session and the poll task.
     cancel: CancellationToken,
@@ -697,6 +722,9 @@ impl Shared {
             Some(e) => {
                 e.slot = Slot::Managed(nh.clone());
                 e.overwrite = true;
+                // The failed session's uploads are kept; the new one counts from 0.
+                let epoch = e.seed.epoch();
+                e.seed.fold_session(epoch, 0);
                 true
             }
             None => false,
@@ -912,44 +940,61 @@ impl Shared {
             .join(format!("{id}.seed"))
     }
 
-    /// Writes download `id`'s seeding record, if it is still there (a failure is only
-    /// logged).
-    pub(crate) fn write_seed(&self, id: DownloadId, rec: &SeedRecord) {
+    /// Writes download `id`'s seeding record `rec` (sequence `seq`, from
+    /// [`SeedTracker::record`]) atomically and durably, if the download is still there
+    /// and no newer record of it has been written: writers are serialized, so a stale
+    /// record (made before one already written) never replaces it. A failure is only
+    /// logged.
+    pub(crate) async fn write_seed(&self, id: DownloadId, seq: u64, rec: &SeedRecord) {
+        let mut written = self.seed_io.lock().await;
         if !self.lock().contains_key(&id) {
             return; // removed meanwhile: its record is gone with it
         }
-        if let Err(e) = rec.write(&self.seed_file(id)) {
-            tracing::warn!(id, "recording the seeding counters: {e}");
+        if written.get(&id).is_some_and(|&last| last >= seq) {
+            tracing::debug!(id, seq, "skipping a stale seeding record");
+            return;
+        }
+        match fsutil::atomic_write(&self.seed_file(id), &rec.to_bytes(), true).await {
+            Ok(()) => {
+                written.insert(id, seq);
+            }
+            Err(e) => tracing::warn!(id, "recording the seeding counters: {e}"),
         }
     }
 
-    /// Writes the seeding record of every torrent with something to record, with
-    /// librqbit's current upload counters (pause, shutdown).
-    fn persist_seeds(&self, only: Option<DownloadId>) {
+    /// Shutdown: folds every torrent's current librqbit session into its counters and
+    /// writes the record of each with something to record.
+    async fn persist_seeds(&self) {
         let handles: Vec<_> = self
             .lock()
             .iter()
-            .filter(|(id, _)| only.is_none_or(|o| o == **id))
             .filter_map(|(&id, e)| match &e.slot {
-                Slot::Managed(h) => Some((id, h.clone())),
+                Slot::Managed(h) => Some((id, e.seed.epoch(), h.clone())),
                 _ => None,
             })
             .collect();
         let now = Instant::now();
-        for (id, h) in handles {
+        for (id, epoch, h) in handles {
             let uploaded = h.stats().uploaded_bytes;
             let rec = {
                 let mut map = self.lock();
                 let Some(e) = map.get_mut(&id) else {
                     continue;
                 };
-                e.seed.observe_upload(uploaded);
+                e.seed.fold_session(epoch, uploaded);
                 e.seed.worth_recording().then(|| e.seed.record(now))
             };
-            if let Some(rec) = rec {
-                self.write_seed(id, &rec);
+            if let Some((seq, rec)) = rec {
+                self.write_seed(id, seq, &rec).await;
             }
         }
+    }
+
+    /// [`Self::forget`], serialized with the seeding record writes (none lands after it).
+    async fn forget_serialized(&self, id: DownloadId) {
+        let mut written = self.seed_io.lock().await;
+        written.remove(&id);
+        self.forget(id);
     }
 
     /// librqbit's own piece map of `h` `(piece count, have)`, MSB first; `None` if it
@@ -1317,6 +1362,7 @@ impl TorrentEngine {
             session: OnceCell::new(),
             api: std::sync::OnceLock::new(),
             seed_defaults,
+            seed_io: tokio::sync::Mutex::new(HashMap::new()),
             limits: Mutex::new((None, None)),
             cancel: cancel.clone(),
             torrents: Mutex::new(HashMap::new()),
@@ -1398,6 +1444,23 @@ impl TorrentEngine {
         self.shared.exact_map(&h)
     }
 
+    /// librqbit's have-bits of download `id`, piece by piece, as `api_dump_haves` gives
+    /// them (tests).
+    #[doc(hidden)]
+    pub fn piece_bits(&self, id: DownloadId) -> Option<Vec<bool>> {
+        let h = match &self.shared.lock().get(&id)?.slot {
+            Slot::Managed(h) => h.clone(),
+            _ => return None,
+        };
+        let (bf, n) = self
+            .shared
+            .api
+            .get()?
+            .api_dump_haves(TorrentIdOrHash::Id(h.id()))
+            .ok()?;
+        Some((0..n as usize).map(|i| bf[i]).collect())
+    }
+
     /// Where the session accepts incoming peer connections (`None` until it is started).
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.shared.started()?.listen_addr()
@@ -1414,7 +1477,7 @@ impl TorrentEngine {
         for id in ids {
             self.shared.persist_choice(id);
         }
-        self.shared.persist_seeds(None);
+        self.shared.persist_seeds().await;
         if let Some(session) = self.shared.started() {
             session.stop().await;
         }
@@ -1726,13 +1789,14 @@ impl TorrentEngine {
     /// After `pause` stopped torrent `id` in librqbit (`stats`: just before): a complete
     /// torrent stops seeding (`Completed`; `SeedingFinished` if it was seeding), and its
     /// counters are recorded.
-    fn stop_seeding_paused(&self, id: DownloadId, stats: &map::Stats) {
+    /// `epoch`: the tracker's, read before `stats`.
+    async fn stop_seeding_paused(&self, id: DownloadId, epoch: u64, stats: &map::Stats) {
         let (completed, was_seeding, rec) = {
             let mut map = self.shared.lock();
             let Some(e) = map.get_mut(&id) else {
                 return;
             };
-            e.seed.observe_upload(stats.uploaded);
+            e.seed.fold_session(epoch, stats.uploaded);
             let mut completed = false;
             if e.seed.phase == SeedPhase::Downloading && stats.finished {
                 // Complete, not seen by the poll task yet (but reported seeding, unless
@@ -1749,8 +1813,8 @@ impl TorrentEngine {
                 .then(|| e.seed.record(Instant::now()));
             (completed, was, rec)
         };
-        if let Some(rec) = rec {
-            self.shared.write_seed(id, &rec);
+        if let Some((seq, rec)) = rec {
+            self.shared.write_seed(id, seq, &rec).await;
         }
         if completed {
             self.shared.persist_choice(id);
@@ -1825,7 +1889,7 @@ impl TorrentEngine {
         };
         if !keep_copy {
             // The download is gone either way: drop its stored copy before reporting.
-            self.shared.forget(id);
+            self.shared.forget_serialized(id).await;
         }
         deleted
     }
@@ -2276,11 +2340,12 @@ impl Engine for TorrentEngine {
         let task = match taken {
             Ok(h) => {
                 self.shared.note_writes();
+                let epoch = self.shared.lock().get(&id).map_or(0, |e| e.seed.epoch());
                 let stats = map::Stats::from(&h.stats());
                 let res = self.shared.pause_managed(&h).await;
                 self.shared.persist_choice(id);
                 if res.is_ok() {
-                    self.stop_seeding_paused(id, &stats);
+                    self.stop_seeding_paused(id, epoch, &stats).await;
                 }
                 return res;
             }
@@ -2329,6 +2394,8 @@ impl Engine for TorrentEngine {
                 .ok_or(EngineError::NotFound(id))?;
             if !matches!(e.slot, Slot::Attention(_) | Slot::Choosing { .. }) {
                 e.run_wanted = true;
+                // Data that failed its check is downloaded again.
+                e.seed.recheck_failed = false;
             }
             match &e.slot {
                 Slot::Managed(h) => (h.clone(), e.overwrite),
@@ -2435,7 +2502,7 @@ impl Engine for TorrentEngine {
 
     /// Deletes the stored `.torrent` copy.
     async fn forget(&self, id: DownloadId) {
-        self.shared.forget(id);
+        self.shared.forget_serialized(id).await;
     }
 
     fn status(&self, id: DownloadId) -> Option<DownloadStatus> {
@@ -3021,6 +3088,46 @@ mod tests {
         assert!(lookup().is_none(), "left in librqbit");
         assert!(out.join("x.bin").exists(), "its files were deleted");
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_seed_records_never_replace_newer_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TorrentEngine::new(test_options(dir.path())).await.unwrap();
+        let shared = &engine.shared;
+        std::fs::create_dir_all(dir.path().join("data/torrents")).unwrap();
+        let hash = "ab".repeat(20);
+        shared.lock().insert(1, held_entry(&hash, dir.path()));
+        let rec = |stopped| SeedRecord {
+            base_uploaded: 10,
+            seeded_secs: 5,
+            last_completed_unix: Some(1),
+            stopped,
+        };
+        // A pause wrote `stopped` (sequence 2); the poll's older record (1) lands late.
+        shared.write_seed(1, 2, &rec(true)).await;
+        shared.write_seed(1, 1, &rec(false)).await;
+        let path = shared.seed_file(1);
+        assert_eq!(
+            SeedRecord::read(&path),
+            Some(rec(true)),
+            "stale record written"
+        );
+        shared.write_seed(1, 3, &rec(false)).await;
+        assert_eq!(
+            SeedRecord::read(&path),
+            Some(rec(false)),
+            "newer one written"
+        );
+        // Forgotten: nothing written afterwards.
+        shared.lock().remove(&1);
+        shared.forget_serialized(1).await;
+        shared.write_seed(1, 4, &rec(true)).await;
+        assert!(!path.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("data/torrents"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

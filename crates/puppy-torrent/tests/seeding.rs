@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use puppy_core::engine::{AddOptions, Added, Engine, EngineEvent, StartMode};
 use puppy_core::types::{
-    AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, FileChoice,
-    RequestContext, SeedPolicy, Source,
+    AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
+    FileChoice, RequestContext, SeedPolicy, Source,
 };
 use puppy_torrent::{TorrentEngine, TorrentEngineOptions};
 use support::{Leecher, Seeder};
@@ -550,17 +550,23 @@ async fn exact_piece_map_matches_api() {
             Instant::now() < deadline,
             "never saw a stable mid-download map"
         );
-        let a = engine.piece_dump(1);
+        // librqbit's bits, piece by piece (not puppy's encoding), around puppy's map.
+        let a = engine.piece_bits(1);
         let d = engine.detail(1);
-        let b = engine.piece_dump(1);
+        let b = engine.piece_bits(1);
         if let (Some(a), Some(_)) = (&a, &d)
             && Some(a) == b.as_ref()
         {
-            let got = popcount(&a.1);
-            if got > 0 && got < a.0 {
-                assert_eq!(piece_map(d), *a, "puppy's map is librqbit's");
-                assert_eq!(a.0, 64);
-                assert_eq!(a.1.len(), 8, "one bit per piece, MSB first, byte padded");
+            let got = a.iter().filter(|&&x| x).count();
+            if got > 0 && got < a.len() {
+                let (n, have) = piece_map(d);
+                assert_eq!(n as usize, a.len());
+                assert_eq!(n, 64);
+                assert_eq!(have.len(), 8, "one bit per piece, MSB first, byte padded");
+                for (i, &bit) in a.iter().enumerate() {
+                    let ours = have[i / 8] & (0x80 >> (i % 8)) != 0;
+                    assert_eq!(ours, bit, "piece {i}");
+                }
                 break;
             }
         }
@@ -602,5 +608,59 @@ async fn piece_map_fallbacks() {
     assert_eq!(second.status(1).unwrap().state, DownloadState::Completed);
     let (n, have) = piece_map(second.detail(1));
     assert_eq!((n, popcount(&have)), (8, 8));
+    second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_recheck_needs_attention_then_downloads_again() {
+    let seeder = Seeder::start(&[("k.bin", 128 * KIB)]).await;
+    let root = tempfile::tempdir().unwrap();
+    let first = engine(
+        root.path(),
+        vec![seeder.addr],
+        0.0,
+        Duration::from_secs(3600),
+    )
+    .await;
+    let added = add(&first, 1, torrent_req(root.path(), &seeder, None)).await;
+    wait(&first, 1, "seeding", is_seeding).await;
+    first.shutdown().await;
+    drop(first);
+    // Someone changes the completed file.
+    let mut data = std::fs::read(&added.path).unwrap();
+    data[0] ^= 0xFF;
+    std::fs::write(&added.path, &data).unwrap();
+
+    // No peers: nothing can repair it behind puppy's back.
+    let second = engine(root.path(), Vec::new(), 0.0, Duration::from_secs(3600)).await;
+    let mut rx = second.subscribe();
+    restore(
+        &second,
+        1,
+        torrent_req(root.path(), &seeder, None),
+        &added.path,
+    )
+    .await;
+    let attention = |s: &DownloadStatus| {
+        matches!(&s.state, DownloadState::NeedsAttention {
+            reason: AttentionReason::ValidationFailed { detail }
+        } if detail == "data changed on disk; resume to download again")
+    };
+    wait(&second, 1, "needs attention", attention).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let st = second.status(1).unwrap();
+    assert!(attention(&st), "stays until resumed: {st:?}");
+    let rec = seed_record(root.path(), 1);
+    assert_eq!(rec["last_completed_unix"], serde_json::Value::Null, "{rec}");
+    assert_eq!(rec["stopped"], false);
+
+    second.resume(1).await.unwrap();
+    let _copy = support::serving_copy(&seeder, second.listen_addr().unwrap()).await;
+    until(&mut rx, completed(1)).await;
+    wait(&second, 1, "seeding again", is_seeding).await;
+    assert!(
+        std::fs::read(&added.path).unwrap() == support::content("k.bin", 128 * KIB),
+        "repaired"
+    );
     second.shutdown().await;
 }
