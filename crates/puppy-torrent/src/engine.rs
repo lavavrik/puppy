@@ -465,6 +465,62 @@ impl Shared {
         }
     }
 
+    /// Re-adds download `id` (failed in librqbit: `h`) from its stored `.torrent` copy,
+    /// allowed to write over existing files, at the same layout and limit, and installs
+    /// the new handle. See [`readd_on_resume`]. Call with the ops lock held.
+    async fn readd_overwriting(
+        &self,
+        id: DownloadId,
+        h: &ManagedTorrentHandle,
+    ) -> Result<(), EngineError> {
+        let (layout, limit, magnet) = {
+            let map = self.lock();
+            let e = map.get(&id).ok_or(EngineError::NotFound(id))?;
+            (e.layout.clone(), e.limit, e.magnet.clone())
+        };
+        let bytes = source::read_torrent_file(&self.stored_torrent(id)).await?;
+        let trackers = match &magnet {
+            Some(uri) => source::parse_magnet(uri)?.trackers,
+            None => Vec::new(),
+        };
+        let opts = self.add_options(&layout, false, limit, true, trackers)?;
+        let session = self.live()?;
+        tracing::info!(id, "restarting a failed torrent over its own files");
+        // Already gone (an earlier attempt) is fine: the add below retries.
+        if let Err(e) = session.delete(TorrentIdOrHash::Id(h.id()), false).await {
+            tracing::debug!(id, "dropping the failed torrent: {e:#}");
+        }
+        let nh = match session
+            .add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
+            .await
+            .map_err(lib_error)?
+        {
+            AddTorrentResponse::Added(_, nh) => nh,
+            AddTorrentResponse::AlreadyManaged(..) => {
+                return Err(EngineError::Invalid(DUPLICATE.into()));
+            }
+            AddTorrentResponse::ListOnly(_) => {
+                return Err(EngineError::Invalid(
+                    "unexpected list-only answer from librqbit".into(),
+                ));
+            }
+        };
+        let installed = match self.lock().get_mut(&id) {
+            Some(e) => {
+                e.slot = Slot::Managed(nh.clone());
+                e.overwrite = true;
+                e.detail = None;
+                true
+            }
+            None => false,
+        };
+        if !installed {
+            // Removed meanwhile (cannot happen under the ops lock): keep nothing running.
+            let _ = session.delete(TorrentIdOrHash::Id(nh.id()), false).await;
+        }
+        Ok(())
+    }
+
     /// After a metadata task was aborted (pause or remove): a torrent it may have added
     /// to librqbit just before the abort (and not handed back) is settled like a
     /// finished task would be ([`settle`]): adopted, paused, if download `id` is still
@@ -531,13 +587,34 @@ impl Shared {
             .join(format!("{id}.torrent"))
     }
 
-    /// Deletes the stored `.torrent` copy of download `id`, if any.
+    /// `<data_dir>/torrents/<id>.placement`: how download `id`'s files were placed
+    /// ([`source::Placement`]), for [`Engine::delete_completed`]. Absent: its own folder.
+    fn placement_marker(&self, id: DownloadId) -> PathBuf {
+        self.opts
+            .data_dir
+            .join("torrents")
+            .join(format!("{id}.placement"))
+    }
+
+    /// The recorded placement of download `id`'s files (none recorded: its own folder,
+    /// as for every magnet).
+    async fn placement(&self, id: DownloadId) -> source::Placement {
+        match tokio::fs::read_to_string(self.placement_marker(id)).await {
+            Ok(s) => source::Placement::parse(&s),
+            Err(_) => source::Placement::Folder,
+        }
+    }
+
+    /// Deletes the stored `.torrent` copy of download `id` and its placement marker,
+    /// if any.
     fn forget(&self, id: DownloadId) {
-        match std::fs::remove_file(self.stored_torrent(id)) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                tracing::warn!(id, "removing the stored .torrent copy: {err}");
+        for path in [self.stored_torrent(id), self.placement_marker(id)] {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!(id, "removing {}: {err}", path.display());
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -664,6 +741,16 @@ async fn resolve_and_add(
     }
 }
 
+/// Whether `resume` must re-add a torrent instead of unpausing it: one in librqbit's
+/// `Error` state that was added with `overwrite: false` (a fresh add). librqbit
+/// restarts a failed torrent by opening its files again with the add-time options, and
+/// `create_new` then refuses the files it created itself. Every file there was created
+/// by librqbit for this download (a fresh add never starts over existing files), so
+/// they are puppy's to write over.
+fn readd_on_resume(phase: map::Phase, overwrite: bool) -> bool {
+    phase == map::Phase::Error && !overwrite
+}
+
 /// Writes a stored `.torrent` copy (synchronously: it is small).
 fn write_stored_copy(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
@@ -686,12 +773,12 @@ fn lib_error(e: anyhow::Error) -> EngineError {
     }
 }
 
-/// Releases a reserved id (and the stored `.torrent` copy, if `stored`) if `add` fails
-/// or its future is dropped mid-await.
+/// Releases a reserved id (and the stored `.torrent` copy and placement marker, if
+/// `stored`) if `add` fails or its future is dropped mid-await.
 struct Reservation<'a> {
     shared: &'a Shared,
     id: DownloadId,
-    stored: Option<PathBuf>,
+    stored: bool,
     armed: bool,
 }
 
@@ -699,8 +786,8 @@ impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.shared.lock().remove(&self.id);
-            if let Some(stored) = &self.stored {
-                let _ = std::fs::remove_file(stored);
+            if self.stored {
+                self.shared.forget(self.id);
             }
         }
     }
@@ -858,7 +945,7 @@ impl TorrentEngine {
         let mut guard = Reservation {
             shared: &self.shared,
             id,
-            stored: (copy == StoredCopy::Write).then(|| stored.clone()),
+            stored: copy == StoredCopy::Write,
             armed: true,
         };
         let add_opts =
@@ -866,6 +953,11 @@ impl TorrentEngine {
                 .add_options(&layout, opts.start_paused, opts.limit, overwrite, trackers)?;
         if copy != StoredCopy::Keep {
             tokio::fs::write(&stored, &bytes).await?;
+        }
+        // Recorded now: the disk cannot tell it once the download is completed.
+        let placement = source::Placement::of(&layout).as_str();
+        if let Err(e) = tokio::fs::write(self.shared.placement_marker(id), placement).await {
+            tracing::warn!(id, "recording where the torrent's files go: {e}");
         }
         let res = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(add_opts))
@@ -1441,7 +1533,7 @@ impl Engine for TorrentEngine {
 
     async fn resume(&self, id: DownloadId) -> Result<(), EngineError> {
         let _ops = self.shared.ops.lock().await;
-        let h = {
+        let (h, overwrite) = {
             let mut map = self.shared.lock();
             let e = map
                 .get_mut(&id)
@@ -1451,7 +1543,7 @@ impl Engine for TorrentEngine {
                 e.run_wanted = true;
             }
             match &e.slot {
-                Slot::Managed(h) => h.clone(),
+                Slot::Managed(h) => (h.clone(), e.overwrite),
                 Slot::Resolving { .. } => return Ok(()),
                 Slot::Held | Slot::PendingFailed { .. } => {
                     let uri = e.magnet.clone().expect("only magnets wait for metadata");
@@ -1482,6 +1574,9 @@ impl Engine for TorrentEngine {
         if st.finished || !stopped {
             return Ok(());
         }
+        if readd_on_resume(st.phase, overwrite) {
+            return self.shared.readd_overwriting(id, &h).await;
+        }
         self.shared.live()?.unpause(&h).await.map_err(lib_error)
     }
 
@@ -1499,8 +1594,10 @@ impl Engine for TorrentEngine {
     }
 
     /// Deletes exactly the files the stored `.torrent` copy lists, where they were put
-    /// (`path` as recorded), then the folders they were in once empty (a torrent's own
-    /// folder included, the download dir never). Without the copy, nothing is deleted.
+    /// (`path` and the placement as recorded at add, see [`source::completed_folders`]),
+    /// then the folders they were in once empty (a torrent's own folder included, the
+    /// download dir never). Never through a symlink (see [`source::delete_listed`]).
+    /// Without the copy, nothing is deleted.
     async fn delete_completed(&self, id: DownloadId, path: &Path) -> Result<(), EngineError> {
         let stored = self.shared.stored_torrent(id);
         let bytes = match source::read_torrent_file(&stored).await {
@@ -1515,7 +1612,13 @@ impl Engine for TorrentEngine {
             }
         };
         let info = source::parse_torrent(&bytes)?;
-        let Some((output, keep)) = source::completed_folders(path, &info) else {
+        let placement = self.shared.placement(id).await;
+        let Some((output, keep)) = source::completed_folders(path, &info, placement) else {
+            tracing::warn!(
+                id,
+                path = %path.display(),
+                "the recorded path does not match the torrent: its files are left on disk"
+            );
             return Ok(());
         };
         tokio::task::spawn_blocking(move || source::delete_listed(&output, &info.files, &keep))
@@ -1948,6 +2051,20 @@ mod tests {
         assert!(lookup().is_none(), "left in librqbit");
         assert!(out.join("x.bin").exists(), "its files were deleted");
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn only_failed_fresh_adds_are_readded_on_resume() {
+        use map::Phase;
+        assert!(readd_on_resume(Phase::Error, false));
+        assert!(!readd_on_resume(Phase::Error, true), "restored: unpause");
+        for p in [
+            Phase::Paused,
+            Phase::Live,
+            Phase::Initializing { paused: false },
+        ] {
+            assert!(!readd_on_resume(p, false), "{p:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

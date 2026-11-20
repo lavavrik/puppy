@@ -18,3 +18,7 @@ librqbit-dualstack-sockets = "0.7"
 [dev-dependencies]
 tempfile.workspace = true
 bytes.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/error_resume.rs: RLIMIT_FSIZE forces librqbit write errors.
+libc = "0.2"

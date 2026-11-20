@@ -291,27 +291,126 @@ fn in_own_folder(path: &Path) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Where a completed torrent recorded at `path` has its files: `(output folder, the
-/// folder above it that is never removed)`. A single file directly in the download dir
-/// (`path` is the file): `(its dir, its dir)`; in a folder of its own: `(that folder,
-/// the dir above)`; anything else (`path` is the torrent's folder, also a magnet's
-/// single file): `(path, its parent)`.
-pub(crate) fn completed_folders(path: &Path, t: &TorrentInfo) -> Option<(PathBuf, PathBuf)> {
-    let parent = path.parent()?.to_owned();
-    if t.single_file.is_some() && !path.is_dir() {
-        if in_own_folder(path) {
-            let above = parent.parent()?.to_owned();
-            return Some((parent, above));
+/// How a torrent's files were placed when it was added, recorded next to its stored
+/// `.torrent` copy: what a completed download's recorded path is cannot be told from
+/// the disk later (a folder may be gone, or replaced by anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A single file directly in the shared download dir: the path is the file.
+    Direct,
+    /// A single file in a folder of its own (`<name> (n)/<file>`): the path is the file.
+    FileInFolder,
+    /// The torrent's own folder (multi-file, or any magnet): the path is that folder.
+    Folder,
+}
+
+impl Placement {
+    /// How `layout` places the torrent's files.
+    pub fn of(layout: &Layout) -> Self {
+        if layout.single_file {
+            Placement::Direct
+        } else if layout.output_folder == layout.path {
+            Placement::Folder
+        } else {
+            Placement::FileInFolder
         }
-        return Some((parent.clone(), parent));
     }
-    Some((path.to_owned(), parent))
+
+    /// As written to the marker file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::Direct => "direct",
+            Placement::FileInFolder => "file-in-folder",
+            Placement::Folder => "folder",
+        }
+    }
+
+    /// Reads a marker; anything unknown is the torrent's own folder (the choice that
+    /// never reaches outside the recorded path).
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "direct" => Placement::Direct,
+            "file-in-folder" => Placement::FileInFolder,
+            _ => Placement::Folder,
+        }
+    }
+}
+
+/// Where a completed torrent recorded at `path` (placed as `placement`) has its files:
+/// `(output folder, the folder above it that is never removed)`. Decided from what
+/// puppy recorded, never from the disk. A single file (`Direct`, `FileInFolder`) only
+/// if the metainfo is single-file and `path` is named after that file; directly in the
+/// download dir: `(its dir, its dir)`; in a folder of its own: `(that folder, the dir
+/// above)`. Otherwise `path` is the torrent's own folder: `(path, its parent)`. `None`:
+/// nothing to delete.
+pub(crate) fn completed_folders(
+    path: &Path,
+    t: &TorrentInfo,
+    placement: Placement,
+) -> Option<(PathBuf, PathBuf)> {
+    let parent = path.parent()?.to_owned();
+    if placement == Placement::Folder {
+        return Some((path.to_owned(), parent));
+    }
+    let file = t.single_file.as_ref()?;
+    if file.components().count() != 1 || path.file_name() != file.file_name() {
+        return None;
+    }
+    match placement {
+        Placement::Direct => Some((parent.clone(), parent)),
+        _ => {
+            let above = parent.parent()?.to_owned();
+            Some((parent, above))
+        }
+    }
+}
+
+/// What is at `output_folder/rel`, walked one component at a time without following
+/// any symlink.
+enum Walk {
+    /// Nothing there (or a component on the way is gone).
+    Missing,
+    /// A symlink (the output folder, a folder on the way, or the entry itself), or a
+    /// non-directory on the way.
+    Unsafe(PathBuf),
+    /// The entry, reached through real directories only.
+    Found(std::fs::Metadata),
+}
+
+fn walk(output_folder: &Path, rel: &Path) -> std::io::Result<Walk> {
+    use std::path::Component;
+    let mut cur = output_folder.to_owned();
+    let mut md = match std::fs::symlink_metadata(&cur) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Walk::Missing),
+        Err(e) => return Err(e),
+    };
+    for c in rel.components() {
+        let Component::Normal(name) = c else {
+            return Ok(Walk::Unsafe(cur.join(c)));
+        };
+        // Everything up to here must be a real directory.
+        if md.file_type().is_symlink() || !md.is_dir() {
+            return Ok(Walk::Unsafe(cur));
+        }
+        cur.push(name);
+        md = match std::fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Walk::Missing),
+            Err(e) => return Err(e),
+        };
+    }
+    if md.file_type().is_symlink() {
+        return Ok(Walk::Unsafe(cur));
+    }
+    Ok(Walk::Found(md))
 }
 
 /// Deletes exactly `files` (relative to `output_folder`), then every folder they were
 /// in that is now empty, up to `output_folder` itself unless it is `keep`. Never
-/// deletes a directory that still holds anything, nor follows a symlinked folder. Goes
-/// on past errors and returns the first.
+/// follows a symlink: a file reached through one (the output folder, a folder on the
+/// way, or the file itself) is skipped, and only real, empty directories inside the
+/// torrent's folder are removed. Goes on past errors and returns the first.
 pub(crate) fn delete_listed(
     output_folder: &Path,
     files: &[PathBuf],
@@ -322,8 +421,8 @@ pub(crate) fn delete_listed(
     let mut dirs = BTreeSet::new();
     for rel in files {
         let path = output_folder.join(rel);
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if !m.is_dir() => {
+        match walk(output_folder, rel) {
+            Ok(Walk::Found(m)) if !m.is_dir() => {
                 if let Err(e) = std::fs::remove_file(&path)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
@@ -331,8 +430,19 @@ pub(crate) fn delete_listed(
                     first_err.get_or_insert(e);
                 }
             }
-            Ok(_) => tracing::warn!(path = %path.display(), "not deleting a directory"),
-            Err(_) => {}
+            Ok(Walk::Found(_)) => {
+                tracing::warn!(path = %path.display(), "not deleting a directory");
+            }
+            Ok(Walk::Unsafe(at)) => tracing::warn!(
+                path = %path.display(),
+                at = %at.display(),
+                "not deleting: reached through a symlink"
+            ),
+            Ok(Walk::Missing) => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "cannot delete: {e}");
+                first_err.get_or_insert(e);
+            }
         }
         let mut dir = rel.parent();
         while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
@@ -340,14 +450,18 @@ pub(crate) fn delete_listed(
             dir = d.parent();
         }
     }
+    let is_real_dir =
+        |rel: &Path| matches!(walk(output_folder, rel), Ok(Walk::Found(m)) if m.is_dir());
     // Deepest first.
     let mut dirs: Vec<_> = dirs.into_iter().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for d in dirs {
-        // Only removes an empty directory (and not a symlink to one).
-        let _ = std::fs::remove_dir(output_folder.join(d));
+        if is_real_dir(&d) {
+            // Only removes an empty directory.
+            let _ = std::fs::remove_dir(output_folder.join(d));
+        }
     }
-    if output_folder != keep {
+    if output_folder != keep && is_real_dir(Path::new("")) {
         let _ = std::fs::remove_dir(output_folder);
     }
     first_err.map_or(Ok(()), Err)
@@ -524,7 +638,7 @@ mod tests {
         std::fs::write(folder.join("sub/b.bin"), b"b").unwrap();
         std::fs::write(base.join("keep.txt"), b"k").unwrap();
         let t = info("bundle", false);
-        let (out, keep) = completed_folders(&folder, &t).unwrap();
+        let (out, keep) = completed_folders(&folder, &t, Placement::Folder).unwrap();
         assert_eq!((&out, &keep), (&folder, &base));
         // Something of the user's in the torrent's folder keeps the folder.
         std::fs::write(folder.join("other/x"), b"x").unwrap();
@@ -543,7 +657,7 @@ mod tests {
         // Single file directly in the download dir: the dir stays.
         let t = info("a.iso", true);
         std::fs::write(base.join("a.iso"), b"a").unwrap();
-        let (out, keep) = completed_folders(&base.join("a.iso"), &t).unwrap();
+        let (out, keep) = completed_folders(&base.join("a.iso"), &t, Placement::Direct).unwrap();
         assert_eq!((&out, &keep), (&base, &base));
         std::fs::remove_file(base.join("keep.txt")).unwrap();
         std::fs::remove_dir_all(&folder).unwrap();
@@ -555,7 +669,8 @@ mod tests {
         let own = base.join("a.iso (1)");
         std::fs::create_dir(&own).unwrap();
         std::fs::write(own.join("a.iso"), b"a").unwrap();
-        let (out, keep) = completed_folders(&own.join("a.iso"), &t).unwrap();
+        let (out, keep) =
+            completed_folders(&own.join("a.iso"), &t, Placement::FileInFolder).unwrap();
         assert_eq!((&out, &keep), (&own, &base));
         delete_listed(&out, &t.files, &keep).unwrap();
         assert!(!own.exists());
@@ -563,10 +678,137 @@ mod tests {
         let mag = base.join(HASH);
         std::fs::create_dir(&mag).unwrap();
         std::fs::write(mag.join("a.iso"), b"a").unwrap();
-        let (out, keep) = completed_folders(&mag, &t).unwrap();
+        let (out, keep) = completed_folders(&mag, &t, Placement::Folder).unwrap();
         assert_eq!((&out, &keep), (&mag, &base));
         delete_listed(&out, &t.files, &keep).unwrap();
         assert!(!mag.exists());
         assert!(base.is_dir());
+    }
+
+    #[test]
+    fn placement_follows_the_layout_and_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let none = |_: &Path| false;
+        let direct = Layout::fresh_torrent(base, &info("a.iso", true), none);
+        assert_eq!(Placement::of(&direct), Placement::Direct);
+        let multi = Layout::fresh_torrent(base, &info("bundle", false), none);
+        assert_eq!(Placement::of(&multi), Placement::Folder);
+        std::fs::write(base.join("a.iso"), b"user").unwrap();
+        let own = Layout::fresh_torrent(base, &info("a.iso", true), none);
+        assert_eq!(Placement::of(&own), Placement::FileInFolder);
+        let m = parse_magnet(&format!("magnet:?xt=urn:btih:{HASH}&dn=a.iso")).unwrap();
+        assert_eq!(
+            Placement::of(&Layout::fresh_magnet(base, &m, none)),
+            Placement::Folder
+        );
+        for p in [
+            Placement::Direct,
+            Placement::FileInFolder,
+            Placement::Folder,
+        ] {
+            assert_eq!(Placement::parse(p.as_str()), p);
+        }
+        assert_eq!(Placement::parse("garbage"), Placement::Folder);
+    }
+
+    #[test]
+    fn completed_folders_never_falls_back_to_the_download_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("dl");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("ubuntu.iso"), b"user").unwrap();
+        let t = info("ubuntu.iso", true);
+        // A magnet's single file, its folder gone: nothing outside it is touched.
+        let mag = base.join("ubuntu.iso (1)");
+        let (out, keep) = completed_folders(&mag, &t, Placement::Folder).unwrap();
+        assert_eq!((&out, &keep), (&mag, &base));
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert_eq!(std::fs::read(base.join("ubuntu.iso")).unwrap(), b"user");
+        // ... or replaced by a file.
+        std::fs::write(&mag, b"user 2").unwrap();
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert_eq!(std::fs::read(&mag).unwrap(), b"user 2");
+        assert!(base.join("ubuntu.iso").exists());
+        // A magnet named exactly like its file, its folder gone: still a folder.
+        let (out, _) = completed_folders(&base.join("ubuntu.iso"), &t, Placement::Folder).unwrap();
+        assert_eq!(out, base.join("ubuntu.iso"));
+        delete_listed(&out, &t.files, &base).unwrap();
+        assert!(base.join("ubuntu.iso").exists());
+
+        // A single-file placement needs single-file metainfo named like the path.
+        assert_eq!(
+            completed_folders(&base.join("other.iso"), &t, Placement::Direct),
+            None
+        );
+        assert_eq!(
+            completed_folders(
+                &base.join("bundle"),
+                &info("bundle", false),
+                Placement::Direct
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_listed_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("dl");
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        for f in ["a.bin", "b.bin", "sub/b.bin"] {
+            std::fs::write(outside.join(f), b"user").unwrap();
+        }
+        let t = info("bundle", false);
+        let intact = || {
+            for f in ["a.bin", "b.bin", "sub/b.bin"] {
+                assert_eq!(std::fs::read(outside.join(f)).unwrap(), b"user", "{f}");
+            }
+        };
+
+        // A symlinked sub-folder.
+        let folder = base.join("bundle");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.bin"), b"a").unwrap();
+        symlink(&outside, folder.join("sub")).unwrap();
+        delete_listed(&folder, &t.files, &base).unwrap();
+        intact();
+        assert!(!folder.join("a.bin").exists());
+        assert!(std::fs::symlink_metadata(folder.join("sub")).is_ok());
+        assert!(folder.is_dir(), "still holds the symlink");
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        // The torrent's folder itself a symlink.
+        symlink(outside.join("sub"), &folder).unwrap();
+        std::fs::write(outside.join("sub/a.bin"), b"user").unwrap();
+        let (out, keep) = completed_folders(&folder, &t, Placement::Folder).unwrap();
+        delete_listed(&out, &t.files, &keep).unwrap();
+        intact();
+        assert!(outside.join("sub/a.bin").exists());
+        assert!(std::fs::symlink_metadata(&folder).is_ok());
+        std::fs::remove_file(&folder).unwrap();
+
+        // A listed file that is a symlink.
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        symlink(outside.join("a.bin"), folder.join("a.bin")).unwrap();
+        std::fs::write(folder.join("sub/b.bin"), b"b").unwrap();
+        delete_listed(&folder, &t.files, &base).unwrap();
+        intact();
+        assert!(std::fs::symlink_metadata(folder.join("a.bin")).is_ok());
+        assert!(!folder.join("sub").exists());
+
+        // The download dir a symlink (single file directly in it): skipped.
+        let real = d.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.iso"), b"user").unwrap();
+        let link = d.path().join("link");
+        symlink(&real, &link).unwrap();
+        let t = info("a.iso", true);
+        let (out, keep) = completed_folders(&link.join("a.iso"), &t, Placement::Direct).unwrap();
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert!(real.join("a.iso").exists());
     }
 }

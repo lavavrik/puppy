@@ -836,3 +836,129 @@ async fn completed_torrent_files_are_deleted_from_the_stored_copy() {
     env2.engine.delete_completed(2, &added.path).await.unwrap();
     assert_files(&added.path, MULTI);
 }
+
+/// Completes `req` as download `id` and drops it like the daemon drops completed ones.
+async fn complete_and_drop(env: &Env, id: DownloadId, req: AddRequest) -> PathBuf {
+    let added = env.add(id, req).await.unwrap();
+    env.wait_state(id, DownloadState::Completed).await;
+    env.engine.drop_completed(id).await.unwrap();
+    added.path
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_magnets_missing_folder_never_touches_the_download_dir() {
+    let seeder = Seeder::start(&[("one.iso", 100 * KIB)]).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    std::fs::create_dir_all(env.out()).unwrap();
+    // The magnet's folder name collides with the user's file: `one.iso (1)/`.
+    std::fs::write(env.out().join("one.iso"), b"the user's own data").unwrap();
+    let uri = format!("{}&dn=one.iso", seeder.magnet);
+    let path = complete_and_drop(&env, 1, env.req(Source::Magnet { uri })).await;
+    assert_eq!(path, env.out().join("one.iso (1)"));
+    assert_files(&path, &[("one.iso", 100 * KIB)]);
+
+    // The user removes that folder, then asks puppy to delete the download's files.
+    std::fs::remove_dir_all(&path).unwrap();
+    env.engine.delete_completed(1, &path).await.unwrap();
+    assert_eq!(
+        std::fs::read(env.out().join("one.iso")).unwrap(),
+        b"the user's own data"
+    );
+
+    // The folder replaced by a file of the same name: left alone too.
+    std::fs::write(&path, b"a file now").unwrap();
+    env.engine.delete_completed(1, &path).await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a file now");
+    assert!(env.out().join("one.iso").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_single_file_torrents_removes_only_their_file() {
+    let seeder = Seeder::start(&[("one.iso", 100 * KIB)]).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    std::fs::create_dir_all(env.out()).unwrap();
+    std::fs::write(env.out().join("keep.txt"), b"mine").unwrap();
+    // Directly in the download dir.
+    let direct = complete_and_drop(&env, 1, env.torrent_req(&seeder)).await;
+    assert_eq!(direct, env.out().join("one.iso"));
+    env.engine.delete_completed(1, &direct).await.unwrap();
+    assert!(!direct.exists());
+    assert!(env.out().join("keep.txt").exists());
+    assert!(env.out().is_dir(), "the download dir stays");
+
+    // Its name taken: in a folder of its own, which goes too.
+    std::fs::write(&direct, b"the user's own data").unwrap();
+    let env2 = Env::new(vec![seeder.addr]).await;
+    let mut req = env2.torrent_req(&seeder);
+    req.output_dir = Some(env.out());
+    let own = complete_and_drop(&env2, 2, req).await;
+    assert_eq!(own, env.out().join("one.iso (1)/one.iso"));
+    env2.engine.delete_completed(2, &own).await.unwrap();
+    assert!(!env.out().join("one.iso (1)").exists());
+    assert_eq!(std::fs::read(&direct).unwrap(), b"the user's own data");
+    assert!(env.out().join("keep.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_never_follows_symlinks_out_of_the_torrent() {
+    use std::os::unix::fs::symlink;
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    let elsewhere = env.dir.path().join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("sub")).unwrap();
+    for f in ["a.bin", "b.bin", "sub/b.bin"] {
+        std::fs::write(elsewhere.join(f), b"the user's own data").unwrap();
+    }
+    let intact = |what: &str| {
+        for f in ["a.bin", "b.bin", "sub/b.bin"] {
+            assert_eq!(
+                std::fs::read(elsewhere.join(f)).unwrap(),
+                b"the user's own data",
+                "{what}: {f} was touched"
+            );
+        }
+    };
+
+    // A sub-folder of the torrent replaced by a symlink pointing outside.
+    let folder = complete_and_drop(&env, 1, env.torrent_req(&seeder)).await;
+    std::fs::remove_dir_all(folder.join("sub")).unwrap();
+    symlink(&elsewhere, folder.join("sub")).unwrap();
+    env.engine.delete_completed(1, &folder).await.unwrap();
+    intact("symlinked sub-folder");
+    assert!(
+        !folder.join("a.bin").exists(),
+        "the torrent's own file goes"
+    );
+    assert!(
+        std::fs::symlink_metadata(folder.join("sub")).is_ok(),
+        "the symlink is left alone"
+    );
+
+    // The torrent's folder itself replaced by a symlink to a folder outside.
+    std::fs::remove_dir_all(env.out()).unwrap();
+    std::fs::create_dir_all(env.out()).unwrap();
+    let env2 = Env::new(vec![seeder.addr]).await;
+    let mut req = env2.torrent_req(&seeder);
+    req.output_dir = Some(env.out());
+    let folder = complete_and_drop(&env2, 2, req).await;
+    std::fs::remove_dir_all(&folder).unwrap();
+    symlink(elsewhere.join("sub"), &folder).unwrap();
+    std::fs::write(elsewhere.join("sub/a.bin"), b"the user's own data").unwrap();
+    env2.engine.delete_completed(2, &folder).await.unwrap();
+    intact("symlinked torrent folder");
+    assert!(elsewhere.join("sub/a.bin").exists());
+    assert!(std::fs::symlink_metadata(&folder).is_ok());
+
+    // A listed file that is a symlink: the link is not followed nor removed.
+    std::fs::remove_file(&folder).unwrap();
+    let env3 = Env::new(vec![seeder.addr]).await;
+    let mut req = env3.torrent_req(&seeder);
+    req.output_dir = Some(env.out());
+    let folder = complete_and_drop(&env3, 3, req).await;
+    std::fs::remove_file(folder.join("a.bin")).unwrap();
+    symlink(elsewhere.join("a.bin"), folder.join("a.bin")).unwrap();
+    env3.engine.delete_completed(3, &folder).await.unwrap();
+    intact("symlinked file");
+    assert!(!folder.join("sub/b.bin").exists());
+}
