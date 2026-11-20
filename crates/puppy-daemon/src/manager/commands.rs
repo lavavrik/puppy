@@ -275,20 +275,20 @@ impl Manager {
     }
 
     /// Per-download limit in bytes/s (`None` or 0: unlimited); applied at once if the
-    /// engine holds the download.
+    /// engine holds the download. The limit is stored (and used from the next start)
+    /// even if the engine rejects it; the engine's error is returned.
     pub fn set_limit(&self, id: DownloadId, bps: Option<u64>) -> Result<()> {
         let inner = &self.inner;
         let bps = normalize_limit(bps);
         let mut st = inner.lock();
         let e = entry_mut(&mut st, id)?;
         e.rec.limit = bps;
-        if e.held
-            && let Some(engine) = e.engine
-        {
-            ignore_not_found(inner.engines[engine].set_download_limit(id, bps))?;
-        }
+        let engine = e.held.then_some(e.engine).flatten();
         inner.persist(&st);
-        Ok(())
+        match engine {
+            Some(engine) => ignore_not_found(inner.engines[engine].set_download_limit(id, bps)),
+            None => Ok(()),
+        }
     }
 
     /// Global limits in bytes/s (`None` or 0: unlimited). The download limit is divided

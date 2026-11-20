@@ -8,6 +8,7 @@ use puppy_proto::{DownloadSnapshot, ErrorCode, Event};
 use puppy_testserver::{ServerCfg, TestServer, body_byte};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -619,11 +620,17 @@ async fn restart_restores_every_state() {
 }
 
 /// An `HttpEngine` whose `add` waits for a permit before starting (`before`) and before
-/// returning (`after`), to race commands and events against a start.
+/// returning (`after`), to race commands and events against a start. With `gate_pause`
+/// set, `pause` counts itself in `pauses` and waits for a `pause_permits` permit first;
+/// with `fail_limit` set, `set_download_limit` fails.
 struct Gated {
     inner: HttpEngine,
     before: tokio::sync::Semaphore,
     after: tokio::sync::Semaphore,
+    gate_pause: AtomicBool,
+    pauses: AtomicUsize,
+    pause_permits: tokio::sync::Semaphore,
+    fail_limit: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -647,6 +654,10 @@ impl Engine for Gated {
         r
     }
     async fn pause(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        if self.gate_pause.load(Ordering::SeqCst) {
+            self.pauses.fetch_add(1, Ordering::SeqCst);
+            self.pause_permits.acquire().await.unwrap().forget();
+        }
         self.inner.pause(id).await
     }
     async fn resume(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
@@ -670,6 +681,9 @@ impl Engine for Gated {
         id: DownloadId,
         bps: Option<u64>,
     ) -> Result<(), puppy_core::engine::EngineError> {
+        if self.fail_limit.load(Ordering::SeqCst) {
+            return Err(puppy_core::engine::EngineError::Unsupported("limits"));
+        }
         self.inner.set_download_limit(id, bps)
     }
     fn set_global_download_budget(&self, bps: Option<u64>) {
@@ -686,6 +700,10 @@ impl Env {
             inner: HttpEngine::new(http_cfg(&self.dl_dir())).unwrap(),
             before: tokio::sync::Semaphore::new(0),
             after: tokio::sync::Semaphore::new(0),
+            gate_pause: AtomicBool::new(false),
+            pauses: AtomicUsize::new(0),
+            pause_permits: tokio::sync::Semaphore::new(0),
+            fail_limit: AtomicBool::new(false),
         });
         let cfg = Config {
             download_dir: self.dl_dir(),
@@ -798,4 +816,84 @@ async fn completion_before_add_returns_is_not_lost() {
     assert_file(&env.dl_dir().join("a.bin"), 64 * KIB, 0);
     assert!(m.is_idle());
     m.shutdown().await;
+}
+
+/// Starts a throttled download through the gated engine and waits until it transfers.
+async fn gated_active(env: &Env, s: &TestServer) -> (Arc<Manager>, Arc<Gated>, DownloadId) {
+    let (m, gated) = env.gated_manager().await;
+    let id = m.add(env.req(s, "a.bin"), false, None).await.unwrap();
+    gated.before.add_permits(1);
+    gated.after.add_permits(1);
+    wait_active_with_bytes(&m, id).await;
+    (m, gated, id)
+}
+
+fn stored_limit(env: &Env, id: DownloadId) -> Option<u64> {
+    let text = std::fs::read_to_string(env.state_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let d = v["downloads"].as_array()?.iter().find(|d| d["id"] == id)?;
+    d["limit"].as_u64()
+}
+
+#[tokio::test]
+async fn set_limit_is_stored_even_if_the_engine_rejects_it() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 4096 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let (m, gated, id) = gated_active(&env, &s).await;
+    gated.fail_limit.store(true, Ordering::SeqCst);
+    let err = m.set_limit(id, Some(100 * KIB)).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::Engine);
+    assert_eq!(snap(&m, id).limit, Some(100 * KIB));
+    // Persisted by `set_limit` itself (nothing else changes while it transfers, so
+    // nothing else would persist it within the store's debounce).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while stored_limit(&env, id) != Some(100 * KIB) {
+        assert!(Instant::now() < deadline, "the limit was not persisted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_shutdown_waits_for_the_first() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 256 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let (m, gated, _id) = gated_active(&env, &s).await;
+    gated.gate_pause.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let m = m.clone();
+        async move { m.shutdown().await }
+    });
+    wait_for("the shutdown to pause the download", || {
+        gated.pauses.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let mut second = tokio::spawn({
+        let m = m.clone();
+        async move { m.shutdown().await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut second)
+            .await
+            .is_err(),
+        "the second shutdown returned while the first was still pausing"
+    );
+    gated.pause_permits.add_permits(1);
+    tokio::time::timeout(TIMEOUT, first).await.unwrap().unwrap();
+    tokio::time::timeout(TIMEOUT, second)
+        .await
+        .unwrap()
+        .unwrap();
+    // A third call after completion returns at once.
+    tokio::time::timeout(Duration::from_secs(1), m.shutdown())
+        .await
+        .unwrap();
 }

@@ -80,8 +80,11 @@ struct Inner {
     events: broadcast::Sender<Event>,
     /// Cancels the event and tick tasks.
     stop: CancellationToken,
-    /// In-flight jobs (engine add/resume/reset), aborted on shutdown.
-    jobs: Mutex<JoinSet<()>>,
+    /// In-flight jobs (engine add/resume/reset), aborted on shutdown. `None` once
+    /// shutdown has begun: no job may start after that.
+    jobs: Mutex<Option<JoinSet<()>>>,
+    /// Completed by the first `shutdown`; later calls wait for it.
+    shutdown_done: tokio::sync::OnceCell<()>,
 }
 
 struct State {
@@ -226,7 +229,8 @@ impl Manager {
             }),
             events: broadcast::channel(EVENT_CAPACITY).0,
             stop: CancellationToken::new(),
-            jobs: Mutex::new(JoinSet::new()),
+            jobs: Mutex::new(Some(JoinSet::new())),
+            shutdown_done: tokio::sync::OnceCell::new(),
         });
         inner.restore(persisted).await;
         inner.persist(&inner.lock());
@@ -260,9 +264,11 @@ impl Manager {
 
     /// Pauses every engine-held download (so sidecars are flushed), persists the state
     /// (downloads that were active stay recorded as active, to resume after a restart)
-    /// and flushes the store. Later commands fail with `InvalidState`.
+    /// and flushes the store. Later commands fail with `InvalidState`. Concurrent and
+    /// later calls return once the first one has finished.
     pub async fn shutdown(&self) {
-        self.inner.shutdown().await;
+        let inner = &self.inner;
+        inner.shutdown_done.get_or_init(|| inner.shutdown()).await;
     }
 }
 
@@ -424,22 +430,28 @@ impl Inner {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(jobs) = jobs.as_mut() else {
+            // Shutting down: the download stays `Starting` and is persisted as active,
+            // so it is resumed after a restart.
+            tracing::debug!("not starting a job: shutting down");
+            return;
+        };
         while jobs.try_join_next().is_some() {}
         jobs.spawn(fut);
     }
 
+    /// Runs once (see `Manager::shutdown`); if a caller is cancelled midway, the next
+    /// one runs it again from the start, which is harmless.
     async fn shutdown(&self) {
-        let already = std::mem::replace(&mut self.lock().shutting_down, true);
-        if already {
-            self.store.flush().await;
-            return;
-        }
+        self.lock().shutting_down = true;
         self.stop.cancel();
         // Dropping an in-flight `add` cancels it; its download (if it got that far) is
         // paused below like every other one.
-        let mut jobs = std::mem::take(&mut *self.jobs.lock().unwrap_or_else(|e| e.into_inner()));
-        jobs.abort_all();
-        while jobs.join_next().await.is_some() {}
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut jobs) = jobs {
+            jobs.abort_all();
+            while jobs.join_next().await.is_some() {}
+        }
         // Engine-held (or possibly held: the add may have returned) downloads are
         // paused; ones removed while starting are removed as their job would have.
         let (to_pause, to_remove) = {
@@ -514,5 +526,31 @@ async fn tick_task(inner: Weak<Inner>, stop: CancellationToken) {
             inner.on_engine_change(engine, None);
         }
         inner.schedule();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn no_jobs_spawn_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("state.json"));
+        let m = Manager::start(Vec::new(), store, Config::default())
+            .await
+            .unwrap();
+        m.shutdown().await;
+        let ran = Arc::new(AtomicBool::new(false));
+        m.inner.spawn_job({
+            let ran = ran.clone();
+            async move { ran.store(true, Ordering::SeqCst) }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!ran.load(Ordering::SeqCst), "a job ran after shutdown");
     }
 }
