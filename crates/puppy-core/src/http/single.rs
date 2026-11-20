@@ -48,7 +48,7 @@ pub async fn run_single(ctx: &WorkerCtx, seg: Arc<SegmentShared>) -> WorkerExit 
             attempt = 0;
         }
         if attempt >= ctx.cfg.max_retries {
-            return WorkerExit::Fatal(format!("retries exhausted: {why}"));
+            return WorkerExit::Exhausted(format!("retries exhausted: {why}"));
         }
         let delay = backoff(&ctx.cfg, attempt);
         attempt += 1;

@@ -177,14 +177,14 @@ async fn worker_wrong_total_is_remote_changed() {
 }
 
 #[tokio::test]
-async fn worker_retries_exhausted_is_fatal() {
+async fn worker_retries_exhausted_is_transient() {
     let s = server(|_| {}).await;
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = make_ctx(&s, rw_file(&dir), None);
     ctx.url = s.url("/status/503");
     ctx.cfg.max_retries = 2;
     let exit = run_segment(&ctx, 0, seg(0, 5000)).await;
-    assert!(matches!(exit, WorkerExit::Fatal(_)), "{exit:?}");
+    assert!(matches!(exit, WorkerExit::Exhausted(_)), "{exit:?}");
     assert_eq!(s.requests_seen().len(), 3);
 }
 

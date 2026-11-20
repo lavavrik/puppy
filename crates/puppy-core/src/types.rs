@@ -46,8 +46,16 @@ pub enum DownloadState {
     Active,
     Paused,
     Completed,
-    Failed { reason: String },
-    NeedsAttention { reason: AttentionReason },
+    Failed {
+        reason: String,
+        /// The cause may go away by itself (network error, timeout, HTTP 5xx/429/408):
+        /// retrying later can succeed. Otherwise retrying as is would fail the same way.
+        #[serde(default)]
+        transient: bool,
+    },
+    NeedsAttention {
+        reason: AttentionReason,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

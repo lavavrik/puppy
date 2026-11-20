@@ -61,6 +61,23 @@ pub enum EngineError {
     Invalid(String),
 }
 
+impl EngineError {
+    /// Whether the error may go away by itself (network trouble, a timeout, or an HTTP
+    /// status saying "try again later": 5xx, 429, 408), so retrying later can succeed.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            EngineError::Network(_) => true,
+            EngineError::Http { status } => is_transient_status(*status),
+            _ => false,
+        }
+    }
+}
+
+/// HTTP statuses that mean "try again later".
+pub fn is_transient_status(status: u16) -> bool {
+    status >= 500 || status == 429 || status == 408
+}
+
 /// A download engine managing many downloads by caller-chosen id.
 ///
 /// - A download in `NeedsAttention` is not resumable as is. To restart it from scratch,
@@ -99,4 +116,23 @@ pub trait Engine: Send + Sync + 'static {
     /// Engine-wide download budget assigned by the daemon's global limiter.
     fn set_global_download_budget(&self, bps: Option<u64>);
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_errors() {
+        assert!(EngineError::Network("reset".into()).is_transient());
+        for status in [500, 502, 503, 429, 408] {
+            assert!(EngineError::Http { status }.is_transient(), "{status}");
+        }
+        for status in [400, 401, 403, 404, 410, 416] {
+            assert!(!EngineError::Http { status }.is_transient(), "{status}");
+        }
+        assert!(!EngineError::Io(std::io::Error::other("disk full")).is_transient());
+        assert!(!EngineError::Invalid("x".into()).is_transient());
+        assert!(!EngineError::NotFound(1).is_transient());
+    }
 }

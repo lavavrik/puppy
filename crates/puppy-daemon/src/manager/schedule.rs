@@ -228,6 +228,7 @@ impl Inner {
                 e.held = false;
                 DownloadState::Failed {
                     reason: err.to_string(),
+                    transient: err.is_transient(),
                 }
             }
             Outcome::Reset => {
@@ -249,6 +250,7 @@ impl Inner {
                         e.held = false;
                         DownloadState::Failed {
                             reason: "the engine lost the download".into(),
+                            transient: false,
                         }
                     }
                     Some(status) => {
@@ -266,6 +268,7 @@ impl Inner {
                             DownloadState::Paused => match outcome {
                                 Outcome::Resumed(Err(err)) => DownloadState::Failed {
                                     reason: err.to_string(),
+                                    transient: err.is_transient(),
                                 },
                                 // Resumed; the transfer has not marked itself active yet.
                                 _ => DownloadState::Active,

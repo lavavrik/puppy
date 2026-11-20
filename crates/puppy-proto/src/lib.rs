@@ -103,6 +103,7 @@ pub fn parse_request(
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // wire type; boxing would change the public API
 pub enum ServerMsg {
     Response {
         req_id: u64,
@@ -211,6 +212,9 @@ pub struct DownloadSnapshot {
     /// Active segment count (http).
     pub connections: Option<u16>,
     pub peers: Option<u32>,
+    /// When a transiently failed download is retried automatically (Unix seconds).
+    #[serde(default)]
+    pub next_retry_unix: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +239,9 @@ pub enum WireState {
     Completed,
     Failed {
         reason: String,
+        /// Retried automatically (see `DownloadSnapshot::next_retry_unix`).
+        #[serde(default)]
+        transient: bool,
     },
     NeedsAttention {
         reason: WireAttention,
@@ -279,8 +286,9 @@ impl From<&DownloadState> for WireState {
             DownloadState::Active => WireState::Active,
             DownloadState::Paused => WireState::Paused,
             DownloadState::Completed => WireState::Completed,
-            DownloadState::Failed { reason } => WireState::Failed {
+            DownloadState::Failed { reason, transient } => WireState::Failed {
                 reason: reason.clone(),
+                transient: *transient,
             },
             DownloadState::NeedsAttention { reason } => WireState::NeedsAttention {
                 reason: reason.into(),
@@ -323,7 +331,10 @@ mod tests {
             source: "http://x/f".into(),
             name: "f".into(),
             path: Some("/tmp/f".into()),
-            state: WireState::Failed { reason: "r".into() },
+            state: WireState::Failed {
+                reason: "r".into(),
+                transient: true,
+            },
             total_bytes: Some(10),
             done_bytes: 5,
             down_bps: 1,
@@ -333,6 +344,7 @@ mod tests {
             queue_position: Some(0),
             connections: Some(4),
             peers: None,
+            next_retry_unix: Some(99),
         }
     }
 
@@ -564,7 +576,14 @@ mod tests {
             DownloadState::Active,
             DownloadState::Paused,
             DownloadState::Completed,
-            DownloadState::Failed { reason: "r".into() },
+            DownloadState::Failed {
+                reason: "r".into(),
+                transient: false,
+            },
+            DownloadState::Failed {
+                reason: "r".into(),
+                transient: true,
+            },
             DownloadState::NeedsAttention {
                 reason: AttentionReason::RemoteChanged,
             },

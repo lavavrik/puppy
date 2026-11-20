@@ -491,7 +491,16 @@ async fn restore_network_error_fails_then_resume_completes() {
     s.set_cfg(|c| c.get_503_once = true);
     let (dl, _) = restore(&s, &final_path, dir.path()).await;
     let st = dl.status();
-    assert!(matches!(st.state, DownloadState::Failed { .. }), "{st:?}");
+    assert!(
+        matches!(
+            st.state,
+            DownloadState::Failed {
+                transient: true,
+                ..
+            }
+        ),
+        "{st:?}"
+    );
     assert!(part_path(&final_path).exists());
     dl.resume().await.unwrap();
     wait_completed(&dl).await;
@@ -565,7 +574,10 @@ async fn restore_stalled_server_times_out_failed() {
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     let st = dl.status();
     match &st.state {
-        DownloadState::Failed { reason } => assert!(reason.contains("timed out"), "{reason}"),
+        DownloadState::Failed {
+            reason,
+            transient: true,
+        } => assert!(reason.contains("timed out"), "{reason}"),
         other => panic!("expected Failed, got {other:?}"),
     }
     assert!(part_path(&final_path).exists());

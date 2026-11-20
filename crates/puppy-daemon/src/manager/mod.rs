@@ -9,6 +9,10 @@
 //!   While a job is in flight the download shows `Starting` and its entry carries a
 //!   [`JobCtl`]; commands racing it only leave requests there (pause) or orphan it
 //!   (remove), and the job settles them when the engine call returns.
+//! - Transient failures (`Failed { transient: true }`: network trouble, timeouts, HTTP
+//!   5xx/429/408) are retried automatically: requeued after `Config::retry_base`,
+//!   doubling per failure up to [`MAX_RETRY_DELAY`], for as long as the daemon runs.
+//!   Pausing cancels a pending retry; resuming (or restarting) resets the delay.
 //! - Engine events only mean "look again": the manager re-reads `engine.status()` instead
 //!   of trusting event payloads, and ignores events for downloads with a job in flight
 //!   (the job reads the status itself once the engine call returns). Events may thus
@@ -20,7 +24,7 @@ mod schedule;
 mod snapshot;
 
 use crate::budget;
-use crate::config::Config;
+use crate::config::{Config, MAX_RETRY_DELAY};
 use crate::store::{
     PersistedState, RuntimeSettings, Store, StoreError, StoredDownload, StoredState,
 };
@@ -111,6 +115,47 @@ struct Entry {
     held: bool,
     /// A job is in flight (`state` is `Starting`).
     job: Option<JobCtl>,
+    /// A pending automatic retry (only while `Failed { transient: true }`).
+    retry: Option<Retry>,
+    /// The delay before the next automatic retry; `None`: `Config::retry_base`.
+    backoff: Option<Duration>,
+}
+
+/// When a transiently failed download is requeued.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    at: tokio::time::Instant,
+    unix: u64,
+}
+
+impl Entry {
+    fn new(rec: StoredDownload, state: DownloadState, engine: Option<usize>) -> Self {
+        Entry {
+            rec,
+            state,
+            engine,
+            held: false,
+            job: None,
+            retry: None,
+            backoff: None,
+        }
+    }
+
+    /// Forgets a pending retry and resets the backoff (a user resumed or restarted).
+    fn reset_retry(&mut self) {
+        self.retry = None;
+        self.backoff = None;
+    }
+}
+
+fn is_transient_failure(s: &DownloadState) -> bool {
+    matches!(
+        s,
+        DownloadState::Failed {
+            transient: true,
+            ..
+        }
+    )
 }
 
 /// Requests left for an in-flight job by commands racing it.
@@ -155,8 +200,9 @@ fn stored_state(s: &DownloadState) -> StoredState {
         DownloadState::Starting | DownloadState::Active => StoredState::Active,
         DownloadState::Paused => StoredState::Paused,
         DownloadState::Completed => StoredState::Completed,
-        DownloadState::Failed { reason } => StoredState::Failed {
+        DownloadState::Failed { reason, transient } => StoredState::Failed {
             reason: reason.clone(),
+            transient: *transient,
         },
         DownloadState::NeedsAttention { reason } => StoredState::NeedsAttention {
             reason: reason.clone(),
@@ -252,13 +298,14 @@ impl Manager {
         self.inner.events.subscribe()
     }
 
-    /// No download is active, starting or queued.
+    /// No download is active, starting, queued or waiting for an automatic retry.
     pub fn is_idle(&self) -> bool {
         self.inner.lock().entries.values().all(|e| {
-            !matches!(
-                e.state,
-                DownloadState::Queued | DownloadState::Starting | DownloadState::Active
-            )
+            e.retry.is_none()
+                && !matches!(
+                    e.state,
+                    DownloadState::Queued | DownloadState::Starting | DownloadState::Active
+                )
         })
     }
 
@@ -311,7 +358,7 @@ impl Inner {
                     name: e.rec.name.clone().unwrap_or_default(),
                 });
             }
-            DownloadState::Failed { reason } => self.emit(Event::Failed {
+            DownloadState::Failed { reason, .. } => self.emit(Event::Failed {
                 id,
                 reason: reason.clone(),
             }),
@@ -322,7 +369,53 @@ impl Inner {
             _ => {}
         }
         e.state = next;
+        if is_transient_failure(&e.state) {
+            self.arm_retry(id, e);
+        } else {
+            e.retry = None;
+        }
         true
+    }
+
+    /// Schedules the automatic retry of a transiently failed download: after the
+    /// current backoff, which then doubles (up to [`MAX_RETRY_DELAY`]).
+    fn arm_retry(&self, id: DownloadId, e: &mut Entry) {
+        let delay = e
+            .backoff
+            .unwrap_or(self.cfg.retry_base)
+            .min(MAX_RETRY_DELAY);
+        e.backoff = Some((delay * 2).min(MAX_RETRY_DELAY));
+        let unix = now_unix() + delay.as_secs_f64().ceil() as u64;
+        e.retry = Some(Retry {
+            at: tokio::time::Instant::now() + delay,
+            unix,
+        });
+        tracing::info!(id, ?delay, "retrying the failed download later");
+    }
+
+    /// Requeues transiently failed downloads whose retry is due. The caller schedules
+    /// afterwards.
+    fn retry_due(&self) {
+        let now = tokio::time::Instant::now();
+        let mut st = self.lock();
+        if st.shutting_down {
+            return;
+        }
+        let mut changed = false;
+        for (id, e) in st.entries.iter_mut() {
+            if e.job.is_none()
+                && is_transient_failure(&e.state)
+                && e.retry.is_some_and(|r| r.at <= now)
+            {
+                tracing::info!(id, "retrying the failed download");
+                e.retry = None;
+                e.state = DownloadState::Queued;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(&st);
+        }
     }
 
     /// Copies what the engine knows about name, path and size into the record.
@@ -512,7 +605,8 @@ async fn event_task(
     }
 }
 
-/// Every second: resync with the engines, start queued downloads, rebalance limits.
+/// Every second: resync with the engines, requeue due retries, start queued downloads,
+/// rebalance limits.
 async fn tick_task(inner: Weak<Inner>, stop: CancellationToken) {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -525,6 +619,7 @@ async fn tick_task(inner: Weak<Inner>, stop: CancellationToken) {
         for engine in 0..inner.engines.len() {
             inner.on_engine_change(engine, None);
         }
+        inner.retry_due();
         inner.schedule();
     }
 }

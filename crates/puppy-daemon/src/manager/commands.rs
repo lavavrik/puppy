@@ -55,26 +55,18 @@ impl Manager {
             } else {
                 DownloadState::Queued
             };
-            st.entries.insert(
+            let rec = StoredDownload {
                 id,
-                Entry {
-                    rec: StoredDownload {
-                        id,
-                        request: req,
-                        limit: normalize_limit(limit),
-                        state: StoredState::Queued,
-                        name: None,
-                        path: None,
-                        total_bytes: None,
-                        created_unix: now_unix(),
-                        finished_unix: None,
-                    },
-                    state,
-                    engine: Some(engine),
-                    held: false,
-                    job: None,
-                },
-            );
+                request: req,
+                limit: normalize_limit(limit),
+                state: StoredState::Queued,
+                name: None,
+                path: None,
+                total_bytes: None,
+                created_unix: now_unix(),
+                finished_unix: None,
+            };
+            st.entries.insert(id, Entry::new(rec, state, Some(engine)));
             st.order.push(id);
             inner.persist(&st);
             inner.emit(Event::Added { id });
@@ -85,7 +77,8 @@ impl Manager {
     }
 
     /// Queued ⇒ paused (daemon-level); transferring ⇒ paused in the engine; starting ⇒
-    /// paused as soon as the engine call returns. Completed ⇒ `InvalidState`.
+    /// paused as soon as the engine call returns; failed with an automatic retry pending
+    /// ⇒ paused (the retry is cancelled). Completed ⇒ `InvalidState`.
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
         let (engine, was_active) = {
@@ -109,6 +102,12 @@ impl Manager {
                     (e.held.then_some(e.engine).flatten(), false)
                 }
                 DownloadState::Active => (e.engine, true),
+                DownloadState::Failed { .. } if e.retry.is_some() => {
+                    e.retry = None;
+                    e.state = DownloadState::Paused;
+                    inner.persist(&st);
+                    (None, false)
+                }
                 DownloadState::Paused
                 | DownloadState::Failed { .. }
                 | DownloadState::NeedsAttention { .. } => (None, false),
@@ -125,7 +124,8 @@ impl Manager {
     }
 
     /// Paused/Failed ⇒ resumed in the engine now if it holds the download and a slot is
-    /// free, else queued. NeedsAttention ⇒ `InvalidState` (restart it instead).
+    /// free, else queued. Resets the automatic-retry backoff. NeedsAttention ⇒
+    /// `InvalidState` (restart it instead).
     pub async fn resume(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
         let job = {
@@ -148,6 +148,7 @@ impl Manager {
                 }
                 DownloadState::Queued | DownloadState::Active => None,
                 DownloadState::Paused | DownloadState::Failed { .. } => {
+                    e.reset_retry();
                     let held = e.held;
                     let job = if held {
                         Inner::start_now(&mut st, id)
@@ -225,6 +226,7 @@ impl Manager {
                     "only failed downloads or downloads needing attention can be restarted".into(),
                 ));
             }
+            e.reset_retry();
             let job = if e.held {
                 Inner::begin_job(id, e, JobKind::Reset)
             } else {

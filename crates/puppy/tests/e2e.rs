@@ -276,7 +276,7 @@ async fn wait_state(
         if done(&d) {
             return d;
         }
-        if let WireState::Failed { reason } = &d.state {
+        if let WireState::Failed { reason, .. } = &d.state {
             panic!("download failed: {reason}");
         }
         assert!(Instant::now() < deadline, "never {what}: {d:?}");

@@ -39,6 +39,9 @@ pub struct ServerCfg {
     /// `slow_bytes_per_sec` instead of `bytes_per_sec` (makes one segment lag).
     pub slow_range_start: Option<u64>,
     pub slow_bytes_per_sec: Option<u64>,
+    /// Answer every request for the file with this status (e.g. 503), and abort the
+    /// bodies being sent once it is set: the server "goes down".
+    pub fail_status: Option<u16>,
 }
 
 impl Default for ServerCfg {
@@ -60,6 +63,7 @@ impl Default for ServerCfg {
             content_encoding: None,
             slow_range_start: None,
             slow_bytes_per_sec: None,
+            fail_status: None,
         }
     }
 }
@@ -227,6 +231,9 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     if cfg.stall_headers {
         std::future::pending::<()>().await;
     }
+    if let Some(status) = cfg.fail_status {
+        return plain(StatusCode::from_u16(status).expect("valid status"));
+    }
     let version = sh.version.load(Ordering::SeqCst);
     let is_head = match *req.method() {
         Method::GET => false,
@@ -326,12 +333,18 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     };
     builder
         .body(Body::from_stream(body_stream(
-            start, body_len, version, bps, fail_at,
+            sh.clone(),
+            start,
+            body_len,
+            version,
+            bps,
+            fail_at,
         )))
         .unwrap()
 }
 
 fn body_stream(
+    sh: Arc<Shared>,
     start: u64,
     len: u64,
     version: u32,
@@ -339,26 +352,33 @@ fn body_stream(
     fail_at: Option<u64>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     const CHUNK: u64 = 16 * 1024;
-    futures_util::stream::unfold((0u64, false), move |(sent, done)| async move {
-        if done || sent >= len {
-            return None;
-        }
-        let mut n = CHUNK.min(len - sent);
-        if let Some(f) = fail_at {
-            if sent >= f {
-                // Let hyper flush the bytes already queued before the connection is aborted.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected");
+    futures_util::stream::unfold((0u64, false), move |(sent, done)| {
+        let sh = sh.clone();
+        async move {
+            if done || sent >= len {
+                return None;
+            }
+            if sh.cfg.lock().unwrap().fail_status.is_some() {
+                let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "server down");
                 return Some((Err(err), (sent, true)));
             }
-            n = n.min(f - sent);
+            let mut n = CHUNK.min(len - sent);
+            if let Some(f) = fail_at {
+                if sent >= f {
+                    // Let hyper flush the bytes already queued before the connection is aborted.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected");
+                    return Some((Err(err), (sent, true)));
+                }
+                n = n.min(f - sent);
+            }
+            if let Some(bps) = bps.filter(|b| *b > 0) {
+                tokio::time::sleep(Duration::from_secs_f64(n as f64 / bps as f64)).await;
+            }
+            let chunk: Vec<u8> = (0..n)
+                .map(|i| body_byte(start + sent + i, version))
+                .collect();
+            Some((Ok(Bytes::from(chunk)), (sent + n, false)))
         }
-        if let Some(bps) = bps.filter(|b| *b > 0) {
-            tokio::time::sleep(Duration::from_secs_f64(n as f64 / bps as f64)).await;
-        }
-        let chunk: Vec<u8> = (0..n)
-            .map(|i| body_byte(start + sent + i, version))
-            .collect();
-        Some((Ok(Bytes::from(chunk)), (sent + n, false)))
     })
 }

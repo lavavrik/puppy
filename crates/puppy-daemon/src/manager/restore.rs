@@ -66,6 +66,7 @@ impl Inner {
                     (StoredState::Completed, _, _) => DownloadState::Completed,
                     (_, None, _) => DownloadState::Failed {
                         reason: "unsupported source".into(),
+                        transient: false,
                     },
                     (StoredState::Queued, ..) => DownloadState::Queued,
                     (StoredState::Active, Some(engine), Some(path)) => {
@@ -96,16 +97,12 @@ impl Inner {
                 } else {
                     rest.push(id);
                 }
-                st.entries.insert(
-                    id,
-                    Entry {
-                        rec,
-                        state,
-                        engine,
-                        held: false,
-                        job: None,
-                    },
-                );
+                let mut entry = Entry::new(rec, state, engine);
+                if super::is_transient_failure(&entry.state) {
+                    // Failed transiently before the restart: retried like any other.
+                    self.arm_retry(id, &mut entry);
+                }
+                st.entries.insert(id, entry);
             }
             front.extend(rest);
             st.order = front;
@@ -148,9 +145,11 @@ impl Inner {
                     }
                     Err(err) => {
                         tracing::warn!(id = r.id, "restoring failed: {err}");
-                        e.state = DownloadState::Failed {
+                        let next = DownloadState::Failed {
                             reason: format!("restoring failed: {err}"),
+                            transient: err.is_transient(),
                         };
+                        self.transition(r.id, e, next, &mut fx);
                     }
                 }
             }
@@ -162,8 +161,9 @@ impl Inner {
 /// The live state for a stored paused/failed/needs-attention download.
 fn live_state(stored: &StoredState) -> DownloadState {
     match stored {
-        StoredState::Failed { reason } => DownloadState::Failed {
+        StoredState::Failed { reason, transient } => DownloadState::Failed {
             reason: reason.clone(),
+            transient: *transient,
         },
         StoredState::NeedsAttention { reason } => DownloadState::NeedsAttention {
             reason: reason.clone(),

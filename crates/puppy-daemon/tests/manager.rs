@@ -47,12 +47,17 @@ impl Env {
     }
 
     async fn manager(&self, max_active: u16) -> Arc<Manager> {
+        self.manager_with(max_active, |_| {}).await
+    }
+
+    async fn manager_with(&self, max_active: u16, f: impl FnOnce(&mut Config)) -> Arc<Manager> {
         let engine: Arc<dyn Engine> = Arc::new(HttpEngine::new(http_cfg(&self.dl_dir())).unwrap());
-        let cfg = Config {
+        let mut cfg = Config {
             download_dir: self.dl_dir(),
             max_active,
             ..Config::default()
         };
+        f(&mut cfg);
         Manager::start(vec![engine], Store::new(self.state_path()), cfg)
             .await
             .unwrap()
@@ -884,4 +889,231 @@ async fn concurrent_shutdown_waits_for_the_first() {
     tokio::time::timeout(Duration::from_secs(1), m.shutdown())
         .await
         .unwrap();
+}
+
+const RETRY_BASE: Duration = Duration::from_millis(200);
+
+fn is_transient_failure(s: &WireState) -> bool {
+    matches!(
+        s,
+        WireState::Failed {
+            transient: true,
+            ..
+        }
+    )
+}
+
+async fn retrying_manager(env: &Env) -> Arc<Manager> {
+    env.manager_with(3, |c| c.retry_base = RETRY_BASE).await
+}
+
+/// Server down: the probe fails transiently and is retried on its own until the
+/// server is back.
+#[tokio::test]
+async fn transient_probe_failure_is_retried() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 64 * KIB;
+        c.fail_status = Some(503);
+    })
+    .await;
+    let m = retrying_manager(&env).await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_state(&m, id, is_transient_failure).await;
+    let d = snap(&m, id);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = d.next_retry_unix.expect("a retry is scheduled");
+    assert!(at >= now && at <= now + 2, "{at} vs {now}");
+    assert!(!m.is_idle(), "a pending retry is work");
+    // Still down: retried (more requests), still failing.
+    let seen = s.paths_seen().len();
+    wait_for("a retry", || s.paths_seen().len() > seen).await;
+    s.set_cfg(|c| c.fail_status = None);
+    wait_completed(&m, id).await;
+    assert_eq!(snap(&m, id).next_retry_unix, None);
+    assert_file(&env.dl_dir().join("a.bin"), 64 * KIB, 0);
+    m.shutdown().await;
+}
+
+/// A permanent failure (404) is left alone.
+#[tokio::test]
+async fn permanent_failure_is_not_retried() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    let m = retrying_manager(&env).await;
+    let mut req = env.req(&s, "a.bin");
+    req.source = Source::Http {
+        url: s.url("/missing"),
+    };
+    let id = m.add(req, false, None).await.unwrap();
+    wait_state(&m, id, |s| {
+        matches!(
+            s,
+            WireState::Failed {
+                transient: false,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(snap(&m, id).next_retry_unix, None);
+    let seen = s.paths_seen().len();
+    tokio::time::sleep(RETRY_BASE * 3 + Duration::from_secs(1)).await;
+    assert_eq!(
+        s.paths_seen().len(),
+        seen,
+        "a permanent failure was retried"
+    );
+    assert!(m.is_idle());
+    m.shutdown().await;
+}
+
+/// A transfer whose server starts failing mid-way ends up failed transiently once the
+/// workers' own retries are exhausted, then continues by itself.
+#[tokio::test]
+async fn transient_transfer_failure_is_retried() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(256 * KIB);
+    })
+    .await;
+    let m = retrying_manager(&env).await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_active_with_bytes(&m, id).await;
+    s.set_cfg(|c| c.fail_status = Some(500));
+    wait_state(&m, id, is_transient_failure).await;
+    s.set_cfg(|c| {
+        c.fail_status = None;
+        c.bytes_per_sec = None;
+    });
+    wait_completed(&m, id).await;
+    assert_file(&env.dl_dir().join("a.bin"), 512 * KIB, 0);
+    m.shutdown().await;
+}
+
+/// Pausing cancels a pending retry; resuming starts again at once.
+#[tokio::test]
+async fn pause_cancels_a_pending_retry() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 64 * KIB;
+        c.fail_status = Some(503);
+    })
+    .await;
+    let m = retrying_manager(&env).await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_state(&m, id, is_transient_failure).await;
+    m.pause(id).await.unwrap();
+    let d = snap(&m, id);
+    assert_eq!(d.state, WireState::Paused);
+    assert_eq!(d.next_retry_unix, None);
+    let seen = s.paths_seen().len();
+    tokio::time::sleep(RETRY_BASE * 3 + Duration::from_secs(1)).await;
+    assert_eq!(s.paths_seen().len(), seen, "retried while paused");
+    assert_eq!(snap(&m, id).state, WireState::Paused);
+    s.set_cfg(|c| c.fail_status = None);
+    m.resume(id).await.unwrap();
+    wait_completed(&m, id).await;
+    m.shutdown().await;
+}
+
+/// Backoff doubles per failure and `resume` resets it.
+#[tokio::test]
+async fn retry_backoff_doubles_and_resume_resets_it() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 64 * KIB;
+        c.fail_status = Some(503);
+    })
+    .await;
+    let m = env
+        .manager_with(3, |c| c.retry_base = Duration::from_secs(4))
+        .await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_state(&m, id, is_transient_failure).await;
+    let first = snap(&m, id).next_retry_unix.unwrap();
+    // The first retry fails again: the next one is twice as far away.
+    let mut rx = m.events();
+    next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await;
+    let failed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let second = snap(&m, id).next_retry_unix.unwrap();
+    assert!(second > first, "{second} vs {first}");
+    let delay = second - failed_at;
+    assert!((7..=9).contains(&delay), "second delay {delay}");
+    // Resume: tried again at once, and the next failure waits the base delay again.
+    m.resume(id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await;
+    let failed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let delay = snap(&m, id).next_retry_unix.unwrap() - failed_at;
+    assert!((3..=5).contains(&delay), "delay after resume {delay}");
+    m.shutdown().await;
+}
+
+/// A download that was active when the daemon stopped and whose server is down after
+/// the restart is retried like any other transient failure.
+#[tokio::test]
+async fn restored_active_download_retries_transient_failure() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(128 * KIB);
+    })
+    .await;
+    let m = retrying_manager(&env).await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_active_with_bytes(&m, id).await;
+    m.shutdown().await;
+    drop(m);
+    s.set_cfg(|c| {
+        c.fail_status = Some(503);
+        c.bytes_per_sec = None;
+    });
+    let m = retrying_manager(&env).await;
+    wait_state(&m, id, is_transient_failure).await;
+    s.set_cfg(|c| c.fail_status = None);
+    wait_completed(&m, id).await;
+    assert_file(&env.dl_dir().join("a.bin"), 512 * KIB, 0);
+    m.shutdown().await;
+}
+
+/// A download that had failed transiently before a restart is retried after it.
+#[tokio::test]
+async fn stored_transient_failure_is_retried_after_restart() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    let rec = puppy_daemon::StoredDownload {
+        id: 4,
+        request: env.req(&s, "a.bin"),
+        limit: None,
+        state: puppy_daemon::StoredState::Failed {
+            reason: "network error".into(),
+            transient: true,
+        },
+        name: None,
+        path: None,
+        total_bytes: None,
+        created_unix: 1,
+        finished_unix: None,
+    };
+    let st = puppy_daemon::PersistedState {
+        next_id: 5,
+        order: vec![4],
+        downloads: vec![rec],
+        ..Default::default()
+    };
+    Store::new(env.state_path()).save_now(&st).await.unwrap();
+    let m = retrying_manager(&env).await;
+    assert!(snap(&m, 4).next_retry_unix.is_some());
+    wait_completed(&m, 4).await;
+    m.shutdown().await;
 }

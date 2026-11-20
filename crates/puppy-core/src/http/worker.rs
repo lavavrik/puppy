@@ -99,6 +99,9 @@ pub enum WorkerExit {
     /// The URL answered 401/403/404/410: possibly an expired signed redirect target.
     UrlRejected(u16),
     Fatal(String),
+    /// Every retry failed on errors that may go away by themselves (network errors,
+    /// timeouts, HTTP 5xx/429/408).
+    Exhausted(String),
 }
 
 /// Statuses with which an (expired) signed URL typically refuses a request.
@@ -145,7 +148,7 @@ pub async fn run_segment(ctx: &WorkerCtx, start: u64, seg: Arc<SegmentShared>) -
                     attempt = 0;
                 }
                 if attempt >= ctx.cfg.max_retries {
-                    return WorkerExit::Fatal(format!("retries exhausted: {why}"));
+                    return WorkerExit::Exhausted(format!("retries exhausted: {why}"));
                 }
                 let delay = backoff(&ctx.cfg, attempt);
                 attempt += 1;

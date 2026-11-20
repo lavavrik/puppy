@@ -93,6 +93,7 @@ impl Inner {
             queue_position,
             connections,
             peers,
+            next_retry_unix: e.retry.map(|r| r.unix),
         };
         (snap, detail)
     }

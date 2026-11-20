@@ -1,6 +1,7 @@
 //! TOML configuration for the daemon.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use puppy_core::config::HttpConfig;
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,14 @@ pub struct Config {
     pub global_up_limit: Option<u64>,
     pub theme: String,
     pub proxy: Option<url::Url>,
+    /// First delay before a transiently failed download is retried automatically;
+    /// doubles per failure up to [`MAX_RETRY_DELAY`]. Not read from the file.
+    #[serde(skip)]
+    pub retry_base: Duration,
 }
+
+/// The longest delay between automatic retries of a transiently failed download.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 
 impl Default for Config {
     fn default() -> Self {
@@ -54,6 +62,7 @@ impl Default for Config {
             global_up_limit: None,
             theme: "auto".into(),
             proxy: None,
+            retry_base: Duration::from_secs(30),
         }
     }
 }

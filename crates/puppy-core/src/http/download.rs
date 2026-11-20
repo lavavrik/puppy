@@ -276,6 +276,7 @@ impl HttpDownload {
             Err(e) => {
                 env.emit(DownloadState::Failed {
                     reason: e.to_string(),
+                    transient: e.is_transient(),
                 });
                 return Err(e);
             }
@@ -287,6 +288,7 @@ impl HttpDownload {
             if let Err(e) = inner.write_sidecar().await {
                 inner.set_state(DownloadState::Failed {
                     reason: e.to_string(),
+                    transient: e.is_transient(),
                 });
                 let part = part_path(&inner.final_path);
                 if let Err(e) = tokio::fs::remove_file(&part).await {
@@ -494,6 +496,7 @@ impl Inner {
             Err(e) => {
                 self.set_state(DownloadState::Failed {
                     reason: format!("validating the remote file failed: {e}"),
+                    transient: e.is_transient(),
                 });
                 Err(e)
             }
@@ -560,6 +563,7 @@ impl Inner {
     fn task_failed(&self, e: tokio::task::JoinError) {
         self.set_state(DownloadState::Failed {
             reason: format!("download task failed: {e}"),
+            transient: false,
         });
     }
 
@@ -664,7 +668,10 @@ mod tests {
     async fn set_state_propagates_a_changed_failure_reason() {
         let (tx, mut rx) = broadcast::channel(16);
         let inner = Inner::for_test(tx);
-        let failed = |r: &str| DownloadState::Failed { reason: r.into() };
+        let failed = |r: &str| DownloadState::Failed {
+            reason: r.into(),
+            transient: false,
+        };
         inner.set_state(failed("a"));
         inner.set_state(failed("b"));
         inner.set_state(failed("b")); // unchanged: not re-emitted

@@ -46,8 +46,15 @@ pub enum StoredState {
     Active,
     Paused,
     Completed,
-    Failed { reason: String },
-    NeedsAttention { reason: AttentionReason },
+    Failed {
+        reason: String,
+        /// Retried automatically (also after a restart).
+        #[serde(default)]
+        transient: bool,
+    },
+    NeedsAttention {
+        reason: AttentionReason,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -291,6 +298,7 @@ mod tests {
                 limit: Some(5),
                 state: StoredState::Failed {
                     reason: "boom".into(),
+                    transient: true,
                 },
                 name: Some("f.bin".into()),
                 path: Some("/tmp/f.bin".into()),
@@ -347,6 +355,18 @@ mod tests {
         .unwrap();
         assert_eq!(s.load().await.unwrap(), PersistedState::default());
         assert_eq!(corrupt_files(d.path()).len(), 1);
+    }
+
+    #[test]
+    fn failed_without_transient_parses() {
+        let s: StoredState = serde_json::from_str(r#"{"kind":"failed","reason":"x"}"#).unwrap();
+        assert_eq!(
+            s,
+            StoredState::Failed {
+                reason: "x".into(),
+                transient: false
+            }
+        );
     }
 
     #[tokio::test(start_paused = true)]

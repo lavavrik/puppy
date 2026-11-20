@@ -24,6 +24,9 @@ enum Outcome {
     RangeUnsupported,
     UrlRejected(u16),
     Fatal(String),
+    /// Failed for a reason that may go away by itself (retries exhausted on network
+    /// errors or 5xx/429/408).
+    Transient(String),
 }
 
 pub(super) fn spawn_run(inner: &Arc<Inner>) -> RunHandle {
@@ -49,17 +52,26 @@ async fn run(inner: Arc<Inner>, cancel: CancellationToken) -> RunEnd {
                 }
                 Err(e) => DownloadState::Failed {
                     reason: format!("finalizing failed: {e}"),
+                    transient: false,
                 },
             },
             Outcome::RemoteChanged => DownloadState::NeedsAttention {
                 reason: AttentionReason::RemoteChanged,
             },
-            Outcome::Fatal(reason) => DownloadState::Failed { reason },
+            Outcome::Fatal(reason) => DownloadState::Failed {
+                reason,
+                transient: false,
+            },
+            Outcome::Transient(reason) => DownloadState::Failed {
+                reason,
+                transient: true,
+            },
             Outcome::UrlRejected(status) => {
                 let done = inner.lock().plan.done_bytes();
                 if reresolved_at.is_some_and(|at| done <= at) {
                     DownloadState::Failed {
                         reason: format!("HTTP {status}"),
+                        transient: false,
                     }
                 } else {
                     let result = tokio::select! {
@@ -76,17 +88,20 @@ async fn run(inner: Arc<Inner>, cancel: CancellationToken) -> RunEnd {
                         },
                         Err(e) => DownloadState::Failed {
                             reason: format!("HTTP {status}; re-resolving the URL failed: {e}"),
+                            transient: e.is_transient(),
                         },
                     }
                 }
             }
             Outcome::RangeUnsupported if inner.lock().plan.fell_back => DownloadState::Failed {
                 reason: "server does not honour range requests".into(),
+                transient: false,
             },
             Outcome::RangeUnsupported => match fall_back_to_single(&inner).await {
                 Ok(()) => continue,
                 Err(e) => DownloadState::Failed {
                     reason: format!("restarting as a single stream failed: {e}"),
+                    transient: false,
                 },
             },
         };
@@ -218,6 +233,7 @@ async fn drive(
                     WorkerExit::RangeUnsupported => return Outcome::RangeUnsupported,
                     WorkerExit::UrlRejected(s) => return Outcome::UrlRejected(s),
                     WorkerExit::Fatal(reason) => return Outcome::Fatal(reason),
+                    WorkerExit::Exhausted(reason) => return Outcome::Transient(reason),
                 }
             }
             _ = flush_iv.tick() => inner.flush_if_changed(file, &mut flushed).await,

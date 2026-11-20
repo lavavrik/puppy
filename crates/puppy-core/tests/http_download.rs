@@ -596,7 +596,7 @@ async fn compressed_response_fails_without_writing() {
         let (dl, added) = start(&s, dir.path(), cfg(dir.path())).await;
         let st = wait_state(&dl, |s| matches!(s, DownloadState::Failed { .. }), TIMEOUT).await;
         assert!(
-            matches!(&st.state, DownloadState::Failed { reason } if reason == "server sent compressed content (br)"),
+            matches!(&st.state, DownloadState::Failed { reason, transient: false } if reason == "server sent compressed content (br)"),
             "{st:?}"
         );
         assert_eq!(st.done_bytes, 0);
@@ -633,4 +633,58 @@ async fn idle_transfer_does_not_rewrite_sidecar() {
         "sidecar rewritten without progress"
     );
     dl.cancel(true).await;
+}
+
+/// A server that keeps failing with 5xx exhausts the workers' retries: the download
+/// fails as transient (retrying later can succeed), keeping its progress.
+#[tokio::test]
+async fn exhausted_server_errors_fail_transiently() {
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(256 * KIB);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(&s, dir.path(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT).await;
+    s.set_cfg(|c| c.fail_status = Some(503));
+    let st = wait_state(&dl, |s| matches!(s, DownloadState::Failed { .. }), TIMEOUT).await;
+    assert!(
+        matches!(&st.state, DownloadState::Failed { transient: true, reason } if reason.contains("503")),
+        "{st:?}"
+    );
+    assert!(st.done_bytes > 0);
+    s.set_cfg(|c| {
+        c.fail_status = None;
+        c.bytes_per_sec = None;
+    });
+    dl.resume().await.unwrap();
+    wait_state(&dl, is_completed, TIMEOUT).await;
+    assert_file(&added.path, 512 * KIB, 0);
+}
+
+/// A probe answered with 5xx is a transient error, with 404 a permanent one.
+#[tokio::test]
+async fn probe_errors_are_classified() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = server(|c| c.fail_status = Some(503)).await;
+    let c = cfg(dir.path());
+    let client = build_client(&c).unwrap();
+    let probe = |path: &str| {
+        let mut req = request(&s, dir.path());
+        req.source = Source::Http { url: s.url(path) };
+        HttpDownload::start_fresh(
+            1,
+            req,
+            AddOptions::default(),
+            client.clone(),
+            c.clone(),
+            TokenBucket::new(None),
+            broadcast::channel(16).0,
+        )
+    };
+    let e = probe("/file.bin").await.err().expect("probe fails");
+    assert!(e.is_transient(), "{e}");
+    let e = probe("/missing").await.err().expect("probe fails");
+    assert!(!e.is_transient(), "{e}");
 }
