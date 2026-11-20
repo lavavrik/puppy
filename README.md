@@ -46,7 +46,7 @@ A text render of the dashboard (120x32, dark theme, sample data):
 │      completed · 1.0 GiB                                          ││ Limit      20.0 MiB/s                           │
 │  ↻ 5 big-dataset.tar.zst                █████                 25% ││ Source     https://exa…4.04.3-desktop-amd64.iso │
 │      retry in 1:23 · connection reset by peer                     ││                                                 │
-│  ! 6 photos.zip                         █████                 25% ││ Speed history                   peak 17.0 MiB/s │
+│  ! 6 photos.zip                         █████                 25% ││ speed · last 60 s               peak 17.0 MiB/s │
 │      remote file changed · R restarts                             ││ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    │
 │  ⏸ 7 notes.pdf                          █████                 25% ││ █▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ │
 │      paused · 256.0 MiB / 1.0 GiB                                 ││ ██████▇████████████▇████████████▇████████████▇█ │
@@ -121,7 +121,7 @@ The footer shows the keys that apply to the current selection.
 
 ### Configuration
 
-Settings go in `config.toml` (location above). Keys:
+Settings go in `config.toml` (where it lives: see below). Keys:
 `download_dir`, `connections` (default 8), `max_active` (default 3),
 `global_down_limit`, `global_up_limit` (bytes per second), `theme`
 (`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and
