@@ -1,7 +1,7 @@
 //! Starting the daemon in the background, detached from the client's terminal.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Idle timeout (seconds) for a daemon started by a client, unless `PUPPY_IDLE_EXIT`
@@ -10,14 +10,30 @@ const DEFAULT_IDLE_EXIT_SECS: u64 = 30;
 
 /// Starts `exe daemon --idle-exit <PUPPY_IDLE_EXIT or 30>` detached from this process
 /// (its own session on Unix; no console and its own process group on Windows), with
-/// stdin/stdout/stderr null. `PUPPY_HOME` and `PUPPY_SOCKET` are forwarded when set,
-/// then `extra_env` is applied. Returns once the process is started; whether it
-/// becomes the daemon (or finds one already running) is up to it.
-pub fn spawn_daemon_detached(exe: &Path, extra_env: &[(&str, &str)]) -> io::Result<()> {
+/// stdin/stdout/stderr null, in `cwd` (the daemon's data dir) if it is a directory,
+/// else in the filesystem root, never in the caller's working directory (which it
+/// would keep busy). `PUPPY_HOME` and `PUPPY_SOCKET` are forwarded when set, then
+/// `extra_env` is applied; `PUPPY_IDLE_EXIT` is looked up in `extra_env` first.
+/// Returns once the process is started; whether it becomes the daemon (or finds one
+/// already running) is up to it.
+pub fn spawn_daemon_detached(
+    exe: &Path,
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+) -> io::Result<()> {
+    let idle_exit = extra_env
+        .iter()
+        .find(|(k, _)| *k == "PUPPY_IDLE_EXIT")
+        .map(|(_, v)| v.to_string())
+        .or_else(|| std::env::var("PUPPY_IDLE_EXIT").ok());
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
         .arg("--idle-exit")
-        .arg(idle_exit_secs().to_string())
+        .arg(idle_exit_secs(idle_exit.as_deref()).to_string())
+        .current_dir(match cwd {
+            Some(d) if d.is_dir() => d.to_path_buf(),
+            _ => root_dir(),
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -35,11 +51,21 @@ pub fn spawn_daemon_detached(exe: &Path, extra_env: &[(&str, &str)]) -> io::Resu
     Ok(())
 }
 
-fn idle_exit_secs() -> u64 {
-    std::env::var("PUPPY_IDLE_EXIT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
+fn idle_exit_secs(var: Option<&str>) -> u64 {
+    var.and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_IDLE_EXIT_SECS)
+}
+
+#[cfg(unix)]
+fn root_dir() -> PathBuf {
+    PathBuf::from("/")
+}
+
+/// The system drive's root, e.g. `C:\`.
+#[cfg(windows)]
+fn root_dir() -> PathBuf {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    PathBuf::from(format!("{drive}\\"))
 }
 
 #[cfg(unix)]

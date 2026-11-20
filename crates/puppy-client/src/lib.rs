@@ -21,6 +21,7 @@ use puppy_proto::{
     CodecError, DownloadSnapshot, Envelope, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply,
     ReplyData, Request, ServerMsg, write_msg,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -46,6 +47,8 @@ const RETRY_FIRST: Duration = Duration::from_millis(50);
 const RETRY_MAX: Duration = Duration::from_millis(500);
 /// Windows: every instance of the pipe is busy (the daemon is there).
 const ERROR_PIPE_BUSY: i32 = 231;
+/// The daemon's log file, in `Paths::log_dir`.
+const DAEMON_LOG: &str = "puppyd.log";
 /// At most one daemon is spawned per this period while waiting for one to listen.
 const RESPAWN_EVERY: Duration = Duration::from_secs(1);
 
@@ -69,6 +72,12 @@ pub enum ClientError {
     /// No reply within [`CALL_TIMEOUT`] (or the handshake timeout).
     #[error("the daemon did not reply in time")]
     Timeout,
+    /// No daemon answered within the spawn budget after starting one.
+    #[error("no daemon answered after starting one (see its log, {}): {last}", log_file.display())]
+    NoDaemon {
+        log_file: std::path::PathBuf,
+        last: Box<ClientError>,
+    },
     /// The daemon executable could not be started.
     #[error("cannot start the daemon: {0}")]
     Spawn(io::Error),
@@ -79,7 +88,7 @@ pub struct Client {
     /// `None` once a write failed or was torn: nothing more may be written.
     writer: tokio::sync::Mutex<Option<WriteHalf<Stream>>>,
     next_id: AtomicU64,
-    events: mpsc::Receiver<Event>,
+    events: Option<mpsc::Receiver<Event>>,
     reader: JoinHandle<()>,
 }
 
@@ -93,7 +102,7 @@ struct Shared {
 }
 
 struct Pending {
-    calls: HashMap<u64, oneshot::Sender<Reply>>,
+    calls: HashMap<u64, oneshot::Sender<Result<Reply, String>>>,
     open: bool,
 }
 
@@ -102,7 +111,10 @@ impl Shared {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn register(&self, req_id: u64) -> Result<oneshot::Receiver<Reply>, ClientError> {
+    fn register(
+        &self,
+        req_id: u64,
+    ) -> Result<oneshot::Receiver<Result<Reply, String>>, ClientError> {
         let mut p = self.lock();
         if !p.open {
             return Err(ClientError::Disconnected);
@@ -196,23 +208,28 @@ impl Client {
             shared,
             writer: tokio::sync::Mutex::new(Some(wr)),
             next_id: AtomicU64::new(HELLO_ID + 1),
-            events,
+            events: Some(events),
             reader,
         })
     }
 
-    /// Like [`connect`](Self::connect), but when no daemon answers, starts
-    /// `exe daemon --idle-exit …` detached ([`spawn_daemon_detached`]) and retries with
-    /// backoff (50 ms doubling to 500 ms) for up to 5 s. While a daemon is on its way
-    /// out (refusing connections or hanging up) another may be spawned, at most once
-    /// per second; extra ones find the lock taken and exit. Errors that retrying cannot
-    /// fix (another user's socket, a protocol mismatch, the executable failing to
-    /// start) are returned at once; otherwise the last connection error after 5 s.
+    /// Like [`connect`](Self::connect) to `paths.socket`, but when no daemon answers,
+    /// starts `exe daemon --idle-exit …` detached ([`spawn_daemon_detached`], in
+    /// `paths.data_dir`, with `extra_env`) and retries with backoff (50 ms doubling to
+    /// 500 ms) for up to 5 s. `paths` should be what the daemon resolves from its
+    /// environment ([`Paths::resolve`]). While a daemon is on its way out (refusing
+    /// connections or hanging up) another may be spawned, at most once per second;
+    /// extra ones find the lock taken and exit. Errors that retrying cannot fix
+    /// (another user's socket, a protocol mismatch, the executable failing to start)
+    /// are returned at once; after 5 s, [`ClientError::NoDaemon`] naming the daemon's
+    /// log file and the last connection error.
     pub async fn connect_or_spawn(
-        name: &SocketName,
+        paths: &Paths,
         client_name: &str,
         exe: &Path,
+        extra_env: &[(&str, &str)],
     ) -> Result<Self, ClientError> {
+        let name = &paths.socket;
         let deadline = Instant::now() + SPAWN_BUDGET;
         let mut delay = RETRY_FIRST;
         let mut last_spawn: Option<Instant> = None;
@@ -226,12 +243,16 @@ impl Client {
             };
             if last_spawn.is_none_or(|t| t.elapsed() >= RESPAWN_EVERY) {
                 debug!("no daemon answered ({err}); starting {}", exe.display());
-                spawn_daemon_detached(exe, &[]).map_err(ClientError::Spawn)?;
+                spawn_daemon_detached(exe, Some(&paths.data_dir), extra_env)
+                    .map_err(ClientError::Spawn)?;
                 last_spawn = Some(Instant::now());
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(err);
+                return Err(ClientError::NoDaemon {
+                    log_file: paths.log_dir.join(DAEMON_LOG),
+                    last: Box::new(err),
+                });
             }
             tokio::time::sleep(delay.min(left)).await;
             delay = (delay * 2).min(RETRY_MAX);
@@ -246,7 +267,11 @@ impl Client {
         let _unregister = Unregister(&self.shared, req_id);
         let exchange = async {
             self.send(&Envelope { req_id, body: req }).await?;
-            rx.await.map_err(|_| ClientError::Disconnected)
+            match rx.await {
+                Ok(Ok(reply)) => Ok(reply),
+                Ok(Err(e)) => Err(ClientError::Protocol(format!("unreadable reply: {e}"))),
+                Err(_) => Err(ClientError::Disconnected),
+            }
         };
         let reply = timeout(CALL_TIMEOUT, exchange)
             .await
@@ -256,27 +281,35 @@ impl Client {
 
     async fn send(&self, msg: &Envelope<Request>) -> Result<(), ClientError> {
         let mut writer = self.writer.lock().await;
-        let Some(w) = writer.as_mut() else {
-            return Err(ClientError::Disconnected);
-        };
         if self.shared.close.is_cancelled() {
+            *writer = None;
             return Err(ClientError::Disconnected);
         }
-        // A write abandoned half-way (the call timed out or was dropped) leaves a torn
-        // frame on the wire, after which nothing can be framed: close the connection.
+        // Taken out while writing: a write abandoned half-way (the call timed out or
+        // was dropped) leaves a torn frame on the wire, after which nothing can be
+        // framed. The writer is then dropped with the future and `close` makes the
+        // reader drop its half, so the OS connection closes.
+        let Some(mut w) = writer.take() else {
+            return Err(ClientError::Disconnected);
+        };
         let torn = self.shared.close.clone().drop_guard();
-        let r = write_msg(w, msg).await;
+        let r = write_msg(&mut w, msg).await;
         torn.disarm();
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                *writer = Some(w);
+                Ok(())
+            }
             Err(CodecError::Io(e)) => {
                 debug!("writing to the daemon failed: {e}");
-                *writer = None;
                 self.shared.close.cancel();
                 Err(ClientError::Disconnected)
             }
             // Nothing was written; the connection is fine.
-            Err(e) => Err(ClientError::Protocol(format!("cannot send request: {e}"))),
+            Err(e) => {
+                *writer = Some(w);
+                Err(ClientError::Protocol(format!("cannot send request: {e}")))
+            }
         }
     }
 
@@ -318,9 +351,16 @@ impl Client {
     }
 
     /// The next event; `None` once the connection is closed and queued events are
-    /// read.
+    /// read, or if the stream was moved out with [`take_events`](Self::take_events).
     pub async fn next_event(&mut self) -> Option<Event> {
-        self.events.recv().await
+        self.events.as_mut()?.recv().await
+    }
+
+    /// Moves the event stream out of the client, e.g. to read it in its own task while
+    /// the client is shared (`Arc<Client>`) for calls. `None` if already taken; after
+    /// taking, [`next_event`](Self::next_event) returns `None`.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<Event>> {
+        self.events.take()
     }
 
     /// Whether the connection is still open.
@@ -359,32 +399,56 @@ async fn read_loop(
     loop {
         let msg = tokio::select! {
             _ = shared.close.cancelled() => break,
-            m = rd.next::<ServerMsg>() => m,
+            m = rd.next::<serde_json::Value>() => m,
         };
-        match msg {
-            Ok(Some(ServerMsg::Response { req_id, result })) => {
-                let call = shared.lock().calls.remove(&req_id);
-                match call {
-                    // The caller may have given up meanwhile.
-                    Some(tx) => drop(tx.send(result)),
-                    None => debug!(req_id, "reply for no pending call: {result:?}"),
-                }
-            }
-            Ok(Some(ServerMsg::Event { event })) => {
-                if let Err(mpsc::error::TrySendError::Full(_)) = events.try_send(event) {
-                    shared.dropped_events.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        let value = match msg {
+            Ok(Some(v)) => v,
             Ok(None) => break,
-            // A message kind this client does not know (newer daemon): skip it.
-            Err(CodecError::Json(e)) => debug!("ignoring an unreadable message: {e}"),
+            // Not JSON at all: skip the line.
+            Err(CodecError::Json(e)) => {
+                debug!("ignoring an unreadable message: {e}");
+                continue;
+            }
             Err(e) => {
                 debug!("reading from the daemon failed: {e}");
                 break;
             }
+        };
+        // Parsed in two steps so a reply whose body this client cannot decode (e.g.
+        // from a newer daemon) still fails its call at once instead of timing out.
+        let (req_id, result) = match ServerMsg::deserialize(&value) {
+            Ok(ServerMsg::Response { req_id, result }) => (req_id, Ok(result)),
+            Ok(ServerMsg::Event { event }) => {
+                if let Err(mpsc::error::TrySendError::Full(_)) = events.try_send(event) {
+                    shared.dropped_events.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            Err(e) => match response_req_id(&value) {
+                Some(req_id) => (req_id, Err(e.to_string())),
+                // A message kind this client does not know (newer daemon): skip it.
+                None => {
+                    debug!("ignoring an unreadable message: {e}");
+                    continue;
+                }
+            },
+        };
+        let call = shared.lock().calls.remove(&req_id);
+        match call {
+            // The caller may have given up meanwhile.
+            Some(tx) => drop(tx.send(result)),
+            None => debug!(req_id, "reply for no pending call: {result:?}"),
         }
     }
     shared.disconnect();
+}
+
+/// The `req_id` of a message that claims to be a response.
+fn response_req_id(v: &serde_json::Value) -> Option<u64> {
+    if v.get("type")?.as_str()? != "response" {
+        return None;
+    }
+    v.get("req_id")?.as_u64()
 }
 
 async fn connect_stream(name: &SocketName) -> io::Result<Stream> {

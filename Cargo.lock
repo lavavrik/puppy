@@ -971,6 +971,8 @@ dependencies = [
  "puppy-daemon",
  "puppy-proto",
  "puppy-testserver",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
