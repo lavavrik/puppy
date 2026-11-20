@@ -163,9 +163,135 @@ pub(crate) fn is_transient_error(msg: &str) -> bool {
     NETWORK.iter().any(|k| m.contains(k))
 }
 
+/// `(peers, seeds, leechers)` of a live torrent: connected peers, how many of them have
+/// every piece, and the rest. All 0 when the torrent is not live.
+pub(crate) fn peer_counts(s: &TorrentStats) -> (u32, u32, u32) {
+    match &s.live {
+        Some(l) => {
+            let live = l.snapshot.peer_stats.live;
+            let seeds = l.snapshot.peer_stats.live_seeders.min(live);
+            (live, seeds, live - seeds)
+        }
+        None => (0, 0, 0),
+    }
+}
+
+/// Share ratio: uploaded / total (0 when the torrent has no size).
+pub(crate) fn ratio(uploaded: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (uploaded as f64 / total as f64) as f32
+    }
+}
+
+/// The piece map puppy shows, synthesised from per-file progress (librqbit does not expose
+/// its have-bitfield). MSB first: piece 0 is bit 7 of byte 0.
+///
+/// Each file's progress is taken as an in-order prefix of that file (clamped to its
+/// length); a piece is set iff every byte it covers (possibly across several files) lies
+/// inside those prefixes. An approximation: a file filled out of order shows fewer
+/// pieces than it really has. Missing `file_progress` entries count as 0.
+pub(crate) fn have_bitfield(
+    piece_len: u64,
+    total: u64,
+    file_lengths: &[u64],
+    file_progress: &[u64],
+) -> Vec<u8> {
+    if piece_len == 0 {
+        return Vec::new();
+    }
+    let pieces = total.div_ceil(piece_len);
+    let mut out = vec![0u8; pieces.div_ceil(8) as usize];
+    // Have-ranges `[start, end)` in torrent offsets, ascending; adjacent ones merge.
+    let mut have: Vec<(u64, u64)> = Vec::new();
+    let mut offset = 0u64;
+    for (i, &len) in file_lengths.iter().enumerate() {
+        let got = file_progress.get(i).copied().unwrap_or(0).min(len);
+        if got > 0 {
+            match have.last_mut() {
+                Some(last) if last.1 == offset => last.1 = offset + got,
+                _ => have.push((offset, offset + got)),
+            }
+        }
+        offset += len;
+    }
+    // A piece is had iff one range covers it entirely.
+    let mut r = 0;
+    for piece in 0..pieces {
+        let start = piece * piece_len;
+        let end = (start + piece_len).min(total);
+        while r < have.len() && have[r].1 < end {
+            r += 1;
+        }
+        if r < have.len() && have[r].0 <= start {
+            out[(piece / 8) as usize] |= 0x80 >> (piece % 8);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn have_bitfield_from_file_progress() {
+        // Single file, 10 bytes, pieces of 4: [0,4) [4,8) [8,10).
+        let f = |p| have_bitfield(4, 10, &[10], &[p]);
+        assert_eq!(f(0), vec![0b0000_0000]);
+        assert_eq!(f(3), vec![0b0000_0000]);
+        assert_eq!(f(4), vec![0b1000_0000]);
+        assert_eq!(f(9), vec![0b1100_0000]);
+        assert_eq!(f(10), vec![0b1110_0000], "last partial piece once complete");
+        assert_eq!(f(99), vec![0b1110_0000], "progress above length is clamped");
+
+        // Two files of 6 and 6 bytes, pieces of 4: piece 1 [4,8) spans the boundary.
+        let m = |a, b| have_bitfield(4, 12, &[6, 6], &[a, b]);
+        assert_eq!(
+            m(6, 0),
+            vec![0b1000_0000],
+            "piece 1 needs file 2's first bytes"
+        );
+        assert_eq!(m(6, 2), vec![0b1100_0000]);
+        assert_eq!(
+            m(0, 6),
+            vec![0b0010_0000],
+            "piece 2 [8,12) lies in file 2 only"
+        );
+        assert_eq!(m(6, 6), vec![0b1110_0000]);
+        assert_eq!(m(2, 2), vec![0]);
+        // A gap in file 1 blocks the piece across the boundary.
+        assert_eq!(m(4, 6), vec![0b1010_0000]);
+        assert_eq!(m(5, 6), vec![0b1010_0000]);
+    }
+
+    #[test]
+    fn have_bitfield_edge_cases() {
+        // Zero-length files are skipped without breaking continuity.
+        let b = have_bitfield(4, 8, &[4, 0, 0, 4], &[4, 0, 0, 4]);
+        assert_eq!(b, vec![0b1100_0000]);
+        let b = have_bitfield(4, 8, &[0, 4, 0, 4], &[0, 4, 0, 0]);
+        assert_eq!(b, vec![0b1000_0000]);
+        // Missing progress entries count as 0; no pieces for an empty torrent.
+        assert_eq!(have_bitfield(4, 8, &[4, 4], &[4]), vec![0b1000_0000]);
+        assert_eq!(have_bitfield(4, 0, &[], &[]), Vec::<u8>::new());
+        assert_eq!(have_bitfield(0, 10, &[10], &[10]), Vec::<u8>::new());
+        // More than 8 pieces: padding bits stay clear, order is MSB first.
+        assert_eq!(have_bitfield(1, 10, &[10], &[9]), vec![0xFF, 0b1000_0000]);
+        assert_eq!(have_bitfield(1, 10, &[10], &[10]), vec![0xFF, 0b1100_0000]);
+        assert_eq!(have_bitfield(1, 10, &[10], &[3]), vec![0b1110_0000, 0]);
+        // Piece length larger than the torrent: one piece.
+        assert_eq!(have_bitfield(100, 10, &[10], &[10]), vec![0x80]);
+        assert_eq!(have_bitfield(100, 10, &[10], &[9]), vec![0]);
+    }
+
+    #[test]
+    fn ratio_is_uploaded_over_total() {
+        assert_eq!(ratio(5, 0), 0.0);
+        assert_eq!(ratio(0, 100), 0.0);
+        assert_eq!(ratio(150, 100), 1.5);
+    }
 
     fn stats(phase: Phase) -> Stats {
         Stats {

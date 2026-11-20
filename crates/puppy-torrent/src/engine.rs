@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::DhtPersistenceConfig;
@@ -85,11 +86,32 @@ pub(crate) struct Entry {
     magnet: Option<String>,
     /// Per-download limit applied when the torrent is (re)added to librqbit.
     limit: Option<u64>,
+    /// `limit` as a magnet's metadata task reads it just before the real add (0: none).
+    limit_cell: Arc<AtomicU64>,
+    /// The piece map, recomputed at most every [`DETAIL_TTL`].
+    detail: Option<DetailCache>,
+    /// Most bytes uploaded seen so far (librqbit forgets them once the torrent is paused).
+    uploaded: u64,
     pub(crate) slot: Slot,
     /// The state last broadcast by the poll task.
     pub(crate) last_state: Option<DownloadState>,
     /// `Completed` was broadcast (and seeding stopped).
     pub(crate) completed_sent: bool,
+}
+
+/// How long a synthesised piece map is reused by `detail`.
+const DETAIL_TTL: Duration = Duration::from_secs(1);
+
+/// A torrent's piece map as last computed.
+struct DetailCache {
+    at: Instant,
+    piece_count: u32,
+    have: Vec<u8>,
+}
+
+/// A bytes/s limit as librqbit takes it: `None`/0 is unlimited, above `u32::MAX` clamps.
+fn bps_limit(bps: Option<u64>) -> Option<NonZeroU32> {
+    bps.and_then(|l| NonZeroU32::new(u32::try_from(l).unwrap_or(u32::MAX)))
 }
 
 /// Where a torrent is in its life with librqbit.
@@ -216,8 +238,7 @@ impl Shared {
             overwrite: true,
             output_folder: Some(output_folder),
             ratelimits: LimitsConfig {
-                download_bps: limit
-                    .and_then(|l| NonZeroU32::new(u32::try_from(l).unwrap_or(u32::MAX))),
+                download_bps: bps_limit(limit),
                 upload_bps: None,
             },
             initial_peers: (!peers.is_empty()).then(|| peers.clone()),
@@ -238,12 +259,13 @@ impl Shared {
         id: DownloadId,
         uri: String,
         opts: AddTorrentOptions,
+        limit: Arc<AtomicU64>,
     ) -> Slot {
         let r#gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let session = self.session.clone();
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
-            let outcome = resolve_and_add(&session, uri, opts).await;
+            let outcome = resolve_and_add(&session, uri, opts, &limit).await;
             let added = outcome.as_ref().ok().cloned();
             let Some(shared) = weak.upgrade() else {
                 return added;
@@ -372,6 +394,7 @@ async fn resolve_and_add(
     session: &Arc<Session>,
     uri: String,
     mut opts: AddTorrentOptions,
+    limit: &AtomicU64,
 ) -> Result<ManagedTorrentHandle, ResolveFailure> {
     let list_opts = AddTorrentOptions {
         list_only: true,
@@ -402,6 +425,8 @@ async fn resolve_and_add(
         })
     })?;
     opts.only_files = listed.only_files;
+    // A limit set while the metadata was being fetched.
+    opts.ratelimits.download_bps = bps_limit(Some(limit.load(Ordering::Relaxed)));
     let mut peers = opts.initial_peers.take().unwrap_or_default();
     for p in listed.seen_peers {
         if !peers.contains(&p) {
@@ -472,6 +497,16 @@ impl TorrentEngine {
         Ok(Self { shared, cancel })
     }
 
+    /// The session's current global `(download, upload)` limits in bytes/s (tests).
+    #[doc(hidden)]
+    pub fn global_limits(&self) -> (Option<u32>, Option<u32>) {
+        let l = &self.shared.session.ratelimits;
+        (
+            l.get_download_bps().map(NonZeroU32::get),
+            l.get_upload_bps().map(NonZeroU32::get),
+        )
+    }
+
     /// Where the session accepts incoming peer connections.
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.shared.session.listen_addr()
@@ -508,6 +543,9 @@ impl TorrentEngine {
                     layout: layout.clone(),
                     magnet: None,
                     limit: opts.limit,
+                    limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
+                    detail: None,
+                    uploaded: 0,
                     slot: Slot::Adding,
                     last_state: None,
                     completed_sent: false,
@@ -564,10 +602,12 @@ impl TorrentEngine {
         let name = info.display_name();
         let mut map = self.shared.lock();
         check_free(&map, id, &info.info_hash)?;
+        let limit_cell = Arc::new(AtomicU64::new(opts.limit.unwrap_or(0)));
         let slot = if opts.start_paused {
             Slot::Held
         } else {
-            self.shared.spawn_resolve(id, uri.clone(), add_opts)
+            self.shared
+                .spawn_resolve(id, uri.clone(), add_opts, limit_cell.clone())
         };
         map.insert(
             id,
@@ -577,6 +617,9 @@ impl TorrentEngine {
                 layout: layout.clone(),
                 magnet: Some(uri),
                 limit: opts.limit,
+                limit_cell,
+                detail: None,
+                uploaded: 0,
                 slot,
                 last_state: None,
                 completed_sent: false,
@@ -748,8 +791,6 @@ fn is_port_unavailable(e: &anyhow::Error) -> bool {
     })
 }
 
-const NOT_YET: &str = "not implemented yet";
-
 #[async_trait::async_trait]
 impl Engine for TorrentEngine {
     fn kind(&self) -> EngineKind {
@@ -847,7 +888,9 @@ impl Engine for TorrentEngine {
                 Slot::Held | Slot::PendingFailed { .. } => {
                     let uri = e.magnet.clone().expect("only magnets wait for metadata");
                     let opts = self.shared.add_options(&e.layout, false, e.limit)?;
-                    e.slot = self.shared.spawn_resolve(id, uri, opts);
+                    e.slot = self
+                        .shared
+                        .spawn_resolve(id, uri, opts, e.limit_cell.clone());
                     return Ok(());
                 }
                 Slot::Adding => return Err(EngineError::NotFound(id)),
@@ -905,15 +948,118 @@ impl Engine for TorrentEngine {
         Some(view.status())
     }
 
-    fn detail(&self, _id: DownloadId) -> Option<EngineDetail> {
-        None
+    /// The piece map is synthesised from per-file progress (see [`map::have_bitfield`]) and
+    /// reused for a second. Seeds are connected peers that have every piece, leechers the
+    /// other connected peers; the ratio is bytes uploaded since the torrent last went live
+    /// (the highest seen) over its size. `None` until librqbit has the torrent's metadata.
+    fn detail(&self, id: DownloadId) -> Option<EngineDetail> {
+        let (h, cached) = {
+            let map = self.shared.lock();
+            let e = map.get(&id)?;
+            let Slot::Managed(h) = &e.slot else {
+                return None;
+            };
+            let cached = e
+                .detail
+                .as_ref()
+                .filter(|c| c.at.elapsed() < DETAIL_TTL)
+                .map(|c| (c.piece_count, c.have.clone()));
+            (h.clone(), cached)
+        };
+        let stats = h.stats();
+        let fresh = match cached {
+            Some(_) => None,
+            None => {
+                let (piece_len, total, pieces, lengths) = h
+                    .with_metadata(|m| {
+                        let l = m.lengths();
+                        (
+                            u64::from(l.default_piece_length()),
+                            l.total_length(),
+                            l.total_pieces(),
+                            m.file_infos.iter().map(|f| f.len).collect::<Vec<_>>(),
+                        )
+                    })
+                    .ok()?;
+                // A finished torrent has every piece, whatever the progress says.
+                let progress = if stats.finished {
+                    &lengths
+                } else {
+                    &stats.file_progress
+                };
+                Some((
+                    pieces,
+                    map::have_bitfield(piece_len, total, &lengths, progress),
+                ))
+            }
+        };
+        let (piece_count, have) = match (cached, fresh) {
+            (Some(c), _) => c,
+            (None, Some(f)) => f,
+            (None, None) => return None,
+        };
+        let uploaded = {
+            let mut map = self.shared.lock();
+            // Removed meanwhile: nothing to report.
+            let e = map.get_mut(&id)?;
+            e.uploaded = e.uploaded.max(stats.uploaded_bytes);
+            if e.detail
+                .as_ref()
+                .is_none_or(|c| c.at.elapsed() >= DETAIL_TTL)
+            {
+                e.detail = Some(DetailCache {
+                    at: Instant::now(),
+                    piece_count,
+                    have: have.clone(),
+                });
+            }
+            e.uploaded
+        };
+        let (peers, seeds, leechers) = map::peer_counts(&stats);
+        Some(EngineDetail::Torrent {
+            piece_count,
+            have,
+            peers,
+            seeds,
+            leechers,
+            ratio: map::ratio(uploaded, stats.total_bytes),
+        })
     }
 
-    fn set_download_limit(&self, _id: DownloadId, _bps: Option<u64>) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported(NOT_YET))
+    /// librqbit takes a torrent's limit only when it is added: set while the torrent is
+    /// still waiting for its metadata (or paused before it), it is applied then.
+    fn set_download_limit(&self, id: DownloadId, bps: Option<u64>) -> Result<(), EngineError> {
+        let mut map = self.shared.lock();
+        let e = map
+            .get_mut(&id)
+            .filter(|e| !matches!(e.slot, Slot::Adding))
+            .ok_or(EngineError::NotFound(id))?;
+        match e.slot {
+            Slot::Resolving { .. } | Slot::Held | Slot::PendingFailed { .. } => {
+                let bps = bps.filter(|&b| b > 0);
+                e.limit = bps;
+                e.limit_cell.store(bps.unwrap_or(0), Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(EngineError::Unsupported(
+                "per-torrent limits can only be set before the torrent starts",
+            )),
+        }
     }
 
-    fn set_global_download_budget(&self, _bps: Option<u64>) {}
+    fn set_global_download_budget(&self, bps: Option<u64>) {
+        self.shared
+            .session
+            .ratelimits
+            .set_download_bps(bps_limit(bps));
+    }
+
+    fn set_global_upload_budget(&self, bps: Option<u64>) {
+        self.shared
+            .session
+            .ratelimits
+            .set_upload_bps(bps_limit(bps));
+    }
 
     fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.shared.events.subscribe()
