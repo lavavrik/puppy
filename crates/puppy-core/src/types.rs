@@ -64,7 +64,7 @@ pub struct DownloadStatus {
     pub eta_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SegmentView {
     pub start: u64,
     /// Exclusive.
@@ -74,7 +74,7 @@ pub struct SegmentView {
     pub active: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineDetail {
     Http {

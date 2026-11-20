@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/puppy-core", "crates/puppy-testserver"]
+members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver"]
 
 [workspace.package]
 version = "0.1.0"
