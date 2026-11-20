@@ -12,9 +12,12 @@ pub use segments::{ConnectionBars, SegmentStrip};
 use ratatui::buffer::Buffer;
 use ratatui::style::Style;
 
-/// Writes one cell, silently ignoring positions outside the buffer.
+/// Writes one cell, silently ignoring positions outside the buffer. The cell is reset
+/// first, so whatever was drawn underneath (a selected row's background or REVERSED
+/// modifier) cannot leak into the widget.
 pub(crate) fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
     if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.reset();
         cell.set_symbol(symbol).set_style(style);
     }
 }

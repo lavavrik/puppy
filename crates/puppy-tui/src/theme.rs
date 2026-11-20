@@ -149,6 +149,8 @@ pub enum Token {
     Key,
     /// What the key does (`pause`).
     KeyLabel,
+    /// The app name in the title bar: inverted accent.
+    Badge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +166,8 @@ impl Theme {
     /// - `Auto`: `COLORFGBG`'s background (its last field) 0–6 or 8 ⇒ dark, 7 or 9–15 ⇒
     ///   light; absent or unparseable ⇒ dark.
     /// - `NO_COLOR` set (non-empty) ⇒ monochrome: modifiers only.
-    /// - `COLORTERM` other than `truecolor`/`24bit` ⇒ the 16 ANSI colors.
+    /// - `COLORTERM` other than `truecolor`/`24bit` (and not Windows Terminal, which sets
+    ///   `WT_SESSION`) ⇒ the 16 ANSI colors.
     pub fn detect(choice: ThemeChoice, env: &dyn Fn(&str) -> Option<String>) -> Self {
         if env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
             return Theme {
@@ -177,10 +180,11 @@ impl Theme {
             ThemeChoice::Light => true,
             ThemeChoice::Auto => env("COLORFGBG").is_some_and(|v| colorfgbg_is_light(&v)),
         };
+        // Windows Terminal renders truecolor but does not set COLORTERM.
         let truecolor = env("COLORTERM").is_some_and(|v| {
             let v = v.trim().to_ascii_lowercase();
             v == "truecolor" || v == "24bit"
-        });
+        }) || env("WT_SESSION").is_some_and(|v| !v.is_empty());
         let p = match (truecolor, light) {
             (true, false) => Palette::DARK,
             (true, true) => Palette::LIGHT,
@@ -213,7 +217,64 @@ impl Theme {
             Token::SegActive => fg(p.seg_active),
             Token::SegDone => fg(p.seg_done),
             Token::SegTodo => fg(p.seg_todo),
+            Token::Badge => {
+                // ANSI palettes have no concrete background colour to invert with.
+                let text = if p.bg == Color::Reset {
+                    Color::Black
+                } else {
+                    p.bg
+                };
+                Style::new()
+                    .fg(text)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            }
         }
+    }
+
+    /// How `token` looks on a selected row: on the selection background (REVERSED in
+    /// mono). A foreground equal to that background (ANSI dark: dim text and the
+    /// selection are both DarkGray) is swapped for a visible gray.
+    pub fn on_selected(&self, token: Token) -> Style {
+        let s = self.style(token);
+        if self.mono {
+            return s.add_modifier(Modifier::REVERSED);
+        }
+        let bg = self.p.selection_bg;
+        let mut s = s.bg(bg);
+        if s.fg == Some(bg) {
+            s.fg = Some(contrast(bg));
+        }
+        s
+    }
+
+    /// This theme with bar/segment tracks that stand out from the selection background
+    /// (the dark palette's empty-bar colour equals its selection colour), for widgets
+    /// drawn on a selected row.
+    pub fn for_selection(&self) -> Theme {
+        let mut t = *self;
+        let sel = t.p.selection_bg;
+        let track = if t.p.border != sel {
+            t.p.border
+        } else {
+            contrast(sel)
+        };
+        if t.p.bar_todo == sel {
+            t.p.bar_todo = track;
+        }
+        if t.p.seg_todo == sel {
+            t.p.seg_todo = track;
+        }
+        t
+    }
+}
+
+/// A gray readable on the ANSI gray `bg`.
+fn contrast(bg: Color) -> Color {
+    match bg {
+        Color::DarkGray => Color::Gray,
+        Color::Gray => Color::DarkGray,
+        _ => Color::Reset,
     }
 }
 
@@ -234,6 +295,7 @@ fn mono_modifier(token: Token) -> Modifier {
         | Token::SegActive
         | Token::Key => Modifier::BOLD,
         Token::Selected => Modifier::REVERSED,
+        Token::Badge => Modifier::REVERSED.union(Modifier::BOLD),
     }
 }
 
@@ -391,6 +453,11 @@ mod tests {
             Palette::ansi(true)
         );
         assert!(!detect(ThemeChoice::Dark, &[]).mono);
+        // Windows Terminal supports truecolor without setting COLORTERM.
+        assert_eq!(
+            detect(ThemeChoice::Dark, &[("WT_SESSION", "8f2c")]).p,
+            Palette::DARK
+        );
 
         // NO_COLOR (non-empty) ⇒ monochrome, whatever else is set.
         let t = detect(ThemeChoice::Auto, &[TRUE, ("NO_COLOR", "1")]);
@@ -425,6 +492,37 @@ mod tests {
         assert_eq!(t.style(Token::Key).fg, Some(p.accent));
         assert!(t.style(Token::Key).add_modifier.contains(Modifier::BOLD));
         assert_eq!(t.style(Token::KeyLabel).fg, Some(p.dim));
+    }
+
+    #[test]
+    fn selected_styles_stay_readable() {
+        for t in [
+            detect(ThemeChoice::Dark, &[TRUE]),
+            detect(ThemeChoice::Light, &[TRUE]),
+            detect(ThemeChoice::Dark, &[]),
+            detect(ThemeChoice::Light, &[]),
+        ] {
+            for tok in [
+                Token::Text,
+                Token::Dim,
+                Token::KeyLabel,
+                Token::Ok,
+                Token::Err,
+            ] {
+                let s = t.on_selected(tok);
+                assert_eq!(s.bg, Some(t.p.selection_bg));
+                assert_ne!(s.fg, s.bg, "{tok:?} invisible in {:?}", t.p);
+            }
+            let sel = t.for_selection();
+            assert_ne!(sel.p.bar_todo, t.p.selection_bg);
+            assert_ne!(sel.p.seg_todo, t.p.selection_bg);
+        }
+        // ANSI dark: dim text on the selection is gray, still dimmer than plain text.
+        let ansi = detect(ThemeChoice::Dark, &[]);
+        assert_eq!(ansi.on_selected(Token::Dim).fg, Some(Color::Gray));
+        let mono = detect(ThemeChoice::Dark, &[("NO_COLOR", "1")]);
+        let s = mono.on_selected(Token::Dim);
+        assert!(s.add_modifier.contains(Modifier::REVERSED | Modifier::DIM));
     }
 
     #[test]

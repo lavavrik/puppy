@@ -242,6 +242,43 @@ mod tests {
     }
 
     #[test]
+    fn progress_over_reversed_row_mono() {
+        // A selected row is REVERSED in mono; the bar must not inherit it.
+        let t = Theme::detect(ThemeChoice::Dark, &|k| {
+            (k == "NO_COLOR").then(|| "1".into())
+        });
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_style(
+            area,
+            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        );
+        ProgressBar {
+            ratio: Some(0.5),
+            label: Some("日本"),
+            theme: &t,
+            tick: 0,
+        }
+        .render(area, &mut buf);
+        // Label "日本" (4 cols) is centered at columns 3..7; the fill ends at 5, so the
+        // second glyph sits on the unfilled side.
+        assert_eq!(row(&buf, 10), "   日本   ");
+        for x in 0..5 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "{x} filled"
+            );
+        }
+        for x in [5u16, 7, 8, 9] {
+            let m = buf[(x, 0)].modifier;
+            assert!(!m.contains(Modifier::REVERSED), "{x} unfilled: {m:?}");
+            assert!(!m.contains(Modifier::BOLD), "{x} leaked bold: {m:?}");
+        }
+        assert_eq!(buf[(3, 0)].symbol(), "日");
+        assert_eq!(buf[(5, 0)].symbol(), "本");
+    }
+
+    #[test]
     fn progress_indeterminate_moves_with_tick() {
         let w = 10;
         let at = |t| row(&render(None, None, w, t), w);

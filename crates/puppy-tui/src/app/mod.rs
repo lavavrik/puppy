@@ -202,6 +202,11 @@ pub struct App {
     pub should_quit: bool,
     /// Hit regions set by drawing.
     pub hits: HitMap,
+    /// Wall-clock Unix seconds for "retry in m:ss" (the runtime sets it before each
+    /// [`Msg::Tick`]; `update` itself never reads a clock).
+    pub now_unix: u64,
+    /// Ticks seen so far: animates indeterminate progress bars.
+    pub ticks: u64,
 }
 
 impl App {
@@ -223,20 +228,31 @@ impl App {
             theme,
             should_quit: false,
             hits: HitMap::new(),
+            now_unix: 0,
+            ticks: 0,
         }
     }
 
     /// Downloads matching the filter, in daemon order.
     pub fn visible(&self) -> Vec<&DownloadSnapshot> {
-        let needle = self.filter.value.trim().to_lowercase();
-        self.downloads
-            .iter()
-            .filter(|d| {
-                needle.is_empty()
-                    || d.name.to_lowercase().contains(&needle)
-                    || d.source.to_lowercase().contains(&needle)
-            })
-            .collect()
+        self.visible_iter().collect()
+    }
+
+    /// [`visible`](Self::visible) without collecting: drawing walks it every frame, so
+    /// matching allocates nothing per download.
+    pub fn visible_iter(&self) -> impl Iterator<Item = &DownloadSnapshot> + Clone {
+        let needle: Vec<char> = self
+            .filter
+            .value
+            .trim()
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect();
+        self.downloads.iter().filter(move |d| {
+            needle.is_empty()
+                || contains_folded(&d.name, &needle)
+                || contains_folded(&d.source, &needle)
+        })
     }
 
     /// The selected download's snapshot.
@@ -353,6 +369,7 @@ impl App {
     }
 
     fn on_tick(&mut self, now: Instant) -> Vec<Cmd> {
+        self.ticks = self.ticks.wrapping_add(1);
         self.toasts.retain(|t| t.until > now);
         match self.selection() {
             Some(d)
@@ -674,6 +691,21 @@ impl App {
     }
 }
 
+/// Whether `hay`, lowercased, contains the already lowercased `needle` (no allocation).
+fn contains_folded(hay: &str, needle: &[char]) -> bool {
+    let mut starts = hay.char_indices();
+    loop {
+        let rest = match starts.next() {
+            Some((i, _)) => &hay[i..],
+            None => return false,
+        };
+        let mut folded = rest.chars().flat_map(char::to_lowercase);
+        if needle.iter().all(|n| folded.next() == Some(*n)) {
+            return true;
+        }
+    }
+}
+
 /// Counts for a freshly connected list (the next snapshot brings the daemon's own).
 fn totals_of(downloads: &[DownloadSnapshot], down_bps: u64, up_bps: u64) -> Totals {
     let count = |f: fn(&WireState) -> bool| downloads.iter().filter(|d| f(&d.state)).count();
@@ -739,6 +771,16 @@ mod tests {
         unknown_kind.kind = EngineKindTag::Unknown;
         assert!(!a.can(Action::Pause, &unknown_kind));
         assert!(a.can(Action::Delete, &unknown_kind));
+    }
+
+    #[test]
+    fn filter_matching_is_case_insensitive() {
+        let needle = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<Vec<_>>();
+        assert!(contains_folded("Ubuntu-ISO", &needle("iso")));
+        assert!(contains_folded("ÄBC", &needle("äb")));
+        assert!(contains_folded("abc", &needle("c")));
+        assert!(!contains_folded("abc", &needle("abcd")));
+        assert!(!contains_folded("", &needle("a")));
     }
 
     #[test]

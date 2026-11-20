@@ -1,6 +1,8 @@
 //! Text formatting for the dashboard: sizes, speeds, ETAs, percentages, display-width
 //! truncation, and parsing of user-entered rates.
 
+use std::borrow::Cow;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -77,6 +79,25 @@ pub fn truncate(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Makes untrusted text (names, sources, paths from the daemon) safe to draw: control
+/// characters (`\t`, `\n`, `\r`, ESC, DEL, C1) and bidi overrides/isolates become a
+/// space, so they can neither break the layout nor reach the terminal. Borrows when the
+/// text is already clean. Apply before [`truncate`].
+pub fn display_safe(s: &str) -> Cow<'_, str> {
+    fn unsafe_char(c: char) -> bool {
+        c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }
+    if s.contains(unsafe_char) {
+        Cow::Owned(
+            s.chars()
+                .map(|c| if unsafe_char(c) { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// Parses a user-entered rate in bytes/s with binary units: `500k`, `5M`, `5MiB`,
 /// `1.5g`, `5 MiB/s` (case-insensitive). `0`, `none`, `off` and the empty string mean
 /// "no limit" (`None`). Errors are user-facing text.
@@ -137,6 +158,7 @@ pub fn parse_rate(s: &str) -> Result<Option<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use unicode_width::UnicodeWidthStr;
 
     const KIB: u64 = 1024;
@@ -213,6 +235,21 @@ mod tests {
         assert_eq!(truncate("abc", 1), "…");
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn display_safe_replaces_controls() {
+        assert!(matches!(
+            display_safe("plain.iso"),
+            Cow::Borrowed("plain.iso")
+        ));
+        assert_eq!(display_safe("a\tb\nc\rd\x1be"), "a b c d e");
+        assert_eq!(display_safe("x\u{7f}y\u{9b}z"), "x y z");
+        // Bidi overrides would reorder the rest of the row.
+        assert_eq!(display_safe("evil\u{202e}gpj.exe"), "evil gpj.exe");
+        assert_eq!(display_safe("日本\n語"), "日本 語");
+        // Sanitize first, then truncate: widths stay right.
+        assert_eq!(truncate(&display_safe("ab\ncd"), 4), "ab …");
     }
 
     #[test]

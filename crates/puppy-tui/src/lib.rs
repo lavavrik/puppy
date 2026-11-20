@@ -6,4 +6,5 @@
 pub mod app;
 pub mod format;
 pub mod theme;
+pub mod ui;
 pub mod widgets;
