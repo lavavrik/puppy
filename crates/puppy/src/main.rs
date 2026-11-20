@@ -3,7 +3,8 @@
 //! - `puppy daemon [--idle-exit <SECS>]` runs the background daemon (started by a login
 //!   service, or detached by a client with `--idle-exit`).
 //! - `puppy` opens the full-screen dashboard (starting a daemon if none runs).
-//! - `puppy status` prints a one-line summary (scriptable).
+//! - `puppy status`, `add`, `ls`, `info`, `pause`, ..., `wait`, `watch`: scriptable
+//!   commands (see [`cli`] and the README's "Command line" section).
 //! - `--json` (global) makes commands print JSON; errors map to exit codes (see
 //!   [`cli::CliError`]).
 
@@ -97,6 +98,9 @@ enum Command {
         /// Referer header value.
         #[arg(long, value_name = "URL")]
         referer: Option<String>,
+        /// Wait until the downloads end (exit code as for `puppy wait`).
+        #[arg(long)]
+        wait: bool,
     },
     /// List downloads.
     Ls {
@@ -158,6 +162,13 @@ enum Command {
     },
     /// Set how many downloads run at once.
     MaxActive { n: u16 },
+    /// Wait until downloads complete, fail or need attention (exit 0/4/5; 3 if gone).
+    Wait {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
+    /// Print events as they happen until Ctrl-C (`--json`: one JSON event per line).
+    Watch,
     /// Stop the background daemon.
     Stop,
 }
@@ -200,21 +211,24 @@ fn main() -> ExitCode {
                 headers,
                 cookie,
                 referer,
-            }) => cli::add::add(
-                &Ctx::from_env(cli.json)?,
-                AddArgs {
-                    sources,
-                    output_dir,
-                    name,
-                    paused,
-                    limit,
-                    headers,
-                    cookie,
-                    referer,
-                },
-            )
-            .await
-            .map(|_| ()),
+                wait,
+            }) => {
+                cli::add::run(
+                    &Ctx::from_env(cli.json)?,
+                    AddArgs {
+                        sources,
+                        output_dir,
+                        name,
+                        paused,
+                        limit,
+                        headers,
+                        cookie,
+                        referer,
+                    },
+                    wait,
+                )
+                .await
+            }
             Some(Command::Ls { state }) => cli::list::ls(&Ctx::from_env(cli.json)?, state).await,
             Some(Command::Info { id }) => cli::list::info(&Ctx::from_env(cli.json)?, id).await,
             Some(Command::Pause { ids }) => act(cli.json, cli::control::Action::Pause, ids).await,
@@ -250,6 +264,8 @@ fn main() -> ExitCode {
             Some(Command::MaxActive { n }) => {
                 cli::control::max_active(&Ctx::from_env(cli.json)?, n).await
             }
+            Some(Command::Wait { ids }) => cli::wait::wait(&Ctx::from_env(cli.json)?, ids).await,
+            Some(Command::Watch) => cli::wait::watch(&Ctx::from_env(cli.json)?).await,
             Some(Command::Stop) => cli::control::stop(&Ctx::from_env(cli.json)?).await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
@@ -258,11 +274,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            match &e {
-                CliError::Reported(_) => {}
-                CliError::Other(e) => err(format_args!("puppy: {e:#}")),
-                e => err(format_args!("puppy: {e}")),
-            }
+            cli::report_error(&e);
             ExitCode::from(e.exit_code())
         }
     }

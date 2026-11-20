@@ -23,7 +23,6 @@ fn is_closed_pipe(e: &std::io::Error) -> bool {
 static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// Whether stdout has been closed by its reader. Long-running commands stop on it.
-#[allow(dead_code)] // used by `watch`
 pub fn stdout_closed() -> bool {
     STDOUT_CLOSED.load(Ordering::Relaxed)
 }

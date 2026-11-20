@@ -1,6 +1,7 @@
 //! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files or stdin.
 
 use super::output::{err, json, out};
+use super::wait::{collect, finish, interruptible, until_done};
 use super::{CliError, Ctx};
 use puppy_core::types::{AddRequest, DownloadId, RequestContext};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
@@ -63,9 +64,36 @@ fn expand_sources(sources: Vec<String>) -> Result<Vec<String>, CliError> {
     Ok(all)
 }
 
+/// What `add` did: the ids it added, and its exit code (1 if some sources could not be
+/// added; they were reported on stderr).
+#[derive(Debug)]
+pub struct AddOutcome {
+    pub ids: Vec<DownloadId>,
+    pub code: u8,
+}
+
+/// `add`, then with `wait` waits for the added downloads; the worst code wins.
+pub async fn run(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<(), CliError> {
+    if wait && args.paused {
+        return Err(CliError::Usage(
+            "--wait and --paused do not go together: a paused download never ends".into(),
+        ));
+    }
+    let added = add(ctx, args).await?;
+    let mut codes = vec![added.code];
+    if wait && !added.ids.is_empty() {
+        let mut client = ctx.client().await?;
+        collect(
+            &mut codes,
+            interruptible(until_done(ctx, &mut client, &added.ids)).await,
+        );
+    }
+    finish(&codes)
+}
+
 /// Adds every source; ones that cannot be added are reported on stderr and make the
-/// command fail (exit 1) after the others were added.
-pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<Vec<DownloadId>, CliError> {
+/// outcome's code 1, after the others were added.
+pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
     let limit = match args.limit.as_deref() {
         Some(l) => parse_rate(l).map_err(|e| CliError::Usage(format!("bad --limit: {e}")))?,
         None => None,
@@ -143,11 +171,16 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<Vec<DownloadId>, CliError> 
     if ctx.json {
         json(&added);
     }
+    let mut code = 0;
     if failures > 0 {
         let total = added.len() + failures;
-        return Err(CliError::Other(anyhow::anyhow!(
-            "{failures} of {total} sources could not be added"
-        )));
+        err(format_args!(
+            "puppy: {failures} of {total} sources could not be added"
+        ));
+        code = 1;
     }
-    Ok(added.into_iter().map(|a| a.id).collect())
+    Ok(AddOutcome {
+        ids: added.into_iter().map(|a| a.id).collect(),
+        code,
+    })
 }

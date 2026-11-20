@@ -280,6 +280,8 @@ pub async fn limit(ctx: &Ctx, a: LimitArgs) -> Result<(), CliError> {
         let up = a.up.as_deref().map(rate_arg).transpose()?;
         let client = ctx.client().await?;
         if down.is_some() || up.is_some() {
+            // Read-modify-write: a concurrent change to the other limit between these two
+            // calls is overwritten (acceptable for a manual command).
             let cur = settings(&client).await?;
             client
                 .call(Request::SetGlobalLimits {
@@ -330,11 +332,15 @@ pub async fn max_active(ctx: &Ctx, n: u16) -> Result<(), CliError> {
 
 /// `stop`: shuts the daemon down and waits for it to go away.
 pub async fn stop(ctx: &Ctx) -> Result<(), CliError> {
-    let say = |running: bool, text: &str| {
-        if ctx.json {
-            json(&json!({ "running": running }));
-        } else {
+    // JSON: `{"running":false}` when there was nothing to stop, `{"stopped":true}`
+    // after stopping it.
+    let say = |stopped: bool, text: &str| {
+        if !ctx.json {
             out(text);
+        } else if stopped {
+            json(&json!({ "stopped": true }));
+        } else {
+            json(&json!({ "running": false }));
         }
     };
     let client = match Client::connect(&ctx.paths.socket, "puppy-cli").await {
@@ -363,6 +369,6 @@ pub async fn stop(ctx: &Ctx) -> Result<(), CliError> {
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
-    say(false, "stopped");
+    say(true, "stopped");
     Ok(())
 }

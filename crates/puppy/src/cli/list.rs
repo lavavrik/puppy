@@ -127,7 +127,7 @@ struct Info<'a> {
     detail: &'a Option<EngineDetail>,
 }
 
-fn attention_text(r: &WireAttention) -> String {
+pub(super) fn attention_text(r: &WireAttention) -> String {
     match r {
         WireAttention::RemoteChanged => "the file changed on the server".to_string(),
         WireAttention::NotResumable => "the server cannot resume this download".to_string(),

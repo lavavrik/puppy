@@ -94,7 +94,7 @@ cargo install --path crates/puppy
 
 ```sh
 puppy                 # open the dashboard, starting a daemon if none is running
-puppy status          # print a one-line summary, e.g. "3 downloads, 1 active"
+puppy status          # print a one-line summary (more commands: "Command line" below)
 puppy daemon          # run the daemon in the foreground (Ctrl-C stops it gracefully)
 puppy --theme light   # override the theme: auto, dark or light
 ```
@@ -122,6 +122,62 @@ the dashboard only disconnects; the daemon and its downloads keep running.
 | `q` / `Ctrl+C`                    | Quit |
 
 The footer shows the keys that apply to the current selection.
+
+### Command line
+
+Every command talks to the daemon, starting one if none runs (except `stop`).
+Text goes to stdout; errors, and the progress line of `wait` (only on a
+terminal), go to stderr.
+
+```sh
+puppy add https://example.com/a.iso         # add a URL, magnet link or .torrent path
+puppy add -o ~/isos --limit 2M URL1 URL2    # into a folder, at most 2 MiB/s each
+puppy add --name b.iso --paused URL         # under another name, without starting
+puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
+puppy add - < urls.txt                      # one source per line from stdin (# comments)
+puppy add --wait URL                        # add, then wait like `puppy wait`
+puppy status                                # "3 downloads, 1 active"
+puppy ls                                    # table of downloads
+puppy ls --state active,queued              # only these states
+puppy info 3                                # everything about download 3
+puppy pause 3 4                             # pause downloads (ids, or `all`)
+puppy resume all                            # resume paused or failed downloads
+puppy restart 3                             # start a failed / needs-attention download over
+puppy rm 3 --delete-files                   # remove, and delete its files
+puppy move 5 0                              # move a queued download to the front
+puppy limit 3 500K                          # speed limit for one download (`none` lifts it)
+puppy limit --global --down 5M --up 1M      # global limits; `limit --global` shows them
+puppy max-active 2                          # run at most 2 downloads at once
+puppy wait 3 4                              # wait until they complete, fail or need attention
+puppy watch                                 # print events as they happen, until Ctrl-C
+puppy stop                                  # stop the daemon
+```
+
+`--json` (anywhere on the line) makes any command print JSON instead: the
+protocol's own types (`ls` prints an array of download snapshots, `info`
+`{"download":…,"detail":…}`, `limit --global` the settings). Commands that act
+on several ids print one result per id, e.g.
+`[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`. `wait`
+prints the final snapshots once done. `watch --json` prints NDJSON: one event
+per line (`snapshot`, `added`, `completed`, `failed`, `removed`,
+`needs_attention`), snapshots included, so `puppy --json watch | jq` works;
+without `--json` it prints lines like `14:02:11 completed 3 a.iso` and leaves
+out snapshots.
+
+`wait` treats a transient failure (e.g. the server answering 503) as not yet
+ended, since puppy retries it on its own: it keeps waiting and shows
+`retrying in m:ss`. Ctrl-C stops waiting (exit 130); the downloads keep going.
+
+Exit codes (with several ids, the highest wins):
+
+| Code | Meaning |
+|------|---------|
+| `0`  | ok |
+| `1`  | error (daemon or operation) |
+| `2`  | usage |
+| `3`  | unknown id |
+| `4`  | waited download failed |
+| `5`  | waited download needs attention |
 
 ### Configuration
 

@@ -5,6 +5,7 @@ pub mod add;
 pub mod control;
 pub mod list;
 pub mod output;
+pub mod wait;
 
 use anyhow::Context;
 pub use puppy_client::ClientError;
@@ -33,8 +34,6 @@ impl Ctx {
 }
 
 /// Why a command failed; each kind has its own exit code.
-// Not every kind is produced yet: the commands that do arrive in later tasks.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// Bad arguments (exit 2).
@@ -43,13 +42,8 @@ pub enum CliError {
     /// An id that does not exist (exit 3).
     #[error("{0}")]
     UnknownId(String),
-    /// A waited-for download failed (exit 4).
-    #[error("{0}")]
-    Failed(String),
-    /// A waited-for download needs attention (exit 5).
-    #[error("{0}")]
-    Attention(String),
-    /// Already reported per item; only the exit code remains.
+    /// Already reported per item; only the exit code remains (e.g. `wait`: 4 when a
+    /// download failed, 5 when one needs attention, 130 after Ctrl-C).
     #[error("")]
     Reported(u8),
     /// Anything else: daemon or operation errors (exit 1).
@@ -69,10 +63,17 @@ impl CliError {
             CliError::Other(_) => 1,
             CliError::Usage(_) => 2,
             CliError::UnknownId(_) => 3,
-            CliError::Failed(_) => 4,
-            CliError::Attention(_) => 5,
             CliError::Reported(c) => *c,
         }
+    }
+}
+
+/// Prints `e` on stderr, unless it was already reported.
+pub fn report_error(e: &CliError) {
+    match e {
+        CliError::Reported(_) => {}
+        CliError::Other(e) => output::err(format_args!("puppy: {e:#}")),
+        e => output::err(format_args!("puppy: {e}")),
     }
 }
 
@@ -89,8 +90,7 @@ mod tests {
     fn exit_codes() {
         assert_eq!(CliError::Usage("x".into()).exit_code(), 2);
         assert_eq!(CliError::UnknownId("x".into()).exit_code(), 3);
-        assert_eq!(CliError::Failed("x".into()).exit_code(), 4);
-        assert_eq!(CliError::Attention("x".into()).exit_code(), 5);
+        assert_eq!(CliError::Reported(5).exit_code(), 5);
         assert_eq!(CliError::Other(anyhow::anyhow!("x")).exit_code(), 1);
     }
 
