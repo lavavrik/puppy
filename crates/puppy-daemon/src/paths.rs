@@ -24,6 +24,12 @@ pub struct Paths {
 impl Paths {
     /// Resolve paths from the environment (`PUPPY_HOME`, `PUPPY_SOCKET`) and
     /// the platform defaults, creating the directories (mode 0700 on Unix).
+    ///
+    /// `PUPPY_SOCKET` is a socket file path on Unix and a bare pipe name on
+    /// Windows (a leading `\\.\pipe\` is stripped). Its parent directory is
+    /// created if missing but its permissions are never changed. Unix socket
+    /// paths longer than 100 bytes are rejected (`sun_path` limit); tests on
+    /// macOS should therefore use short paths, e.g. under `/tmp`.
     pub fn resolve() -> io::Result<Self> {
         let (data_dir, config_dir) = match std::env::var_os("PUPPY_HOME").filter(|v| !v.is_empty())
         {
@@ -34,7 +40,9 @@ impl Paths {
             None => default_dirs()?,
         };
         let socket_override = std::env::var("PUPPY_SOCKET").ok().filter(|v| !v.is_empty());
+        let overridden = socket_override.is_some();
         let socket = socket_name(socket_override, &data_dir);
+        check_socket_len(&socket)?;
 
         create_private_dir(&data_dir)?;
         create_private_dir(&config_dir)?;
@@ -42,7 +50,12 @@ impl Paths {
             && let Some(parent) = p.parent()
             && !parent.as_os_str().is_empty()
         {
-            create_private_dir(parent)?;
+            if overridden {
+                // User-chosen location: create if missing, never chmod.
+                std::fs::create_dir_all(parent)?;
+            } else {
+                create_private_dir(parent)?;
+            }
         }
         let log_dir = data_dir.join("logs");
         create_private_dir(&log_dir)?;
@@ -90,12 +103,39 @@ fn socket_name(over: Option<String>, data_dir: &Path) -> SocketName {
 #[cfg(windows)]
 fn socket_name(over: Option<String>, _data_dir: &Path) -> SocketName {
     SocketName::Pipe(match over {
-        Some(n) => n,
+        Some(n) => normalize_pipe_name(&n).to_string(),
         None => format!(
             "puppy-{}",
             sanitize_username(std::env::var("USERNAME").ok().as_deref())
         ),
     })
+}
+
+/// Strip a leading `\\.\pipe\` so overrides may be given in either form.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn normalize_pipe_name(name: &str) -> &str {
+    name.strip_prefix(r"\\.\pipe\").unwrap_or(name)
+}
+
+/// Reject Unix socket paths that cannot fit in `sun_path`.
+fn check_socket_len(socket: &SocketName) -> io::Result<()> {
+    const MAX: usize = 100;
+    #[cfg(unix)]
+    if let SocketName::Path(p) = socket {
+        use std::os::unix::ffi::OsStrExt;
+        let n = p.as_os_str().as_bytes().len();
+        if n > MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "socket path is {n} bytes (max {MAX}): {}; set PUPPY_SOCKET to a shorter path",
+                    p.display()
+                ),
+            ));
+        }
+    }
+    let _ = (socket, MAX);
+    Ok(())
 }
 
 /// Keep `[A-Za-z0-9_-]`; fall back to "user" if nothing remains.
@@ -164,8 +204,13 @@ mod tests {
     #[test]
     fn puppy_home_overrides_dirs() {
         let d = tempfile::tempdir().unwrap();
+        let rt = d.path().join("rt");
         let p = with_env(
-            &[("PUPPY_HOME", Some(d.path())), ("PUPPY_SOCKET", None)],
+            &[
+                ("PUPPY_HOME", Some(d.path())),
+                ("PUPPY_SOCKET", None),
+                ("XDG_RUNTIME_DIR", Some(&rt)),
+            ],
             || Paths::resolve().unwrap(),
         );
         assert_eq!(p.data_dir, d.path().join("data"));
@@ -204,6 +249,7 @@ mod tests {
                 &[
                     ("PUPPY_HOME", Some(d.path())),
                     ("PUPPY_SOCKET", Some(Path::new("testpipe"))),
+                    ("XDG_RUNTIME_DIR", Some(d.path())),
                 ],
                 || Paths::resolve().unwrap(),
             );
@@ -228,6 +274,50 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert_eq!(p.socket, SocketName::Path(rt.join("puppy/puppy.sock")));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_override_does_not_chmod_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let shared = d.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = shared.join("x.sock");
+        with_env(
+            &[
+                ("PUPPY_HOME", Some(d.path())),
+                ("PUPPY_SOCKET", Some(&sock)),
+                ("XDG_RUNTIME_DIR", Some(d.path())),
+            ],
+            || Paths::resolve().unwrap(),
+        );
+        let m = std::fs::metadata(&shared).unwrap().permissions().mode();
+        assert_eq!(m & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlong_socket_path_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("a".repeat(120)).join("x.sock");
+        let e = with_env(
+            &[
+                ("PUPPY_HOME", Some(d.path())),
+                ("PUPPY_SOCKET", Some(&sock)),
+                ("XDG_RUNTIME_DIR", Some(d.path())),
+            ],
+            || Paths::resolve().unwrap_err(),
+        );
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("PUPPY_SOCKET"), "{e}");
+    }
+
+    #[test]
+    fn pipe_name_prefix_stripped() {
+        assert_eq!(normalize_pipe_name(r"\\.\pipe\foo"), "foo");
+        assert_eq!(normalize_pipe_name("foo"), "foo");
     }
 
     #[test]
