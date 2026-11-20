@@ -1,5 +1,3 @@
-mod support;
-
 use puppy_core::config::HttpConfig;
 use puppy_core::engine::{AddOptions, Added, EngineEvent};
 use puppy_core::http::download::HttpDownload;
@@ -10,9 +8,9 @@ use puppy_core::types::{
     AddRequest, AttentionReason, DownloadState, DownloadStatus, EngineDetail, RequestContext,
     Source,
 };
+use puppy_testserver::{ServerCfg, TestServer, body_byte};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use support::{ServerCfg, TestServer, body_byte};
 use tokio::sync::broadcast;
 
 const KIB: u64 = 1024;

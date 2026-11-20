@@ -1,0 +1,13 @@
+[package]
+name = "puppy-testserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+url.workspace = true
+http.workspace = true
+futures-util.workspace = true

@@ -1,9 +1,7 @@
-mod support;
-
 use puppy_core::config::HttpConfig;
 use puppy_core::http::probe::{apply_context, build_client, probe};
 use puppy_core::types::RequestContext;
-use support::{ServerCfg, TestServer};
+use puppy_testserver::{ServerCfg, TestServer};
 
 const MIB4: u64 = 4 * 1024 * 1024;
 const RT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -190,7 +188,7 @@ async fn server_range_and_if_range() {
     assert_eq!(r.headers()["content-range"], "bytes 10-19/1000");
     let b = r.bytes().await.unwrap();
     assert_eq!(b.len(), 10);
-    assert_eq!(b[0], support::body_byte(10, 0));
+    assert_eq!(b[0], puppy_testserver::body_byte(10, 0));
     // Stale If-Range -> full body.
     let r = c
         .get(s.url("/file.bin"))

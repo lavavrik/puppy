@@ -1,13 +1,11 @@
-mod support;
-
 use puppy_core::config::HttpConfig;
 use puppy_core::engine::{AddOptions, Engine, EngineError, EngineEvent, StartMode};
 use puppy_core::http::engine::HttpEngine;
 use puppy_core::http::resume::{part_path, sidecar_path};
 use puppy_core::types::{AddRequest, DownloadState, RequestContext, Source};
+use puppy_testserver::{ServerCfg, TestServer};
 use std::path::Path;
 use std::time::{Duration, Instant};
-use support::{ServerCfg, TestServer};
 
 const KIB: u64 = 1024;
 

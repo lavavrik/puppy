@@ -1,5 +1,4 @@
 //! Configurable axum test server shared by HTTP-engine integration tests.
-#![allow(dead_code)]
 
 use axum::Router;
 use axum::body::{Body, Bytes};

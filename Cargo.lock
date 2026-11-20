@@ -895,12 +895,12 @@ name = "puppy-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "dirs",
  "futures-util",
  "http",
  "libc",
  "percent-encoding",
+ "puppy-testserver",
  "reqwest",
  "serde",
  "serde_json",
@@ -911,6 +911,17 @@ dependencies = [
  "tracing",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "puppy-testserver"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "http",
+ "tokio",
+ "url",
 ]
 
 [[package]]

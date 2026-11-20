@@ -1,15 +1,13 @@
-mod support;
-
 use puppy_core::config::HttpConfig;
 use puppy_core::http::probe::build_client;
 use puppy_core::http::worker::{SegmentShared, WorkerCtx, WorkerExit, run_segment};
 use puppy_core::limiter::TokenBucket;
 use puppy_core::types::RequestContext;
+use puppy_testserver::{ServerCfg, TestServer, body_byte};
 use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use support::{ServerCfg, TestServer, body_byte};
 use tokio_util::sync::CancellationToken;
 
 const LEN: u64 = 64 * 1024;
