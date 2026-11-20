@@ -184,7 +184,11 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         }
         let err = io::Error::last_os_error();
         match delays.next() {
-            Some(ms) if err.kind() == io::ErrorKind::PermissionDenied => {
+            // 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION (scanner/indexer holds the file).
+            Some(ms)
+                if err.kind() == io::ErrorKind::PermissionDenied
+                    || matches!(err.raw_os_error(), Some(32 | 33)) =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             _ => return Err(err),

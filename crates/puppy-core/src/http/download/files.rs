@@ -147,8 +147,9 @@ pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
             tracing::warn!(path = %target.display(), "cannot sync directory: {e}");
         }
         // Renaming first means a crash here leaves the finished file plus a stale sidecar,
-        // never an unrenamed file without its sidecar.
-        remove_if_exists(&sidecar_path(&final_path))?;
+        // never an unrenamed file without its sidecar. The download is already complete
+        // here, so a sidecar that cannot be removed is only logged.
+        remove_sidecar_best_effort(&sidecar_path(&final_path));
         Ok(target)
     })
     .await?;
@@ -192,9 +193,46 @@ fn rename_part(part: &Path, final_path: &Path) -> io::Result<PathBuf> {
     ))
 }
 
+/// Removes a sidecar after a successful rename; failure is logged, never fatal.
+fn remove_sidecar_best_effort(path: &Path) {
+    if let Err(e) = remove_if_exists(path) {
+        tracing::warn!(path = %path.display(), "cannot remove sidecar after finishing: {e}");
+    }
+}
+
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_sidecar_best_effort;
+
+    #[test]
+    fn missing_sidecar_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_sidecar_best_effort(&dir.path().join("absent.puppy"));
+    }
+
+    #[test]
+    fn present_sidecar_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.puppy");
+        std::fs::write(&p, b"x").unwrap();
+        remove_sidecar_best_effort(&p);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn unremovable_sidecar_does_not_error_or_panic() {
+        // remove_file on a directory fails on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.puppy");
+        std::fs::create_dir(&p).unwrap();
+        remove_sidecar_best_effort(&p);
+        assert!(p.exists());
     }
 }
