@@ -15,6 +15,7 @@ use puppy_proto::{
 };
 use puppy_testserver::{ServerCfg, TestServer};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{BufReader, ReadHalf, WriteHalf};
@@ -71,6 +72,7 @@ impl Env {
                 default_dir: self.dl_dir(),
                 ..HttpConfig::default()
             }),
+            engine: None,
         }
     }
 
@@ -431,4 +433,116 @@ async fn shutdown_persists_and_pauses() {
     assert_eq!(path, env.dl_dir().join("a.bin"));
     let sidecar = puppy_core::http::resume::sidecar_path(&path);
     assert!(sidecar.exists(), "sidecar flushed at {}", sidecar.display());
+}
+
+/// An engine whose restores take 3 s.
+struct SlowRestore(puppy_core::http::engine::HttpEngine);
+
+#[async_trait::async_trait]
+impl puppy_core::engine::Engine for SlowRestore {
+    fn kind(&self) -> puppy_core::engine::EngineKind {
+        self.0.kind()
+    }
+    fn accepts(&self, source: &Source) -> bool {
+        self.0.accepts(source)
+    }
+    async fn add(
+        &self,
+        id: DownloadId,
+        req: AddRequest,
+        mode: puppy_core::engine::StartMode,
+        opts: puppy_core::engine::AddOptions,
+    ) -> Result<puppy_core::engine::Added, puppy_core::engine::EngineError> {
+        if matches!(mode, puppy_core::engine::StartMode::Restore { .. }) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        self.0.add(id, req, mode, opts).await
+    }
+    async fn pause(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.0.pause(id).await
+    }
+    async fn resume(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.0.resume(id).await
+    }
+    async fn remove(
+        &self,
+        id: DownloadId,
+        delete_files: bool,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.0.remove(id, delete_files).await
+    }
+    fn status(&self, id: DownloadId) -> Option<puppy_core::types::DownloadStatus> {
+        self.0.status(id)
+    }
+    fn detail(&self, id: DownloadId) -> Option<puppy_core::types::EngineDetail> {
+        self.0.detail(id)
+    }
+    fn set_download_limit(
+        &self,
+        id: DownloadId,
+        bps: Option<u64>,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.0.set_download_limit(id, bps)
+    }
+    fn set_global_download_budget(&self, bps: Option<u64>) {
+        self.0.set_global_download_budget(bps)
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<puppy_core::engine::EngineEvent> {
+        self.0.subscribe()
+    }
+}
+
+/// Restoring downloads never delays the socket: `hello` is answered within 500 ms
+/// although the restore takes 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_restore_does_not_block_the_socket() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(128 * KIB);
+    })
+    .await;
+    // A download paused mid-way, with files to restore.
+    let d = env.start(None).await;
+    let mut c = env.client().await;
+    let id = c.add(env.req(&s, "a.bin")).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while c.get(id).await.1 == 0 {
+        assert!(Instant::now() < deadline, "no progress");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(
+        c.request(Request::Pause { id }).await,
+        Reply::Ok { .. }
+    ));
+    drop(c);
+    shutdown(&env, d).await;
+
+    let mut opts = env.opts(None);
+    let http = opts.http.clone().unwrap();
+    opts.engine = Some(Arc::new(SlowRestore(
+        puppy_core::http::engine::HttpEngine::new(http).unwrap(),
+    )));
+    let t = Instant::now();
+    let d = tokio::spawn(run_daemon(opts));
+    let mut c = loop {
+        if let Some(c) = env.try_connect().await {
+            break c;
+        }
+        assert!(t.elapsed() < TIMEOUT, "daemon never listened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let r = c
+        .request(Request::Hello {
+            client: "test".into(),
+            protocol: PROTOCOL_VERSION,
+        })
+        .await;
+    let waited = t.elapsed();
+    assert!(matches!(r, Reply::Ok { .. }), "{r:?}");
+    assert!(waited < Duration::from_millis(500), "hello took {waited:?}");
+    // Shown with its stored state while the restore runs.
+    assert_eq!(c.get(id).await.0, WireState::Paused);
+    drop(c);
+    shutdown(&env, d).await;
 }

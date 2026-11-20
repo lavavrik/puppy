@@ -17,6 +17,13 @@ pub(super) enum JobKind {
     Resume,
     /// `engine.remove(id, true)` before starting over (restart).
     Reset,
+    /// `engine.add` of a stored download after a daemon restart, paused (local checks
+    /// only). Unlike the others it leaves the download's state alone while it runs.
+    Restore {
+        req: Box<AddRequest>,
+        mode: StartMode,
+        opts: AddOptions,
+    },
 }
 
 pub(super) struct Job {
@@ -30,6 +37,8 @@ enum Outcome {
     AddFailed(EngineError),
     Resumed(Result<(), EngineError>),
     Reset,
+    Restored,
+    RestoreFailed(EngineError),
 }
 
 impl Inner {
@@ -37,6 +46,13 @@ impl Inner {
     pub(super) fn begin_job(id: DownloadId, e: &mut Entry, kind: JobKind) -> Option<Job> {
         let engine = e.engine?;
         e.state = DownloadState::Starting;
+        e.job = Some(JobCtl::default());
+        Some(Job { id, engine, kind })
+    }
+
+    /// Marks `e` as being restored (its state is left as is) and returns the job.
+    pub(super) fn begin_restore(id: DownloadId, e: &mut Entry, kind: JobKind) -> Option<Job> {
+        let engine = e.engine?;
         e.job = Some(JobCtl::default());
         Some(Job { id, engine, kind })
     }
@@ -63,7 +79,8 @@ impl Inner {
     }
 
     /// Starts queued downloads, in queue order, while fewer than `max_active` are
-    /// starting or active; then rebalances the global limit. Never blocks.
+    /// starting or active (a queued download still being restored holds a slot, so
+    /// nothing overtakes it); then rebalances the global limit. Never blocks.
     pub(super) fn schedule(self: &Arc<Self>) {
         let jobs = {
             let mut st = self.lock();
@@ -93,9 +110,13 @@ impl Inner {
             let Some(e) = st.entries.get_mut(id) else {
                 continue;
             };
-            if e.state == DownloadState::Queued
-                && let Some(job) = Self::start_job(*id, e)
-            {
+            if e.state != DownloadState::Queued {
+                continue;
+            }
+            if e.job.is_some() {
+                // Being restored: started once the restore returns.
+                active += 1;
+            } else if let Some(job) = Self::start_job(*id, e) {
                 jobs.push(job);
                 active += 1;
             }
@@ -104,12 +125,17 @@ impl Inner {
     }
 
     /// Starts `id` now if a slot is free (used by `resume` of an engine-held download).
-    /// Returns the job, already marked in the state, or `None` if no slot is free.
+    /// Returns the job, already marked in the state, or `None` if no slot is free or a
+    /// job is in flight.
     pub(super) fn start_now(st: &mut State, id: DownloadId) -> Option<Job> {
         if st.active_count() >= usize::from(st.settings.max_active) {
             return None;
         }
-        Self::start_job(id, st.entries.get_mut(&id)?)
+        let e = st.entries.get_mut(&id)?;
+        if e.job.is_some() {
+            return None;
+        }
+        Self::start_job(id, e)
     }
 
     pub(super) fn spawn(self: &Arc<Self>, job: Job) {
@@ -128,6 +154,13 @@ impl Inner {
                 }
                 Err(e) => Outcome::AddFailed(e),
             },
+            JobKind::Restore { req, mode, opts } => match eng.add(id, *req, mode, opts).await {
+                Ok(added) => {
+                    self.record_added(id, &added);
+                    Outcome::Restored
+                }
+                Err(e) => Outcome::RestoreFailed(e),
+            },
             JobKind::Resume => Outcome::Resumed(eng.resume(id).await),
             JobKind::Reset => {
                 if let Err(e) = eng.remove(id, true).await
@@ -138,7 +171,10 @@ impl Inner {
                 Outcome::Reset
             }
         };
-        let held = matches!(outcome, Outcome::Added | Outcome::Resumed(_));
+        let held = matches!(
+            outcome,
+            Outcome::Added | Outcome::Resumed(_) | Outcome::Restored
+        );
         let mut outcome = Some(outcome);
         let mut paused = false;
         loop {
@@ -224,6 +260,36 @@ impl Inner {
         let ctl = e.job.take().unwrap_or_default();
         let want_pause = ctl.pause;
         let next = match outcome {
+            Outcome::Restored => {
+                let engine = e.engine.expect("a job has an engine");
+                match self.engines[engine].status(id) {
+                    None => {
+                        e.held = false;
+                        e.state.clone()
+                    }
+                    Some(status) => {
+                        Self::record_status(e, &status);
+                        match status.state {
+                            s @ DownloadState::Completed => s,
+                            // One already needing attention keeps its stored reason.
+                            s @ DownloadState::NeedsAttention { .. }
+                                if !matches!(e.state, DownloadState::NeedsAttention { .. }) =>
+                            {
+                                s
+                            }
+                            _ => e.state.clone(),
+                        }
+                    }
+                }
+            }
+            Outcome::RestoreFailed(err) => {
+                tracing::warn!(id, "restoring failed: {err}");
+                e.held = false;
+                DownloadState::Failed {
+                    reason: format!("restoring failed: {err}"),
+                    transient: err.is_transient(),
+                }
+            }
             Outcome::AddFailed(err) => {
                 e.held = false;
                 DownloadState::Failed {

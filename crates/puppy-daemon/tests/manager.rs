@@ -1117,3 +1117,78 @@ async fn stored_transient_failure_is_retried_after_restart() {
     wait_completed(&m, 4).await;
     m.shutdown().await;
 }
+
+/// A paused download with files on disk (so a restart restores it into the engine).
+async fn paused_with_files(env: &Env, s: &TestServer, name: &str) -> DownloadId {
+    let m = env.manager(3).await;
+    let id = m.add(env.req(s, name), false, None).await.unwrap();
+    wait_active_with_bytes(&m, id).await;
+    m.pause(id).await.unwrap();
+    wait_state(&m, id, |s| matches!(s, WireState::Paused)).await;
+    m.shutdown().await;
+    id
+}
+
+/// `Manager::start` does not wait for restores: they run as jobs, the entries show
+/// their stored state meanwhile, and commands follow the job rules.
+#[tokio::test]
+async fn start_does_not_wait_for_restores() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(128 * KIB);
+    })
+    .await;
+    let id = paused_with_files(&env, &s, "a.bin").await;
+    s.set_cfg(|c| c.bytes_per_sec = None);
+    // The gated engine holds every restore until it gets permits.
+    let (m, gated) = tokio::time::timeout(Duration::from_secs(2), env.gated_manager())
+        .await
+        .expect("Manager::start waited for a restore");
+    assert_eq!(snap(&m, id).state, WireState::Paused);
+    assert_eq!(snap(&m, id).path, Some(env.dl_dir().join("a.bin")));
+    // Restart is refused while restoring; resume queues it.
+    assert!(matches!(
+        m.restart(id).await,
+        Err(ManagerError::InvalidState(_))
+    ));
+    m.resume(id).await.unwrap();
+    assert_eq!(snap(&m, id).state, WireState::Queued);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        snap(&m, id).state,
+        WireState::Queued,
+        "started while restoring"
+    );
+    gated.before.add_permits(1);
+    gated.after.add_permits(1);
+    wait_completed(&m, id).await;
+    assert_file(&env.dl_dir().join("a.bin"), 512 * KIB, 0);
+    m.shutdown().await;
+}
+
+/// Removing a download while it is being restored removes it (files too) once the
+/// restore returns.
+#[tokio::test]
+async fn remove_during_restore() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(128 * KIB);
+    })
+    .await;
+    let id = paused_with_files(&env, &s, "a.bin").await;
+    let (m, gated) = tokio::time::timeout(Duration::from_secs(2), env.gated_manager())
+        .await
+        .expect("Manager::start waited for a restore");
+    m.remove(id, true).await.unwrap();
+    assert!(m.snapshot().0.is_empty());
+    gated.before.add_permits(1);
+    gated.after.add_permits(1);
+    wait_for("the partial files to go", || {
+        dir_entries(&env.dl_dir()).is_empty()
+    })
+    .await;
+    assert!(gated.status(id).is_none());
+    m.shutdown().await;
+}

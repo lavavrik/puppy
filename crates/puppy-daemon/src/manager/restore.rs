@@ -1,160 +1,102 @@
 //! Restoring the stored downloads when the manager starts.
 
-use super::{Effects, Entry, Inner};
+use super::schedule::{Job, JobKind};
+use super::{Entry, Inner};
 use crate::store::{PersistedState, StoredState};
 use puppy_core::engine::{AddOptions, StartMode};
-use puppy_core::types::{AddRequest, DownloadId, DownloadState};
+use puppy_core::types::{DownloadId, DownloadState};
 use std::collections::HashSet;
-use std::path::PathBuf;
-
-/// A download to hand back to its engine, paused (local checks only, no network).
-struct ToRestore {
-    id: DownloadId,
-    engine: usize,
-    req: AddRequest,
-    path: PathBuf,
-    limit: Option<u64>,
-}
 
 impl Inner {
-    /// Rebuilds the state from `persisted`:
+    /// Rebuilds the state from `persisted` and returns the restore jobs to spawn:
     /// - Completed: the record only.
     /// - Queued: stays queued (the scheduler restores it from its path, if any, when it
     ///   gets a slot).
     /// - Paused/Failed/NeedsAttention with a path: restored into the engine paused (no
-    ///   network) and keep their state, unless the local files show the download
-    ///   completed or needing attention.
-    /// - Active with a path: restored paused, then queued at the front of the queue (in
-    ///   their original order); the scheduler resumes them, which validates the remote.
+    ///   network) by a job, keeping their state, unless the local files show the
+    ///   download completed or needing attention.
+    /// - Active with a path: queued at the front of the queue (in their original order)
+    ///   and restored paused by a job; the scheduler then resumes them, which validates
+    ///   the remote. While restoring they hold a slot, so later queued downloads do not
+    ///   overtake them.
     /// - Active without a path (never got past the probe): queued.
     /// - Paused/Failed/NeedsAttention without a path: kept as they are.
     /// - No engine accepts the source: failed.
     ///
-    /// Restore errors leave the download failed.
-    pub(super) async fn restore(&self, persisted: PersistedState) {
-        let mut to_restore = Vec::new();
-        {
-            let mut st = self.lock();
-            let mut seen = HashSet::new();
-            let mut front = Vec::new();
-            let mut rest = Vec::new();
-            let known: HashSet<DownloadId> = persisted.downloads.iter().map(|d| d.id).collect();
-            // The stored order first, then any download it misses.
-            let order = persisted
-                .order
-                .iter()
-                .copied()
-                .filter(|id| known.contains(id))
-                .chain(persisted.downloads.iter().map(|d| d.id))
-                .collect::<Vec<_>>();
-            let mut by_id: std::collections::HashMap<_, _> =
-                persisted.downloads.into_iter().map(|d| (d.id, d)).collect();
-            for id in order {
-                if !seen.insert(id) {
-                    continue;
-                }
-                let Some(rec) = by_id.remove(&id) else {
-                    continue;
-                };
-                st.next_id = st.next_id.max(id + 1);
-                let engine = self
-                    .engines
-                    .iter()
-                    .position(|e| e.accepts(&rec.request.source));
-                let path = rec.path.clone();
-                let state = match (&rec.state, engine, path) {
-                    (StoredState::Completed, _, _) => DownloadState::Completed,
-                    (_, None, _) => DownloadState::Failed {
-                        reason: "unsupported source".into(),
-                        transient: false,
-                    },
-                    (StoredState::Queued, ..) => DownloadState::Queued,
-                    (StoredState::Active, Some(engine), Some(path)) => {
-                        to_restore.push(ToRestore {
-                            id,
-                            engine,
-                            req: rec.request.clone(),
-                            path,
-                            limit: rec.limit,
-                        });
-                        DownloadState::Queued
-                    }
-                    (StoredState::Active, _, None) => DownloadState::Queued,
-                    (stored, Some(engine), Some(path)) => {
-                        to_restore.push(ToRestore {
-                            id,
-                            engine,
-                            req: rec.request.clone(),
-                            path,
-                            limit: rec.limit,
-                        });
-                        live_state(stored)
-                    }
-                    (stored, Some(_), None) => live_state(stored),
-                };
-                if matches!(rec.state, StoredState::Active) && rec.path.is_some() {
-                    front.push(id);
-                } else {
-                    rest.push(id);
-                }
-                let mut entry = Entry::new(rec, state, engine);
-                if super::is_transient_failure(&entry.state) {
-                    // Failed transiently before the restart: retried like any other.
-                    self.arm_retry(id, &mut entry);
-                }
-                st.entries.insert(id, entry);
+    /// Restore jobs run in parallel; until one returns its download shows the stored
+    /// state and commands follow the usual job rules. Restore errors leave the download
+    /// failed (retried automatically if the cause is transient).
+    pub(super) fn restore(&self, persisted: PersistedState) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        let mut st = self.lock();
+        let mut seen = HashSet::new();
+        let mut front = Vec::new();
+        let mut rest = Vec::new();
+        let known: HashSet<DownloadId> = persisted.downloads.iter().map(|d| d.id).collect();
+        // The stored order first, then any download it misses.
+        let order = persisted
+            .order
+            .iter()
+            .copied()
+            .filter(|id| known.contains(id))
+            .chain(persisted.downloads.iter().map(|d| d.id))
+            .collect::<Vec<_>>();
+        let mut by_id: std::collections::HashMap<_, _> =
+            persisted.downloads.into_iter().map(|d| (d.id, d)).collect();
+        for id in order {
+            if !seen.insert(id) {
+                continue;
             }
-            front.extend(rest);
-            st.order = front;
-        }
-        for r in to_restore {
-            let opts = AddOptions {
-                start_paused: true,
-                limit: r.limit,
+            let Some(rec) = by_id.remove(&id) else {
+                continue;
             };
-            let mode = StartMode::Restore { path: r.path };
-            let result = self.engines[r.engine].add(r.id, r.req, mode, opts).await;
-            let mut fx = Effects::default();
-            {
-                let mut st = self.lock();
-                let Some(e) = st.entries.get_mut(&r.id) else {
-                    continue;
-                };
-                match result {
-                    Ok(added) => {
-                        e.held = true;
-                        e.rec.name = Some(added.name);
-                        e.rec.path = Some(added.path);
-                        e.rec.total_bytes = added.total_bytes;
-                        if let Some(status) = self.engines[r.engine].status(r.id) {
-                            Self::record_status(e, &status);
-                            let next = match status.state {
-                                s @ DownloadState::Completed => Some(s),
-                                // One already needing attention keeps its stored reason.
-                                s @ DownloadState::NeedsAttention { .. }
-                                    if !matches!(e.state, DownloadState::NeedsAttention { .. }) =>
-                                {
-                                    Some(s)
-                                }
-                                _ => None,
-                            };
-                            if let Some(next) = next {
-                                self.transition(r.id, e, next, &mut fx);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(id = r.id, "restoring failed: {err}");
-                        let next = DownloadState::Failed {
-                            reason: format!("restoring failed: {err}"),
-                            transient: err.is_transient(),
-                        };
-                        self.transition(r.id, e, next, &mut fx);
-                    }
-                }
+            st.next_id = st.next_id.max(id + 1);
+            let engine = self
+                .engines
+                .iter()
+                .position(|e| e.accepts(&rec.request.source));
+            // Handed back to its engine now (Queued ones wait for the scheduler).
+            let restore = engine.is_some()
+                && rec.path.is_some()
+                && !matches!(rec.state, StoredState::Completed | StoredState::Queued);
+            let state = match (&rec.state, engine) {
+                (StoredState::Completed, _) => DownloadState::Completed,
+                (_, None) => DownloadState::Failed {
+                    reason: "unsupported source".into(),
+                    transient: false,
+                },
+                (stored, Some(_)) => live_state(stored),
+            };
+            if matches!(rec.state, StoredState::Active) && restore {
+                front.push(id);
+            } else {
+                rest.push(id);
             }
-            self.apply(fx);
+            let kind = restore.then(|| JobKind::Restore {
+                req: Box::new(rec.request.clone()),
+                mode: StartMode::Restore {
+                    path: rec.path.clone().expect("checked above"),
+                },
+                opts: AddOptions {
+                    start_paused: true,
+                    limit: rec.limit,
+                },
+            });
+            let mut entry = Entry::new(rec, state, engine);
+            if super::is_transient_failure(&entry.state) {
+                // Failed transiently before the restart: retried like any other.
+                self.arm_retry(id, &mut entry);
+            }
+            if let Some(kind) = kind
+                && let Some(job) = Self::begin_restore(id, &mut entry, kind)
+            {
+                jobs.push(job);
+            }
+            st.entries.insert(id, entry);
         }
+        front.extend(rest);
+        st.order = front;
+        jobs
     }
 }
 
@@ -168,6 +110,7 @@ fn live_state(stored: &StoredState) -> DownloadState {
         StoredState::NeedsAttention { reason } => DownloadState::NeedsAttention {
             reason: reason.clone(),
         },
+        // Active ones are queued: the scheduler resumes them.
         StoredState::Queued | StoredState::Active => DownloadState::Queued,
         StoredState::Paused => DownloadState::Paused,
         StoredState::Completed => DownloadState::Completed,

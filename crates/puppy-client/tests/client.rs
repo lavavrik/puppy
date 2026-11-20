@@ -74,6 +74,7 @@ impl Env {
                 default_dir: self.dl_dir(),
                 ..HttpConfig::default()
             }),
+            engine: None,
         }
     }
 

@@ -226,6 +226,11 @@ impl Manager {
                     "only failed downloads or downloads needing attention can be restarted".into(),
                 ));
             }
+            if e.job.is_some() {
+                return Err(ManagerError::InvalidState(
+                    "the download is being restored; try again shortly".into(),
+                ));
+            }
             e.reset_retry();
             let job = if e.held {
                 Inner::begin_job(id, e, JobKind::Reset)

@@ -240,9 +240,10 @@ impl State {
 }
 
 impl Manager {
-    /// Loads the store, restores every download (see `Inner::restore`), then starts the event
-    /// loop and the 1 s schedule/rebalance ticker. Fails if the state file exists but
-    /// cannot be read, so it is never overwritten.
+    /// Loads the store, rebuilds the download list, starts restoring the engine-held
+    /// downloads in the background (see `Inner::restore`: it returns before any engine
+    /// call), then starts the event loop and the 1 s schedule/rebalance ticker. Fails if
+    /// the state file exists but cannot be read, so it is never overwritten.
     pub async fn start(
         engines: Vec<Arc<dyn Engine>>,
         store: Store,
@@ -278,7 +279,7 @@ impl Manager {
             jobs: Mutex::new(Some(JoinSet::new())),
             shutdown_done: tokio::sync::OnceCell::new(),
         });
-        inner.restore(persisted).await;
+        let restores = inner.restore(persisted);
         inner.persist(&inner.lock());
         for (idx, rx) in receivers.into_iter().enumerate() {
             tokio::spawn(event_task(
@@ -289,6 +290,9 @@ impl Manager {
             ));
         }
         tokio::spawn(tick_task(Arc::downgrade(&inner), inner.stop.clone()));
+        for job in restores {
+            inner.spawn(job);
+        }
         inner.schedule();
         Ok(Arc::new(Manager { inner }))
     }

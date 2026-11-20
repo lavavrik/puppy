@@ -28,7 +28,7 @@ const IDLE_CHECK: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const STALE_PROBE: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DaemonOptions {
     /// Exit after being idle (no queued/starting/active downloads and no connected
     /// clients) for this long. `None`: never idle-exit.
@@ -37,6 +37,19 @@ pub struct DaemonOptions {
     pub paths: Option<Paths>,
     /// Use this HTTP engine configuration instead of the one derived from the config file.
     pub http: Option<HttpConfig>,
+    /// Use this engine instead of building an HTTP engine (tests).
+    pub engine: Option<Arc<dyn Engine>>,
+}
+
+impl std::fmt::Debug for DaemonOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonOptions")
+            .field("idle_exit", &self.idle_exit)
+            .field("paths", &self.paths)
+            .field("http", &self.http)
+            .field("engine", &self.engine.as_ref().map(|e| e.kind()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +88,13 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     remove_stale_socket(&paths.socket).await?;
 
     let cfg = Config::load(&paths.config_file())?;
-    let http = opts.http.unwrap_or_else(|| cfg.http_config());
-    let engine: Arc<dyn Engine> =
-        Arc::new(HttpEngine::new(http).context("cannot create the HTTP engine")?);
+    let engine: Arc<dyn Engine> = match opts.engine {
+        Some(engine) => engine,
+        None => {
+            let http = opts.http.unwrap_or_else(|| cfg.http_config());
+            Arc::new(HttpEngine::new(http).context("cannot create the HTTP engine")?)
+        }
+    };
     let store = Store::new(paths.state_file.clone());
     let manager = Manager::start(vec![engine], store, cfg)
         .await
