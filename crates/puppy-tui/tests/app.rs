@@ -481,7 +481,11 @@ fn add_popup_submits_add_cmd() {
                     url: "https://example.com/f.iso".parse().unwrap()
                 }
             );
-            assert_eq!(request.output_dir, Some("/data".into()));
+            // On Windows a rooted path gets the current drive.
+            assert_eq!(
+                request.output_dir,
+                Some(std::path::absolute("/data").unwrap())
+            );
         }
         c => panic!("unexpected {c:?}"),
     }

@@ -620,7 +620,7 @@ fn render_never_panics_any_size() {
     states.push(full);
     let popups = [
         Popup::Add(AddForm::default()),
-        Popup::Limit(LimitForm::new(1)),
+        Popup::Limit(LimitForm::new(1, None)),
         Popup::GlobalLimits(GlobalLimitsForm::default()),
         Popup::ConfirmDelete {
             id: 1,
@@ -955,6 +955,48 @@ fn demo_render_print() {
     for (w, hh) in [(120u16, 32u16), (90, 30), (80, 24)] {
         println!("--- {w}×{hh}");
         for r in render(&mut a, w, hh) {
+            println!("{r}");
+        }
+    }
+
+    // Popups at 100×30 (and a toast).
+    let mut add = AddForm::with_source("htps://example.com/file.iso");
+    add.error = Some(puppy_tui::app::forms::ADD_BAD_SOURCE.into());
+    let popups = [
+        ("add popup with an inline error", Popup::Add(add)),
+        (
+            "confirm delete",
+            Popup::ConfirmDelete {
+                id: 6,
+                name: "photos.zip".into(),
+                delete_files: true,
+            },
+        ),
+        ("help", Popup::Help),
+        ("limit", Popup::Limit(LimitForm::new(1, Some(20 * MIB)))),
+        ("global limits", {
+            let mut g = GlobalLimitsForm::new(Some(2 * MIB), None);
+            g.focus = 1;
+            g.up = TextInput::with_value("fast");
+            g.error_field = 1;
+            g.error = puppy_tui::format::parse_rate("fast").err();
+            Popup::GlobalLimits(g)
+        }),
+    ];
+    let now = Instant::now();
+    a.push_toast(
+        "big-dataset.tar.zst failed: connection reset by peer",
+        puppy_tui::app::ToastKind::Error,
+        now,
+    );
+    for (what, p) in popups {
+        a.mode = Mode::Popup(p);
+        println!("--- 100×30 {what}");
+        for r in render(&mut a, 100, 30) {
+            println!("{r}");
+        }
+        println!("--- 60×16 {what}");
+        for r in render(&mut a, 60, 16) {
             println!("{r}");
         }
     }

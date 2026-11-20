@@ -1896,6 +1896,7 @@ name = "puppy-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "dirs",
  "puppy-core",
  "puppy-proto",
  "ratatui",

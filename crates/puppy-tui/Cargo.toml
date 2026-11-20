@@ -12,3 +12,4 @@ unicode-segmentation.workspace = true
 puppy-core = { path = "../puppy-core" }
 puppy-proto = { path = "../puppy-proto" }
 url.workspace = true
+dirs.workspace = true

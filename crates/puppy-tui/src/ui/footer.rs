@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Sparkline, Widget};
 
 use super::{groups, spans, width};
-use crate::app::{Action, App, HitTarget, Mode};
+use crate::app::{Action, AddField, App, HitTarget, Mode, Popup};
 use crate::format;
 use crate::theme::Token;
 
@@ -147,7 +147,7 @@ fn hint_line(app: &mut App, buf: &mut Buffer, r: Rect) {
             );
             vec![hint("Enter", "keep", None), hint("Esc", "clear", Some(ESC))]
         }
-        Mode::Popup(_) => vec![hint("Esc", "close", Some(ESC))],
+        Mode::Popup(p) => popup_hints(p),
     };
     let filter_mode = app.mode == Mode::Filter;
     for (i, h) in hints.iter().enumerate() {
@@ -205,4 +205,31 @@ fn normal_hints(app: &App) -> Vec<Hint> {
         hint("q", "quit", Some('q')),
     ]);
     v
+}
+
+/// What the open popup's keys do.
+fn popup_hints(p: &Popup) -> Vec<Hint> {
+    let cancel = hint("Esc", "cancel", Some(ESC));
+    match p {
+        Popup::Add(f) => {
+            let mut v = vec![hint("Tab", "next", None)];
+            if f.focus == AddField::Paused {
+                v.push(hint("Space", "toggle", None));
+            }
+            v.extend([hint("Enter", "add", None), cancel]);
+            v
+        }
+        Popup::Limit(_) => vec![hint("Enter", "set", None), cancel],
+        Popup::GlobalLimits(_) => vec![
+            hint("Tab", "next", None),
+            hint("Enter", "set", None),
+            cancel,
+        ],
+        Popup::ConfirmDelete { .. } => vec![
+            hint("f", "files", Some('f')),
+            hint("Enter", "delete", None),
+            cancel,
+        ],
+        Popup::Help => vec![hint("j/k", "scroll", None), hint("Esc", "close", Some(ESC))],
+    }
 }

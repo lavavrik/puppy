@@ -207,6 +207,8 @@ pub struct App {
     pub now_unix: u64,
     /// Ticks seen so far: animates indeterminate progress bars.
     pub ticks: u64,
+    /// First visible row of the help popup (clamped by drawing).
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -230,6 +232,7 @@ impl App {
             hits: HitMap::new(),
             now_unix: 0,
             ticks: 0,
+            help_scroll: 0,
         }
     }
 
@@ -474,20 +477,9 @@ impl App {
                 }
             }
             Mode::Filter => self.edit_filter(|f| f.paste(text)),
-            Mode::Popup(Popup::Add(form)) => {
-                if let Some(input) = form.focused_input() {
-                    input.paste(text);
-                    form.error = None;
-                }
-            }
-            Mode::Popup(Popup::Limit(form)) => form.input.paste(text),
-            Mode::Popup(Popup::GlobalLimits(form)) => {
-                if form.focus == 0 {
-                    form.down.paste(text);
-                } else {
-                    form.up.paste(text);
-                }
-            }
+            Mode::Popup(Popup::Add(form)) => form.paste(text),
+            Mode::Popup(Popup::Limit(form)) => form.paste(text),
+            Mode::Popup(Popup::GlobalLimits(form)) => form.paste(text),
             Mode::Popup(Popup::ConfirmDelete { .. } | Popup::Help) => {}
         }
     }
@@ -582,7 +574,7 @@ impl App {
             }
             KeyAction::Limit => {
                 if let Some(d) = self.target(Action::Limit, now) {
-                    self.mode = Mode::Popup(Popup::Limit(LimitForm::new(d.id)));
+                    self.mode = Mode::Popup(Popup::Limit(LimitForm::new(d.id, d.limit)));
                 }
             }
             KeyAction::MoveUp | KeyAction::MoveDown => {
@@ -596,7 +588,11 @@ impl App {
                 }
             }
             KeyAction::GlobalLimits => {
-                self.mode = Mode::Popup(Popup::GlobalLimits(GlobalLimitsForm::default()));
+                let (down, up) = self
+                    .settings
+                    .as_ref()
+                    .map_or((None, None), |s| (s.global_down_limit, s.global_up_limit));
+                self.mode = Mode::Popup(Popup::GlobalLimits(GlobalLimitsForm::new(down, up)));
             }
             KeyAction::MoreActive | KeyAction::LessActive => {
                 let (lo, hi) = MAX_ACTIVE_RANGE;
@@ -615,7 +611,10 @@ impl App {
             }
             KeyAction::Filter => self.mode = Mode::Filter,
             KeyAction::ClearFilter => self.edit_filter(TextInput::clear),
-            KeyAction::Help => self.mode = Mode::Popup(Popup::Help),
+            KeyAction::Help => {
+                self.help_scroll = 0;
+                self.mode = Mode::Popup(Popup::Help);
+            }
             KeyAction::Quit => return self.quit(),
         }
         Vec::new()
@@ -631,11 +630,19 @@ impl App {
         }
         let submitted = match popup {
             Popup::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q')
-                ) {
-                    self.mode = Mode::Normal;
+                // Drawing clamps the scroll to the help's height.
+                let s = &mut self.help_scroll;
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => *s = s.saturating_add(1),
+                    KeyCode::Char('k') | KeyCode::Up => *s = s.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *s = s.saturating_add(10),
+                    KeyCode::PageUp => *s = s.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => *s = 0,
+                    KeyCode::Char('G') | KeyCode::End => *s = u16::MAX,
+                    _ => {}
                 }
                 return Vec::new();
             }

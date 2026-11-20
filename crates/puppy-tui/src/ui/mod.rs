@@ -6,6 +6,8 @@
 mod detail;
 mod footer;
 mod list;
+mod popup;
+mod toast;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -17,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use puppy_proto::WireState;
 
-use crate::app::{App, Conn, Mode};
+use crate::app::{App, Conn, HitTarget, Mode};
 use crate::format;
 use crate::theme::{Theme, Token};
 
@@ -115,8 +117,25 @@ fn draw_into(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
         detail::draw(app, buf, d);
     }
     footer::draw(app, buf, l.footer);
-    // Popups and toasts draw last, over everything (Task 5).
-    title_bar(app, buf, l.title)
+    let filter_cursor = title_bar(app, buf, l.title);
+    // The popup over everything but the footer, then the toasts that do not overlap it
+    // (the popup is modal: a toast must not hide its fields).
+    let cursor = match app.mode {
+        Mode::Popup(_) => popup::draw(app, buf, area),
+        _ => filter_cursor,
+    };
+    let popup = app
+        .hits
+        .iter()
+        .find(|(_, t)| *t == HitTarget::PopupInside)
+        .map(|(r, _)| *r);
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height - 1 - FOOTER_ROWS,
+        ..area
+    };
+    toast::draw(app, buf, body, popup);
+    cursor
 }
 
 fn too_small(theme: &Theme, buf: &mut Buffer, area: Rect) {
@@ -271,6 +290,55 @@ pub(crate) fn groups(
 /// Display width of `s` as drawn (sanitized), saturating at `u16::MAX`.
 pub(crate) fn width(s: &str) -> u16 {
     u16::try_from(format::display_safe(s).width()).unwrap_or(u16::MAX)
+}
+
+/// Word-wraps `s` (sanitized) to lines of at most `max_w` columns, at most `max_lines`
+/// of them; a word longer than a line is split, and text that does not fit ends the
+/// last line with `…`.
+pub(crate) fn wrap(s: &str, max_w: usize, max_lines: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    if max_w == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let safe = format::display_safe(s);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    for word in safe.split_whitespace() {
+        let ww = word.width();
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + ww <= max_w {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            cur_w += sep + ww;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        // Split a word too long for a line.
+        for g in word.graphemes(true) {
+            let gw = g.width();
+            if cur_w + gw > max_w && !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            cur.push_str(g);
+            cur_w += gw;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        let rest = lines.split_off(max_lines - 1).join(" ");
+        // The rest is wider than a line (it was wrapped), so this ends with `…`.
+        lines.push(format::truncate(&rest, max_w));
+    }
+    lines
 }
 
 /// Writes `s` centered horizontally in `area` on row `y`.

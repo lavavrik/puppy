@@ -134,6 +134,18 @@ pub fn display_safe(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// A rate as the limit inputs take it back ([`parse_rate`] round-trips it exactly):
+/// `1.0M`, `500.0k`, `1.5G`; plain bytes when no unit with one decimal is exact.
+pub fn rate_input(bps: u64) -> String {
+    for (unit, suffix) in [(1u64 << 30, 'G'), (1 << 20, 'M'), (1 << 10, 'k')] {
+        if bps >= unit && (u128::from(bps) * 10) % u128::from(unit) == 0 {
+            let tenths = u128::from(bps) * 10 / u128::from(unit);
+            return format!("{}.{}{suffix}", tenths / 10, tenths % 10);
+        }
+    }
+    bps.to_string()
+}
+
 /// Parses a user-entered rate in bytes/s with binary units: `500k`, `5M`, `5MiB`,
 /// `1.5g`, `5 MiB/s` (case-insensitive). `0`, `none`, `off` and the empty string mean
 /// "no limit" (`None`). Errors are user-facing text.
@@ -198,6 +210,18 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const KIB: u64 = 1024;
+
+    #[test]
+    fn rate_input_round_trips() {
+        assert_eq!(rate_input(1 << 20), "1.0M");
+        assert_eq!(rate_input(500 * KIB), "500.0k");
+        assert_eq!(rate_input(3 << 29), "1.5G");
+        assert_eq!(rate_input(1000), "1000");
+        assert_eq!(rate_input(1_234_567), "1234567");
+        for v in [1, 1000, 500 * KIB, 1 << 20, 3 << 29, 1_234_567, u64::MAX] {
+            assert_eq!(parse_rate(&rate_input(v)), Ok(Some(v)), "{v}");
+        }
+    }
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
 
