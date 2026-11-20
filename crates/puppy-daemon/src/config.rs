@@ -31,6 +31,32 @@ fn fmt_pos(line: Option<usize>, column: Option<usize>) -> String {
     }
 }
 
+/// The `[torrent]` table.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct TorrentConfig {
+    /// Use the DHT to find peers.
+    pub dht: bool,
+    /// Map the listen port with UPnP.
+    pub upnp: bool,
+    /// Port to listen on for peers (an OS-assigned one if busy).
+    pub listen_port: u16,
+    /// Seed until this share ratio is reached. Reserved: only `0.0` (stop at
+    /// completion) is implemented.
+    pub seed_ratio: f32,
+}
+
+impl Default for TorrentConfig {
+    fn default() -> Self {
+        Self {
+            dht: true,
+            upnp: false,
+            listen_port: 42069,
+            seed_ratio: 0.0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -41,6 +67,7 @@ pub struct Config {
     pub global_up_limit: Option<u64>,
     pub theme: String,
     pub proxy: Option<url::Url>,
+    pub torrent: TorrentConfig,
     /// First delay before a transiently failed download is retried automatically;
     /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
     /// the file.
@@ -67,6 +94,7 @@ impl Default for Config {
             global_up_limit: None,
             theme: "auto".into(),
             proxy: None,
+            torrent: TorrentConfig::default(),
             retry_base: Duration::from_secs(30),
             shutdown_pause_timeout: Duration::from_secs(10),
         }
@@ -143,6 +171,27 @@ mod tests {
         assert_eq!(c.max_active, 5);
         assert_eq!(c.connections, 8);
         assert_eq!(c.theme, "auto");
+    }
+
+    #[test]
+    fn config_torrent_table_defaults_and_overrides() {
+        let _env = env_lock();
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        std::fs::write(&p, "max_active = 5\n").unwrap();
+        let t = Config::load(&p).unwrap().torrent;
+        assert!(t.dht && !t.upnp);
+        assert_eq!(t.listen_port, 42069);
+        assert_eq!(t.seed_ratio, 0.0);
+        std::fs::write(&p, "[torrent]\ndht = false\nlisten_port = 51413\n").unwrap();
+        let t = Config::load(&p).unwrap().torrent;
+        assert!(!t.dht && !t.upnp);
+        assert_eq!(t.listen_port, 51413);
+        assert_eq!(t.seed_ratio, 0.0);
+        std::fs::write(&p, "[torrent]\nupnp = true\nseed_ratio = 1.5\n").unwrap();
+        let t = Config::load(&p).unwrap().torrent;
+        assert!(t.dht && t.upnp);
+        assert_eq!(t.seed_ratio, 1.5);
     }
 
     #[test]

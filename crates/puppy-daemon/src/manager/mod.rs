@@ -299,6 +299,7 @@ impl Manager {
             jobs: Mutex::new(Some(JoinSet::new())),
             shutdown_done: tokio::sync::OnceCell::new(),
         });
+        inner.apply_upload_budget();
         let restores = inner.restore(persisted);
         inner.persist(&inner.lock());
         for (idx, rx) in receivers.into_iter().enumerate() {
@@ -564,6 +565,15 @@ impl Inner {
         };
         for (engine, share) in self.engines.iter().zip(budget::divide(global, &counts)) {
             engine.set_global_download_budget(share);
+        }
+    }
+
+    /// Hands the global upload limit to every engine as is: unlike downloads it is not
+    /// divided (only the torrent engine uploads).
+    fn apply_upload_budget(&self) {
+        let up = self.lock().settings.global_up_limit;
+        for engine in &self.engines {
+            engine.set_global_upload_budget(up);
         }
     }
 

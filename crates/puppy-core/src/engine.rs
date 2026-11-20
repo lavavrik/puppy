@@ -115,6 +115,9 @@ pub trait Engine: Send + Sync + 'static {
     fn set_download_limit(&self, id: DownloadId, bps: Option<u64>) -> Result<(), EngineError>;
     /// Engine-wide download budget assigned by the daemon's global limiter.
     fn set_global_download_budget(&self, bps: Option<u64>);
+    /// Global upload limit in bytes/s (`None`: unlimited), passed as set (not divided).
+    /// Engines that do not upload ignore it.
+    fn set_global_upload_budget(&self, _bps: Option<u64>) {}
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent>;
 }
 

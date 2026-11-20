@@ -335,7 +335,7 @@ impl Manager {
     }
 
     /// Global limits in bytes/s (`None` or 0: unlimited). The download limit is divided
-    /// across engines; the upload limit is only stored for now.
+    /// across engines; the upload limit goes to every engine as is.
     pub fn set_global_limits(&self, down: Option<u64>, up: Option<u64>) {
         let inner = &self.inner;
         {
@@ -345,6 +345,7 @@ impl Manager {
             inner.persist(&st);
         }
         inner.rebalance();
+        inner.apply_upload_budget();
     }
 
     /// At most `n` downloads starting or active at once. Lowering it does not pause

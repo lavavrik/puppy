@@ -1347,3 +1347,100 @@ async fn restart_keeps_partial_files_another_download_owns() {
     assert_eq!(snap(&m, id).path, None);
     m.shutdown().await;
 }
+
+/// An engine that only records the upload budgets it is given.
+struct UpRecorder {
+    inner: HttpEngine,
+    calls: std::sync::Mutex<Vec<Option<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl Engine for UpRecorder {
+    fn kind(&self) -> puppy_core::engine::EngineKind {
+        self.inner.kind()
+    }
+    fn accepts(&self, source: &Source) -> bool {
+        self.inner.accepts(source)
+    }
+    async fn add(
+        &self,
+        id: DownloadId,
+        req: AddRequest,
+        mode: puppy_core::engine::StartMode,
+        opts: puppy_core::engine::AddOptions,
+    ) -> Result<puppy_core::engine::Added, puppy_core::engine::EngineError> {
+        self.inner.add(id, req, mode, opts).await
+    }
+    async fn pause(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.pause(id).await
+    }
+    async fn resume(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.resume(id).await
+    }
+    async fn remove(
+        &self,
+        id: DownloadId,
+        delete_files: bool,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.remove(id, delete_files).await
+    }
+    fn status(&self, id: DownloadId) -> Option<puppy_core::types::DownloadStatus> {
+        self.inner.status(id)
+    }
+    fn detail(&self, id: DownloadId) -> Option<puppy_core::types::EngineDetail> {
+        self.inner.detail(id)
+    }
+    fn set_download_limit(
+        &self,
+        id: DownloadId,
+        bps: Option<u64>,
+    ) -> Result<(), puppy_core::engine::EngineError> {
+        self.inner.set_download_limit(id, bps)
+    }
+    fn set_global_download_budget(&self, bps: Option<u64>) {
+        self.inner.set_global_download_budget(bps)
+    }
+    fn set_global_upload_budget(&self, bps: Option<u64>) {
+        self.calls.lock().unwrap().push(bps);
+    }
+    fn subscribe(&self) -> broadcast::Receiver<puppy_core::engine::EngineEvent> {
+        self.inner.subscribe()
+    }
+}
+
+#[tokio::test]
+async fn global_up_limit_reaches_engines() {
+    let env = Env::new();
+    let rec = |env: &Env| {
+        Arc::new(UpRecorder {
+            inner: HttpEngine::new(http_cfg(&env.dl_dir())).unwrap(),
+            calls: Default::default(),
+        })
+    };
+    let (a, b) = (rec(&env), rec(&env));
+    let cfg = Config {
+        download_dir: env.dl_dir(),
+        global_up_limit: Some(500),
+        ..Config::default()
+    };
+    let m = Manager::start(
+        vec![a.clone(), b.clone()],
+        Store::new(env.state_path()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    // At start, from the config; not divided between engines.
+    assert_eq!(*a.calls.lock().unwrap(), vec![Some(500)]);
+    assert_eq!(*b.calls.lock().unwrap(), vec![Some(500)]);
+    m.set_global_limits(None, Some(2000));
+    m.set_global_limits(None, Some(0));
+    for e in [&a, &b] {
+        assert_eq!(
+            *e.calls.lock().unwrap(),
+            vec![Some(500), Some(2000), None],
+            "0 means unlimited"
+        );
+    }
+    m.shutdown().await;
+}
