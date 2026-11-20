@@ -25,6 +25,10 @@ pub enum StoreError {
 
 const CURRENT_VERSION: u32 = 1;
 const DEBOUNCE: Duration = Duration::from_millis(300);
+/// A failed debounced write is retried after this long, doubling up to
+/// [`RETRY_MAX`].
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StoredDownload {
@@ -91,6 +95,8 @@ struct Pending {
     state: Option<PersistedState>,
     /// A background debounce task is alive.
     running: bool,
+    /// `close` has run: nothing more is written.
+    closed: bool,
 }
 
 struct Inner {
@@ -134,22 +140,42 @@ impl Inner {
         res
     }
 
+    /// Writes the pending state after [`DEBOUNCE`], again while more arrives, and
+    /// keeps retrying a failed write (after 1 s, doubling up to 30 s) until it
+    /// succeeds, nothing is pending any more, or the store is closed.
     async fn debounce_task(self: Arc<Self>) {
+        let mut delay = DEBOUNCE;
+        let mut retry = RETRY_FIRST;
         loop {
-            tokio::time::sleep(DEBOUNCE).await;
+            tokio::time::sleep(delay).await;
             let _g = self.write_lock.lock().await;
-            let res = self.write_pending().await;
-            let mut p = self.pending.lock().unwrap();
-            if let Err(e) = res {
-                // State stays pending; the next save_soon/flush retries.
-                tracing::warn!("failed to save {}: {e}", self.path.display());
-                p.running = false;
+            if self.pending.lock().unwrap().closed {
+                self.pending.lock().unwrap().running = false;
                 return;
             }
+            let res = self.write_pending().await;
+            let mut p = self.pending.lock().unwrap();
             if p.state.is_none() {
                 p.running = false;
                 return;
             }
+            delay = match res {
+                Ok(()) => {
+                    retry = RETRY_FIRST;
+                    DEBOUNCE
+                }
+                Err(e) => {
+                    // The state stays pending (unless a newer one arrived) and this
+                    // task stays the one writing it.
+                    tracing::warn!(
+                        "failed to save {} (retrying in {retry:?}): {e}",
+                        self.path.display()
+                    );
+                    let d = retry;
+                    retry = (retry * 2).min(RETRY_MAX);
+                    d
+                }
+            };
         }
     }
 }
@@ -222,9 +248,17 @@ impl Store {
     }
 
     /// Writes immediately (atomic, private). Supersedes any pending debounced state.
+    /// A no-op once the store is closed.
     pub async fn save_now(&self, st: &PersistedState) -> std::io::Result<()> {
         let _g = self.inner.write_lock.lock().await;
-        self.inner.pending.lock().unwrap().state = None;
+        {
+            let mut p = self.inner.pending.lock().unwrap();
+            if p.closed {
+                tracing::debug!("not saving: the store is closed");
+                return Ok(());
+            }
+            p.state = None;
+        }
         let res = self.inner.write(st).await;
         if res.is_err() {
             let mut p = self.inner.pending.lock().unwrap();
@@ -235,9 +269,14 @@ impl Store {
         res
     }
 
-    /// Debounced: coalesces calls within 300 ms; the latest state wins. Needs a Tokio runtime.
+    /// Debounced: coalesces calls within 300 ms; the latest state wins. Needs a Tokio
+    /// runtime. A no-op once the store is closed.
     pub fn save_soon(&self, st: PersistedState) {
         let mut p = self.inner.pending.lock().unwrap();
+        if p.closed {
+            tracing::debug!("not saving: the store is closed");
+            return;
+        }
         p.state = Some(st);
         if !p.running {
             p.running = true;
@@ -252,6 +291,19 @@ impl Store {
         if let Err(e) = self.inner.write_pending().await {
             tracing::warn!("failed to flush {}: {e}", self.inner.path.display());
         }
+    }
+
+    /// Final flush: writes any pending state now, after which `save_soon` and
+    /// `save_now` do nothing (so nothing can overwrite the final state, e.g. a late
+    /// background save after shutdown). A failed final write is logged.
+    pub async fn close(&self) {
+        let _g = self.inner.write_lock.lock().await;
+        if let Err(e) = self.inner.write_pending().await {
+            tracing::warn!("failed to save {}: {e}", self.inner.path.display());
+        }
+        let mut p = self.inner.pending.lock().unwrap();
+        p.closed = true;
+        p.state = None;
     }
 }
 
@@ -447,6 +499,43 @@ mod tests {
         chmod(d.path(), 0o700);
         s.flush().await;
         assert_eq!(s.write_count(), 1);
+        assert_eq!(s.load().await.unwrap().next_id, 6);
+    }
+
+    #[tokio::test]
+    async fn saves_after_close_are_ignored() {
+        let (_d, s) = store();
+        s.save_soon(sample(3));
+        s.close().await;
+        assert_eq!(s.load().await.unwrap().next_id, 3, "close flushes");
+        s.save_soon(sample(4));
+        s.save_now(&sample(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.flush().await;
+        assert_eq!(s.write_count(), 1);
+        assert_eq!(s.load().await.unwrap().next_id, 3);
+    }
+
+    /// A failed debounced write is retried by itself (no flush or later save needed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_debounced_write_is_retried() {
+        let (d, s) = store();
+        let probe = d.path().join("probe");
+        chmod(d.path(), 0o500);
+        if std::fs::write(&probe, b"").is_ok() {
+            chmod(d.path(), 0o700);
+            return; // running as root
+        }
+        s.save_soon(sample(6));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(s.write_count(), 0);
+        chmod(d.path(), 0o700);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while s.write_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never retried");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(s.load().await.unwrap().next_id, 6);
     }
 

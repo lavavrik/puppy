@@ -689,6 +689,10 @@ impl Engine for Gated {
 
 impl Env {
     async fn gated_manager(&self) -> (Arc<Manager>, Arc<Gated>) {
+        self.gated_manager_with(|_| {}).await
+    }
+
+    async fn gated_manager_with(&self, f: impl FnOnce(&mut Config)) -> (Arc<Manager>, Arc<Gated>) {
         let gated = Arc::new(Gated {
             inner: HttpEngine::new(http_cfg(&self.dl_dir())).unwrap(),
             before: tokio::sync::Semaphore::new(0),
@@ -698,10 +702,11 @@ impl Env {
             pause_permits: tokio::sync::Semaphore::new(0),
             fail_limit: AtomicBool::new(false),
         });
-        let cfg = Config {
+        let mut cfg = Config {
             download_dir: self.dl_dir(),
             ..Config::default()
         };
+        f(&mut cfg);
         let m = Manager::start(vec![gated.clone()], Store::new(self.state_path()), cfg)
             .await
             .unwrap();
@@ -1191,4 +1196,40 @@ async fn remove_during_restore() {
     .await;
     assert!(gated.status(id).is_none());
     m.shutdown().await;
+}
+
+/// A pause that hangs does not hold shutdown up: after the pause budget the state is
+/// persisted and flushed regardless.
+#[tokio::test]
+async fn shutdown_pause_phase_is_bounded() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 512 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let (m, gated) = env
+        .gated_manager_with(|c| c.shutdown_pause_timeout = Duration::from_millis(500))
+        .await;
+    let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    gated.before.add_permits(1);
+    gated.after.add_permits(1);
+    wait_active_with_bytes(&m, id).await;
+    gated.gate_pause.store(true, Ordering::SeqCst);
+    let t = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), m.shutdown())
+        .await
+        .expect("shutdown waited for a hung pause");
+    assert!(
+        t.elapsed() >= Duration::from_millis(400),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(gated.pauses.load(Ordering::SeqCst), 1);
+    // Recorded as active, to be resumed after a restart.
+    let text = std::fs::read_to_string(env.state_path()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["downloads"][0]["state"]["kind"], "active", "{v:#}");
+    // Stop the transfer the abandoned pause left running.
+    gated.inner.pause(id).await.unwrap();
 }

@@ -66,10 +66,16 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
         ..DaemonOptions::default()
     })
     .await?;
-    if outcome == RunOutcome::AlreadyRunning {
-        eprintln!("puppy: a daemon is already running; nothing to do");
+    match outcome {
+        RunOutcome::Exited => Ok(()),
+        RunOutcome::AlreadyRunning => {
+            eprintln!("puppy: a daemon is already running; nothing to do");
+            Ok(())
+        }
+        RunOutcome::Forced => {
+            anyhow::bail!("shutdown interrupted: some downloads may resume from an earlier point")
+        }
     }
-    Ok(())
 }
 
 /// Placeholder for the dashboard: `N downloads, X active` (`1 download, …`).

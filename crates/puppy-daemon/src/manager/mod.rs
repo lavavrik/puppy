@@ -313,10 +313,22 @@ impl Manager {
         })
     }
 
-    /// Pauses every engine-held download (so sidecars are flushed), persists the state
-    /// (downloads that were active stay recorded as active, to resume after a restart)
-    /// and flushes the store. Later commands fail with `InvalidState`. Concurrent and
-    /// later calls return once the first one has finished.
+    /// Persists the current state and writes it out now, waiting at most `limit`
+    /// (`false`: it timed out; a write error is only logged). For a forced exit, when
+    /// `shutdown` is cut short.
+    pub async fn save_state(&self, limit: Duration) -> bool {
+        let inner = &self.inner;
+        inner.persist(&inner.lock());
+        tokio::time::timeout(limit, inner.store.flush())
+            .await
+            .is_ok()
+    }
+
+    /// Pauses every engine-held download (so sidecars are flushed; at most
+    /// `Config::shutdown_pause_timeout`, then pauses still running are abandoned),
+    /// persists the state (downloads that were active stay recorded as active, to resume
+    /// after a restart) and flushes the store. Later commands fail with `InvalidState`.
+    /// Concurrent and later calls return once the first one has finished.
     pub async fn shutdown(&self) {
         let inner = &self.inner;
         inner.shutdown_done.get_or_init(|| inner.shutdown()).await;
@@ -571,15 +583,29 @@ impl Inner {
             let engine = self.engines[engine].clone();
             calls.spawn(async move { (id, engine.remove(id, delete_files).await) });
         }
-        while let Some(res) = calls.join_next().await {
-            if let Ok((id, Err(e))) = res
-                && !matches!(e, EngineError::NotFound(_))
-            {
-                tracing::warn!(id, "stopping on shutdown: {e}");
+        let settle = async {
+            while let Some(res) = calls.join_next().await {
+                if let Ok((id, Err(e))) = res
+                    && !matches!(e, EngineError::NotFound(_))
+                {
+                    tracing::warn!(id, "stopping on shutdown: {e}");
+                }
             }
+        };
+        if tokio::time::timeout(self.cfg.shutdown_pause_timeout, settle)
+            .await
+            .is_err()
+        {
+            // Their sidecars may lag behind: they resume from an earlier point.
+            tracing::warn!(
+                "{} download(s) did not pause within {:?}; saving the state anyway",
+                calls.len(),
+                self.cfg.shutdown_pause_timeout
+            );
+            calls.abort_all();
         }
         self.persist(&self.lock());
-        self.store.flush().await;
+        self.store.close().await;
     }
 }
 

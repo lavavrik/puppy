@@ -417,6 +417,62 @@ fn bad_arguments_fail() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigterm_shuts_down_gracefully() {
+    signal_shuts_down_gracefully(libc::SIGTERM).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sighup_shuts_down_gracefully() {
+    signal_shuts_down_gracefully(libc::SIGHUP).await;
+}
+
+/// Two signals in a row: the daemon exits promptly either way, releasing its lock and
+/// leaving a readable state file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_signal_exits_promptly() {
+    let env = Env::new();
+    let s = TestServer::start(ServerCfg {
+        len: 4096 * KIB,
+        bytes_per_sec: Some(256 * KIB),
+        ..ServerCfg::default()
+    })
+    .await;
+    let child = env
+        .command(&["daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let c = loop {
+        if let Ok(c) = Client::connect(&env.socket, "e2e").await {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "the daemon never listened");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_state(&c, id, "transferring", |d| d.done_bytes > 0).await;
+    let pid = child.id() as libc::pid_t;
+    for _ in 0..2 {
+        // SAFETY: plain syscall on our own child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    }
+    let t = Instant::now();
+    tokio::task::spawn_blocking(move || wait_exit(child, TIMEOUT))
+        .await
+        .unwrap();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(!env.lock_held());
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(env.paths().state_file).unwrap()).unwrap();
+    assert_eq!(state["downloads"][0]["id"], id, "{state:#}");
+    drop(c);
+}
+
+#[cfg(unix)]
+async fn signal_shuts_down_gracefully(signal: libc::c_int) {
     let env = Env::new();
     let child = env
         .command(&["daemon"])
@@ -434,10 +490,7 @@ async fn sigterm_shuts_down_gracefully() {
     };
     let id = c.add(env.paused_req("a.bin"), true, None).await.unwrap();
     // SAFETY: plain syscall on our own child.
-    assert_eq!(
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
-        0
-    );
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
     let status = tokio::task::spawn_blocking(move || wait_exit(child, TIMEOUT))
         .await
         .unwrap();

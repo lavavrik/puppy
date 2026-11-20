@@ -21,6 +21,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// After a second shutdown signal, how long the state may take to be saved before the
+/// daemon exits anyway.
+const FORCED_FLUSH: Duration = Duration::from_secs(1);
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -58,6 +61,9 @@ pub enum RunOutcome {
     Exited,
     /// Another daemon holds the lock; nothing was started.
     AlreadyRunning,
+    /// A second signal cut the graceful shutdown short: the state was saved on a best
+    /// effort basis, and downloads may resume from an earlier point.
+    Forced,
 }
 
 /// Resolves the paths (unless given), sets up logging to `log_dir/puppyd.log` (plus
@@ -65,9 +71,12 @@ pub enum RunOutcome {
 /// (held by another daemon ⇒ `AlreadyRunning`), writes its pid to `pid_file` (removed
 /// on exit), removes a dead Unix socket file (failing
 /// instead if something listens on it or it is not a socket), loads config and state, builds the engine, manager and server, and runs until a `Shutdown`
-/// request, Ctrl-C, SIGTERM (Unix) or — with `idle_exit` — that long without work or
-/// clients. Then it stops the server (removing the socket file), shuts the manager
-/// down (pausing downloads, persisting state) and releases the lock.
+/// request, a signal (Ctrl-C/SIGINT, SIGTERM, SIGHUP on Unix; Ctrl-C, console close,
+/// logoff and system shutdown on Windows) or — with `idle_exit` — that long without
+/// work or clients. Then it stops the server (removing the socket file), shuts the
+/// manager down (pausing downloads, at most 10 s, then persisting state) and releases
+/// the lock. Another signal during that shutdown makes it save the state for at most
+/// 1 s and return [`RunOutcome::Forced`] at once.
 ///
 /// Fails without touching it if the state file exists but cannot be read.
 pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
@@ -114,6 +123,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         "daemon started"
     );
 
+    let mut signals = Signals::new();
     let clients = server.client_count();
     let shutdown_requested = server.shutdown_requested();
     let stop = CancellationToken::new();
@@ -121,8 +131,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     let mut server_done = false;
     let reason = tokio::select! {
         _ = shutdown_requested.cancelled() => "shutdown requested",
-        _ = ctrl_c() => "interrupted",
-        _ = terminate() => "terminated",
+        signal = signals.recv() => signal,
         _ = idle(opts.idle_exit, &manager, &clients) => "idle",
         r = &mut server_task => {
             server_done = true;
@@ -134,13 +143,27 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     };
     info!(reason, "shutting down");
 
-    // Stop accepting first so no client connects to a daemon on its way out; the
-    // server removes its socket file when it is dropped at the end of `run`.
-    stop.cancel();
-    if !server_done && let Err(e) = server_task.await {
-        warn!("the server task failed: {e}");
+    let graceful = async {
+        // Stop accepting first so no client connects to a daemon on its way out; the
+        // server removes its socket file when it is dropped at the end of `run`.
+        stop.cancel();
+        if !server_done && let Err(e) = (&mut server_task).await {
+            warn!("the server task failed: {e}");
+        }
+        manager.shutdown().await;
+    };
+    tokio::select! {
+        _ = graceful => {}
+        signal = signals.recv() => {
+            warn!(signal, "second signal: exiting without waiting for downloads to pause");
+            stop.cancel();
+            server_task.abort();
+            if !manager.save_state(FORCED_FLUSH).await {
+                warn!("the state could not be saved in time");
+            }
+            return Ok(RunOutcome::Forced);
+        }
     }
-    manager.shutdown().await;
     info!("daemon stopped");
     Ok(RunOutcome::Exited)
 }
@@ -248,30 +271,102 @@ async fn remove_stale_socket(_name: &SocketName) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ctrl_c() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        warn!("cannot listen for Ctrl-C: {e}");
-        std::future::pending::<()>().await;
-    }
+/// The signals that shut the daemon down, listened for from startup on (so a second
+/// one during shutdown is caught too).
+#[cfg(unix)]
+struct Signals {
+    int: Option<tokio::signal::unix::Signal>,
+    term: Option<tokio::signal::unix::Signal>,
+    hup: Option<tokio::signal::unix::Signal>,
 }
 
 #[cfg(unix)]
-async fn terminate() {
-    use tokio::signal::unix::{SignalKind, signal};
-    match signal(SignalKind::terminate()) {
-        Ok(mut s) => {
-            s.recv().await;
+impl Signals {
+    fn new() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let listen = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("cannot listen for {name}: {e}");
+                None
+            }
+        };
+        Signals {
+            int: listen(SignalKind::interrupt(), "SIGINT"),
+            term: listen(SignalKind::terminate(), "SIGTERM"),
+            hup: listen(SignalKind::hangup(), "SIGHUP"),
         }
-        Err(e) => {
-            warn!("cannot listen for SIGTERM: {e}");
-            std::future::pending::<()>().await;
+    }
+
+    /// The next signal's name.
+    async fn recv(&mut self) -> &'static str {
+        async fn next(s: &mut Option<tokio::signal::unix::Signal>) {
+            let Some(s) = s else {
+                return std::future::pending().await;
+            };
+            if s.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        tokio::select! {
+            _ = next(&mut self.int) => "SIGINT",
+            _ = next(&mut self.term) => "SIGTERM",
+            _ = next(&mut self.hup) => "SIGHUP",
         }
     }
 }
 
-#[cfg(not(unix))]
-async fn terminate() {
-    std::future::pending::<()>().await;
+#[cfg(windows)]
+struct Signals {
+    c: Option<tokio::signal::windows::CtrlC>,
+    close: Option<tokio::signal::windows::CtrlClose>,
+    logoff: Option<tokio::signal::windows::CtrlLogoff>,
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+#[cfg(windows)]
+impl Signals {
+    fn new() -> Self {
+        use tokio::signal::windows;
+        fn listen<T>(r: io::Result<T>, name: &str) -> Option<T> {
+            r.map_err(|e| warn!("cannot listen for {name}: {e}")).ok()
+        }
+        Signals {
+            c: listen(windows::ctrl_c(), "Ctrl-C"),
+            close: listen(windows::ctrl_close(), "console close"),
+            logoff: listen(windows::ctrl_logoff(), "logoff"),
+            shutdown: listen(windows::ctrl_shutdown(), "system shutdown"),
+        }
+    }
+
+    /// The next signal's name.
+    async fn recv(&mut self) -> &'static str {
+        macro_rules! next {
+            ($s:expr) => {
+                async move {
+                    let Some(s) = $s.as_mut() else {
+                        return std::future::pending().await;
+                    };
+                    if s.recv().await.is_none() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+        }
+        // Destructured so that each future borrows only its own field.
+        let Signals {
+            c,
+            close,
+            logoff,
+            shutdown,
+        } = self;
+        tokio::select! {
+            _ = next!(c) => "Ctrl-C",
+            _ = next!(close) => "console close",
+            _ = next!(logoff) => "logoff",
+            _ = next!(shutdown) => "system shutdown",
+        }
+    }
 }
 
 /// Resolves once the daemon has had no work and no clients for `after` (never if

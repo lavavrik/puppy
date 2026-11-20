@@ -82,7 +82,8 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically replaces `path` with `bytes`: temp file in the same dir, fsync, rename,
-/// then fsync the directory (Unix). `private` makes the file mode 0600 on Unix.
+/// then fsync the directory (Unix). `private` makes the file mode 0600 on Unix. On
+/// Windows the rename is retried while a scanner or indexer briefly holds the target.
 pub async fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let path = path.to_path_buf();
     let bytes = bytes.to_vec();
@@ -108,13 +109,49 @@ fn atomic_write_blocking(path: &Path, bytes: &[u8], private: bool) -> io::Result
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file); // Windows: no open handle may remain during rename.
-        fs::rename(&tmp, path)?;
+        rename_replace(&tmp, path)?;
         sync_parent_dir(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// `fs::rename` (replacing `to`), retried with backoff (100 ms doubling to 1.6 s, 5
+/// times) on sharing/lock violations and access errors, which antivirus scanners and
+/// the indexer cause by briefly opening the target.
+#[cfg(windows)]
+fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    retry_locked(|| fs::rename(from, to))
+}
+
+/// Runs `op`, retrying it after 100, 200, 400, 800 and 1600 ms while it fails with a
+/// sharing violation (32), a lock violation (33) or `PermissionDenied`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn retry_locked(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut delays = [100u64, 200, 400, 800, 1600].into_iter();
+    loop {
+        let err = match op() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        match delays.next() {
+            Some(ms) if is_locked(&err) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+            _ => return Err(err),
+        }
+    }
+}
+
+/// 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION (a scanner/indexer holds the
+/// file), or access denied.
+fn is_locked(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(32 | 33))
 }
 
 #[cfg(unix)]
@@ -175,25 +212,15 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
             .collect()
     };
     let (from_w, to_w) = (wide(from), wide(to));
-    let mut delays = [100u64, 200, 400, 800, 1600].into_iter();
-    loop {
+    retry_locked(|| {
         // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive the call.
         let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), 0) };
         if ok != 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        let err = io::Error::last_os_error();
-        match delays.next() {
-            // 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION (scanner/indexer holds the file).
-            Some(ms)
-                if err.kind() == io::ErrorKind::PermissionDenied
-                    || matches!(err.raw_os_error(), Some(32 | 33)) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-            _ => return Err(err),
-        }
-    }
+    })
 }
 
 #[cfg(unix)]
@@ -401,6 +428,28 @@ mod tests {
         // A leftover sidecar also claims its name.
         fs::write(d.path().join("a (2).iso.part.puppy"), b"x").unwrap();
         assert_eq!(unique_path(d.path(), "a.iso"), d.path().join("a (3).iso"));
+    }
+
+    #[test]
+    fn retry_locked_retries_only_lock_errors() {
+        let mut n = 0;
+        let r = retry_locked(|| {
+            n += 1;
+            if n < 3 {
+                Err(io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_ok());
+        assert_eq!(n, 3);
+        let mut n = 0;
+        let r = retry_locked(|| {
+            n += 1;
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+        });
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

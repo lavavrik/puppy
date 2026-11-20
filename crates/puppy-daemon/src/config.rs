@@ -45,6 +45,10 @@ pub struct Config {
     /// doubles per failure up to [`MAX_RETRY_DELAY`]. Not read from the file.
     #[serde(skip)]
     pub retry_base: Duration,
+    /// How long shutdown waits for downloads to pause (flushing their sidecars) before
+    /// it persists the state regardless. Not read from the file.
+    #[serde(skip)]
+    pub shutdown_pause_timeout: Duration,
 }
 
 /// The longest delay between automatic retries of a transiently failed download.
@@ -63,6 +67,7 @@ impl Default for Config {
             theme: "auto".into(),
             proxy: None,
             retry_base: Duration::from_secs(30),
+            shutdown_pause_timeout: Duration::from_secs(10),
         }
     }
 }
