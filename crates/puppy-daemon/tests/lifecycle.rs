@@ -6,11 +6,12 @@
 use interprocess::local_socket::tokio::{Stream, prelude::*};
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced};
 use puppy_core::config::HttpConfig;
-use puppy_core::types::{AddRequest, DownloadId, DownloadState, RequestContext, Source};
+use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
 use puppy_daemon::{Paths, SocketName};
 use puppy_proto::{
-    Envelope, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg, write_msg,
+    Envelope, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg, WireState,
+    write_msg,
 };
 use puppy_testserver::{ServerCfg, TestServer};
 use std::path::PathBuf;
@@ -203,7 +204,7 @@ impl Client {
         }
     }
 
-    async fn get(&mut self, id: DownloadId) -> (DownloadState, u64) {
+    async fn get(&mut self, id: DownloadId) -> (WireState, u64) {
         match self.request(Request::Get { id }).await {
             Reply::Ok {
                 data: ReplyData::Download { download, .. },
@@ -415,7 +416,7 @@ async fn shutdown_persists_and_pauses() {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let (state, done) = c.get(id).await;
-        if state == DownloadState::Active && done > 0 {
+        if state == WireState::Active && done > 0 {
             break;
         }
         assert!(Instant::now() < deadline, "download never transferred");

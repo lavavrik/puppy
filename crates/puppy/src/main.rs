@@ -8,8 +8,8 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use puppy_client::{Client, Paths};
-use puppy_core::types::DownloadState;
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
+use puppy_proto::WireState;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ async fn summary() -> anyhow::Result<()> {
     let downloads = client.list().await?;
     let active = downloads
         .iter()
-        .filter(|d| matches!(d.state, DownloadState::Starting | DownloadState::Active))
+        .filter(|d| matches!(d.state, WireState::Starting | WireState::Active))
         .count();
     let n = downloads.len();
     let noun = if n == 1 { "download" } else { "downloads" };

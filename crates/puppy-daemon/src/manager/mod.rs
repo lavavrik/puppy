@@ -317,7 +317,7 @@ impl Inner {
             }),
             DownloadState::NeedsAttention { reason } => self.emit(Event::NeedsAttention {
                 id,
-                reason: reason.clone(),
+                reason: reason.into(),
             }),
             _ => {}
         }

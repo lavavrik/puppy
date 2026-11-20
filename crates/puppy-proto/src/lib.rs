@@ -1,10 +1,20 @@
 //! Versioned newline-delimited-JSON protocol spoken by the daemon and its clients.
 //!
-//! Evolution rules: new `Request` methods are additive. Servers must parse the
-//! envelope leniently (as `serde_json::Value` first, then [`parse_request`]) so an
-//! unknown method yields a `bad_request` reply carrying the right `req_id`.
-//! `Event` and `ReplyData` have an `Unknown` catch-all so older clients survive
-//! kinds added by a newer daemon.
+//! Evolution rules:
+//! - New `Request` methods are additive. Servers must parse the envelope leniently (as
+//!   `serde_json::Value` first, then [`parse_request`]) so an unknown method yields a
+//!   `bad_request` reply carrying the right `req_id`.
+//! - Every enum the daemon sends ([`Event`], [`ReplyData`], [`ErrorCode`],
+//!   [`EngineKindTag`], [`WireState`], [`WireAttention`]) has an `Unknown` catch-all, so
+//!   adding a variant to any of them is backward compatible: older clients decode it as
+//!   `Unknown` instead of failing the whole message. A new wire enum must get one too.
+//! - New *optional* fields (`#[serde(default)]`) are additive. A new *required* field, a
+//!   removed field or a changed meaning of an existing value requires bumping
+//!   [`PROTOCOL_VERSION`].
+//! - The download state on the wire is [`WireState`], not puppy-core's `DownloadState`,
+//!   which stays exhaustive for the engines and the daemon.
+//! - A client that gets `protocol_mismatch` for its `hello` may send one `shutdown`
+//!   (any `req_id`) on the same connection within 5 s to stop the incompatible daemon.
 
 pub mod codec;
 
@@ -147,6 +157,9 @@ pub enum ErrorCode {
     InvalidState,
     Engine,
     Internal,
+    /// A code this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -172,7 +185,7 @@ pub enum Event {
     },
     NeedsAttention {
         id: DownloadId,
-        reason: AttentionReason,
+        reason: WireAttention,
     },
     /// A kind this client does not know (newer daemon).
     #[serde(other)]
@@ -187,7 +200,7 @@ pub struct DownloadSnapshot {
     pub source: String,
     pub name: String,
     pub path: Option<PathBuf>,
-    pub state: DownloadState,
+    pub state: WireState,
     pub total_bytes: Option<u64>,
     pub done_bytes: u64,
     pub down_bps: u64,
@@ -205,6 +218,75 @@ pub struct DownloadSnapshot {
 pub enum EngineKindTag {
     Http,
     Torrent,
+    /// A kind this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// A download's state on the wire: puppy-core's `DownloadState` (same JSON) plus a
+/// catch-all for states a newer daemon may add.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireState {
+    Queued,
+    Starting,
+    Active,
+    Paused,
+    Completed,
+    Failed {
+        reason: String,
+    },
+    NeedsAttention {
+        reason: WireAttention,
+    },
+    /// A state this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a download needs attention, on the wire: puppy-core's `AttentionReason` (same
+/// JSON) plus a catch-all.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireAttention {
+    RemoteChanged,
+    NotResumable,
+    ValidationFailed {
+        detail: String,
+    },
+    /// A reason this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<&AttentionReason> for WireAttention {
+    fn from(r: &AttentionReason) -> Self {
+        match r {
+            AttentionReason::RemoteChanged => WireAttention::RemoteChanged,
+            AttentionReason::NotResumable => WireAttention::NotResumable,
+            AttentionReason::ValidationFailed { detail } => WireAttention::ValidationFailed {
+                detail: detail.clone(),
+            },
+        }
+    }
+}
+
+impl From<&DownloadState> for WireState {
+    fn from(s: &DownloadState) -> Self {
+        match s {
+            DownloadState::Queued => WireState::Queued,
+            DownloadState::Starting => WireState::Starting,
+            DownloadState::Active => WireState::Active,
+            DownloadState::Paused => WireState::Paused,
+            DownloadState::Completed => WireState::Completed,
+            DownloadState::Failed { reason } => WireState::Failed {
+                reason: reason.clone(),
+            },
+            DownloadState::NeedsAttention { reason } => WireState::NeedsAttention {
+                reason: reason.into(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -241,7 +323,7 @@ mod tests {
             source: "http://x/f".into(),
             name: "f".into(),
             path: Some("/tmp/f".into()),
-            state: DownloadState::Failed { reason: "r".into() },
+            state: WireState::Failed { reason: "r".into() },
             total_bytes: Some(10),
             done_bytes: 5,
             down_bps: 1,
@@ -349,7 +431,7 @@ mod tests {
             Event::Removed { id: 1 },
             Event::NeedsAttention {
                 id: 1,
-                reason: AttentionReason::ValidationFailed { detail: "d".into() },
+                reason: WireAttention::ValidationFailed { detail: "d".into() },
             },
         ];
         for ev in events {
@@ -468,6 +550,87 @@ mod tests {
                 req_id: 1,
                 result: Reply::Ok {
                     data: ReplyData::Unknown
+                }
+            }
+        );
+    }
+
+    /// `WireState` is the same JSON as core's `DownloadState`.
+    #[test]
+    fn wire_state_matches_core_json() {
+        let states = [
+            DownloadState::Queued,
+            DownloadState::Starting,
+            DownloadState::Active,
+            DownloadState::Paused,
+            DownloadState::Completed,
+            DownloadState::Failed { reason: "r".into() },
+            DownloadState::NeedsAttention {
+                reason: AttentionReason::RemoteChanged,
+            },
+            DownloadState::NeedsAttention {
+                reason: AttentionReason::NotResumable,
+            },
+            DownloadState::NeedsAttention {
+                reason: AttentionReason::ValidationFailed { detail: "d".into() },
+            },
+        ];
+        for s in &states {
+            let core = serde_json::to_value(s).unwrap();
+            let wire = WireState::from(s);
+            assert_eq!(serde_json::to_value(&wire).unwrap(), core);
+            assert_eq!(serde_json::from_value::<WireState>(core).unwrap(), wire);
+        }
+    }
+
+    /// Values a newer daemon may add inside known messages must not make the whole
+    /// message undecodable.
+    #[test]
+    fn unknown_nested_values_deserialize() {
+        let snap = serde_json::json!({
+            "id": 1, "kind": "ipfs", "source": "s", "name": "n", "path": null,
+            "state": {"kind": "verifying", "progress": 3},
+            "total_bytes": null, "done_bytes": 0, "down_bps": 0, "up_bps": 0,
+            "eta_secs": null, "limit": null, "queue_position": null,
+            "connections": null, "peers": null
+        });
+        let m = serde_json::json!({"type": "event", "event": {"kind": "snapshot",
+            "downloads": [snap], "totals": Totals::default()}});
+        let m: ServerMsg = serde_json::from_value(m).expect("snapshot with unknown values");
+        let ServerMsg::Event {
+            event: Event::Snapshot { downloads, .. },
+        } = m
+        else {
+            panic!("{m:?}")
+        };
+        assert_eq!(downloads[0].kind, EngineKindTag::Unknown);
+        assert_eq!(downloads[0].state, WireState::Unknown);
+
+        let m: ServerMsg = serde_json::from_str(
+            r#"{"type":"response","req_id":3,"status":"err","code":"rate_limited","message":"m"}"#,
+        )
+        .expect("unknown error code");
+        assert!(matches!(
+            m,
+            ServerMsg::Response {
+                result: Reply::Err {
+                    code: ErrorCode::Unknown,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let m: ServerMsg = serde_json::from_str(
+            r#"{"type":"event","event":{"kind":"needs_attention","id":1,"reason":{"kind":"disk_full"}}}"#,
+        )
+        .expect("unknown attention reason");
+        assert_eq!(
+            m,
+            ServerMsg::Event {
+                event: Event::NeedsAttention {
+                    id: 1,
+                    reason: WireAttention::Unknown
                 }
             }
         );

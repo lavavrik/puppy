@@ -83,7 +83,7 @@ impl Inner {
                 .as_ref()
                 .map(|s| s.path.clone())
                 .or_else(|| e.rec.path.clone()),
-            state: e.state.clone(),
+            state: (&e.state).into(),
             total_bytes,
             done_bytes,
             down_bps: status.as_ref().map_or(0, |s| s.down_bps),

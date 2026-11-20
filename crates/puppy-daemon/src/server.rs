@@ -46,6 +46,9 @@ pub const QUEUE_CAP: usize = 64;
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A client must say `hello` within this time.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// After a `protocol_mismatch`, how long the connection stays open for a `shutdown`
+/// (so a newer client can stop this daemon).
+pub const MISMATCH_SHUTDOWN_WINDOW: Duration = Duration::from_secs(5);
 /// When the server stops, queued messages get this long to be written.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// At most one "dropped events" warning per client per this period.
@@ -281,23 +284,34 @@ fn ok(data: ReplyData) -> Reply {
     Reply::Ok { data }
 }
 
-/// The reply to the first message of a connection and whether the connection may
-/// continue. `None`: close silently (EOF or I/O error).
-fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(ServerMsg, bool)> {
+/// What happens to a connection after the reply to its first message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// Handshake done: serve requests.
+    Serve,
+    /// Close.
+    Close,
+    /// The client speaks another protocol version: accept one `shutdown`, then close.
+    Mismatch,
+}
+
+/// The reply to the first message of a connection and what happens next. `None`:
+/// close silently (EOF or I/O error).
+fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(ServerMsg, After)> {
     let v = match first {
         Ok(Some(v)) => v,
         Ok(None) | Err(CodecError::Io(_)) => return None,
         Err(e) => {
             return Some((
                 response(0, err(ErrorCode::BadRequest, e.to_string())),
-                false,
+                After::Close,
             ));
         }
     };
     Some(match parse_request(v) {
         Err((req_id, msg)) => (
             response(req_id.unwrap_or(0), err(ErrorCode::BadRequest, msg)),
-            false,
+            After::Close,
         ),
         Ok(env) => match env.body {
             Request::Hello {
@@ -311,7 +325,7 @@ fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(Se
                         protocol: PROTOCOL_VERSION,
                     }),
                 ),
-                true,
+                After::Serve,
             ),
             Request::Hello { protocol, .. } => (
                 response(
@@ -323,14 +337,14 @@ fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(Se
                         ),
                     ),
                 ),
-                false,
+                After::Mismatch,
             ),
             _ => (
                 response(
                     env.req_id,
                     err(ErrorCode::BadRequest, "the first message must be hello"),
                 ),
-                false,
+                After::Close,
             ),
         },
     })
@@ -357,7 +371,7 @@ async fn serve(
             }
         },
     };
-    let Some((reply, accepted)) = handshake(first) else {
+    let Some((reply, after)) = handshake(first) else {
         return;
     };
     tokio::select! {
@@ -368,8 +382,12 @@ async fn serve(
             }
         }
     }
-    if !accepted {
-        return;
+    match after {
+        After::Serve => {}
+        After::Close => return,
+        After::Mismatch => {
+            return mismatch_shutdown(&mut reader, &mut wr, &shutdown, &cancel).await;
+        }
     }
 
     let (tx, rx) = mpsc::channel(QUEUE_CAP);
@@ -420,6 +438,41 @@ async fn serve(
         }
     };
     log_join(r);
+}
+
+/// After a protocol mismatch: waits up to [`MISMATCH_SHUTDOWN_WINDOW`] for one message
+/// and, if it is a `shutdown` (only its `method` is looked at, so any protocol version's
+/// envelope works), replies `done` and requests the daemon's shutdown. Anything else
+/// closes the connection.
+async fn mismatch_shutdown<R, W>(
+    reader: &mut MsgReader<R>,
+    wr: &mut W,
+    shutdown: &CancellationToken,
+    cancel: &CancellationToken,
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let next = tokio::select! {
+        _ = cancel.cancelled() => return,
+        r = timeout(MISMATCH_SHUTDOWN_WINDOW, reader.next::<serde_json::Value>()) => r,
+    };
+    let Ok(Ok(Some(v))) = next else { return };
+    if v.get("method").and_then(serde_json::Value::as_str) != Some("shutdown") {
+        debug!("ignoring a request from a client speaking another protocol");
+        return;
+    }
+    let req_id = v
+        .get("req_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    warn!("a client speaking another protocol version asked the daemon to shut down");
+    let _ = timeout(
+        RESPONSE_TIMEOUT,
+        write_msg(wr, &response(req_id, ok(ReplyData::Done))),
+    )
+    .await;
+    shutdown.cancel();
 }
 
 /// Per-connection state owned by the reader loop.

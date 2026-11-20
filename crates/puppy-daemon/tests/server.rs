@@ -316,8 +316,64 @@ async fn protocol_mismatch_closes() {
         ),
         "{r:?}"
     );
+    // Anything but a shutdown closes the connection at once.
+    let t = Instant::now();
+    c.send(Request::List).await;
     c.expect_closed().await;
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
     wait_for("client released", || h.clients.load(Ordering::SeqCst) == 0).await;
+    assert!(!h.shutdown.is_cancelled());
+    h.stop().await;
+}
+
+/// A newer client (another protocol version) can still stop this daemon: one
+/// `shutdown` is accepted right after the mismatch, whatever its envelope looks like.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_accepted_after_protocol_mismatch() {
+    let h = Harness::new().await;
+    let mut c = h.connect().await;
+    c.send_raw(
+        serde_json::json!({"req_id": 1, "method": "hello", "client": "future",
+        "protocol": PROTOCOL_VERSION + 1, "new_field": true}),
+    )
+    .await;
+    assert!(matches!(
+        c.response(1).await,
+        Reply::Err {
+            code: ErrorCode::ProtocolMismatch,
+            ..
+        }
+    ));
+    c.send_raw(serde_json::json!({"req_id": 77, "method": "shutdown", "force": true}))
+        .await;
+    assert_eq!(c.response(77).await, done());
+    tokio::time::timeout(TIMEOUT, h.shutdown.cancelled())
+        .await
+        .expect("shutdown requested");
+    c.expect_closed().await;
+    h.stop().await;
+}
+
+/// The mismatch window ends: a silent client is disconnected after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatch_window_expires() {
+    let h = Harness::new().await;
+    let mut c = h.connect().await;
+    let r = c
+        .request(Request::Hello {
+            client: "future".into(),
+            protocol: PROTOCOL_VERSION + 1,
+        })
+        .await;
+    assert!(matches!(r, Reply::Err { .. }), "{r:?}");
+    let t = Instant::now();
+    c.expect_closed().await;
+    let waited = t.elapsed();
+    assert!(
+        waited >= puppy_daemon::server::MISMATCH_SHUTDOWN_WINDOW - Duration::from_millis(500),
+        "{waited:?}"
+    );
+    assert!(!h.shutdown.is_cancelled());
     h.stop().await;
 }
 

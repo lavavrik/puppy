@@ -4,7 +4,7 @@ use puppy_core::http::engine::HttpEngine;
 use puppy_core::types::{AddRequest, DownloadId, DownloadState, RequestContext, Source};
 use puppy_daemon::manager::{Manager, ManagerError};
 use puppy_daemon::{Config, Store};
-use puppy_proto::{DownloadSnapshot, ErrorCode, Event};
+use puppy_proto::{DownloadSnapshot, ErrorCode, Event, WireState};
 use puppy_testserver::{ServerCfg, TestServer, body_byte};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,7 +96,7 @@ async fn wait_until(m: &Manager, what: &str, pred: impl Fn(&[DownloadSnapshot]) 
     }
 }
 
-async fn wait_state(m: &Manager, id: DownloadId, pred: impl Fn(&DownloadState) -> bool) {
+async fn wait_state(m: &Manager, id: DownloadId, pred: impl Fn(&WireState) -> bool) {
     wait_until(m, &format!("state of {id}"), |list| {
         list.iter().any(|d| d.id == id && pred(&d.state))
     })
@@ -104,13 +104,13 @@ async fn wait_state(m: &Manager, id: DownloadId, pred: impl Fn(&DownloadState) -
 }
 
 async fn wait_completed(m: &Manager, id: DownloadId) {
-    wait_state(m, id, |s| matches!(s, DownloadState::Completed)).await;
+    wait_state(m, id, |s| matches!(s, WireState::Completed)).await;
 }
 
 async fn wait_active_with_bytes(m: &Manager, id: DownloadId) {
     wait_until(m, &format!("{id} transferring"), |list| {
         list.iter()
-            .any(|d| d.id == id && matches!(d.state, DownloadState::Active) && d.done_bytes > 0)
+            .any(|d| d.id == id && matches!(d.state, WireState::Active) && d.done_bytes > 0)
     })
     .await;
 }
@@ -138,7 +138,7 @@ fn assert_file(path: &Path, len: u64, version: u32) {
 
 fn active_count(list: &[DownloadSnapshot]) -> usize {
     list.iter()
-        .filter(|d| matches!(d.state, DownloadState::Starting | DownloadState::Active))
+        .filter(|d| matches!(d.state, WireState::Starting | WireState::Active))
         .count()
 }
 
@@ -197,10 +197,7 @@ async fn max_active_limits_concurrency() {
         assert!(active <= 2, "too many active: {list:#?}");
         assert_eq!(totals.active, active);
         max_seen = max_seen.max(active);
-        if list
-            .iter()
-            .all(|d| matches!(d.state, DownloadState::Completed))
-        {
+        if list.iter().all(|d| matches!(d.state, WireState::Completed)) {
             break;
         }
         assert!(Instant::now() < deadline, "timed out: {list:#?}");
@@ -225,18 +222,18 @@ async fn queued_pause_and_resume() {
     let a = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
     let b = m.add(env.req(&s, "b.bin"), false, None).await.unwrap();
     let c = m.add(env.req(&s, "c.bin"), true, None).await.unwrap();
-    assert!(matches!(snap(&m, b).state, DownloadState::Queued));
+    assert!(matches!(snap(&m, b).state, WireState::Queued));
     assert_eq!(snap(&m, b).queue_position, Some(0));
-    assert!(matches!(snap(&m, c).state, DownloadState::Paused));
+    assert!(matches!(snap(&m, c).state, WireState::Paused));
 
     m.pause(b).await.unwrap();
-    assert!(matches!(snap(&m, b).state, DownloadState::Paused));
+    assert!(matches!(snap(&m, b).state, WireState::Paused));
     assert_eq!(snap(&m, b).queue_position, None);
     wait_completed(&m, a).await;
     // Nothing is queued any more: the paused downloads stay put.
     assert!(m.is_idle());
-    assert!(matches!(snap(&m, b).state, DownloadState::Paused));
-    assert!(matches!(snap(&m, c).state, DownloadState::Paused));
+    assert!(matches!(snap(&m, b).state, WireState::Paused));
+    assert!(matches!(snap(&m, c).state, WireState::Paused));
     let paths = s.paths_seen().len();
 
     m.resume(b).await.unwrap();
@@ -265,7 +262,7 @@ async fn pause_and_resume_active_download() {
     let a = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
     wait_active_with_bytes(&m, a).await;
     m.pause(a).await.unwrap();
-    assert!(matches!(snap(&m, a).state, DownloadState::Paused));
+    assert!(matches!(snap(&m, a).state, WireState::Paused));
     assert!(m.is_idle());
     m.resume(a).await.unwrap();
     wait_completed(&m, a).await;
@@ -299,13 +296,13 @@ async fn move_reorders_queue() {
     // Once `a` is done, `d` is the next one started.
     wait_until(&m, "a successor", |list| {
         list.iter()
-            .any(|x| x.id != a && !matches!(x.state, DownloadState::Queued))
+            .any(|x| x.id != a && !matches!(x.state, WireState::Queued))
     })
     .await;
     let (list, _) = m.snapshot();
     let started: Vec<_> = list
         .iter()
-        .filter(|x| x.id != a && !matches!(x.state, DownloadState::Queued))
+        .filter(|x| x.id != a && !matches!(x.state, WireState::Queued))
         .map(|x| x.id)
         .collect();
     assert_eq!(started, vec![d], "{list:#?}");
@@ -432,10 +429,7 @@ async fn restart_after_needs_attention() {
     m.pause(id).await.unwrap();
     s.set_version(1);
     m.resume(id).await.unwrap();
-    wait_state(&m, id, |s| {
-        matches!(s, DownloadState::NeedsAttention { .. })
-    })
-    .await;
+    wait_state(&m, id, |s| matches!(s, WireState::NeedsAttention { .. })).await;
     assert!(matches!(
         next_event(&mut rx, |e| matches!(e, Event::NeedsAttention { .. })).await,
         Event::NeedsAttention { id: got, .. } if got == id
@@ -493,14 +487,14 @@ async fn failed_probe_is_failed_and_restartable() {
         url: s.url("/missing"),
     };
     let id = m.add(req, false, None).await.unwrap();
-    wait_state(&m, id, |s| matches!(s, DownloadState::Failed { .. })).await;
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
     assert!(matches!(
         next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await,
         Event::Failed { id: got, .. } if got == id
     ));
     assert!(m.is_idle());
     m.restart(id).await.unwrap();
-    wait_state(&m, id, |s| matches!(s, DownloadState::Failed { .. })).await;
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
     m.shutdown().await;
 }
 
@@ -543,17 +537,14 @@ async fn restart_restores_every_state() {
     m.pause(failed).await.unwrap();
     s_failed.set_cfg(|c| c.stall_headers = true);
     m.resume(failed).await.unwrap();
-    wait_state(&m, failed, |s| matches!(s, DownloadState::Failed { .. })).await;
+    wait_state(&m, failed, |s| matches!(s, WireState::Failed { .. })).await;
 
     let na = m.add(env.req(&s_na, "na.bin"), false, None).await.unwrap();
     wait_active_with_bytes(&m, na).await;
     m.pause(na).await.unwrap();
     s_na.set_version(1);
     m.resume(na).await.unwrap();
-    wait_state(&m, na, |s| {
-        matches!(s, DownloadState::NeedsAttention { .. })
-    })
-    .await;
+    wait_state(&m, na, |s| matches!(s, WireState::NeedsAttention { .. })).await;
 
     let active = m
         .add(env.req(&s_active, "active.bin"), false, None)
@@ -564,7 +555,7 @@ async fn restart_restores_every_state() {
         .add(env.req(&s_queued, "queued.bin"), false, None)
         .await
         .unwrap();
-    assert!(matches!(snap(&m, queued).state, DownloadState::Queued));
+    assert!(matches!(snap(&m, queued).state, WireState::Queued));
 
     m.shutdown().await;
     drop(m);
@@ -577,21 +568,18 @@ async fn restart_restores_every_state() {
 
     let m = env.manager(1).await;
     let state = |id| snap(&m, id).state;
-    assert!(matches!(state(done), DownloadState::Completed));
+    assert!(matches!(state(done), WireState::Completed));
     assert!(
-        matches!(state(paused), DownloadState::Paused),
+        matches!(state(paused), WireState::Paused),
         "{:?}",
         state(paused)
     );
-    assert!(matches!(state(failed), DownloadState::Failed { .. }));
-    assert!(matches!(state(na), DownloadState::NeedsAttention { .. }));
-    assert!(matches!(state(queued), DownloadState::Queued));
+    assert!(matches!(state(failed), WireState::Failed { .. }));
+    assert!(matches!(state(na), WireState::NeedsAttention { .. }));
+    assert!(matches!(state(queued), WireState::Queued));
     assert!(matches!(
         state(active),
-        DownloadState::Queued
-            | DownloadState::Starting
-            | DownloadState::Active
-            | DownloadState::Completed
+        WireState::Queued | WireState::Starting | WireState::Active | WireState::Completed
     ));
     // The previously active download is ahead of the queued one.
     let (list, _) = m.snapshot();
@@ -607,9 +595,9 @@ async fn restart_restores_every_state() {
     assert_file(&env.dl_dir().join("queued.bin"), 64 * KIB, 0);
     let after: Vec<usize> = quiet.iter().map(|s| s.paths_seen().len()).collect();
     assert_eq!(before, after, "restoring made network requests");
-    assert!(matches!(state(paused), DownloadState::Paused));
-    assert!(matches!(state(failed), DownloadState::Failed { .. }));
-    assert!(matches!(state(na), DownloadState::NeedsAttention { .. }));
+    assert!(matches!(state(paused), WireState::Paused));
+    assert!(matches!(state(failed), WireState::Failed { .. }));
+    assert!(matches!(state(na), WireState::NeedsAttention { .. }));
 
     // The paused one still resumes fine afterwards.
     s_paused.set_cfg(|c| c.bytes_per_sec = None);
@@ -741,7 +729,7 @@ async fn remove_while_starting_removes_once_add_returns() {
     .await;
     let (m, gated) = env.gated_manager().await;
     let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
-    wait_state(&m, id, |s| matches!(s, DownloadState::Starting)).await;
+    wait_state(&m, id, |s| matches!(s, WireState::Starting)).await;
     m.remove(id, true).await.unwrap();
     assert!(m.snapshot().0.is_empty());
     assert!(m.is_idle());
@@ -770,11 +758,11 @@ async fn pause_while_starting_pauses_once_add_returns() {
     .await;
     let (m, gated) = env.gated_manager().await;
     let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
-    wait_state(&m, id, |s| matches!(s, DownloadState::Starting)).await;
+    wait_state(&m, id, |s| matches!(s, WireState::Starting)).await;
     m.pause(id).await.unwrap();
     gated.before.add_permits(1);
     gated.after.add_permits(1);
-    wait_state(&m, id, |s| matches!(s, DownloadState::Paused)).await;
+    wait_state(&m, id, |s| matches!(s, WireState::Paused)).await;
     assert!(m.is_idle());
     assert!(matches!(
         gated.status(id).unwrap().state,
@@ -802,7 +790,7 @@ async fn completion_before_add_returns_is_not_lost() {
             .is_some_and(|st| matches!(st.state, DownloadState::Completed))
     })
     .await;
-    assert!(matches!(snap(&m, id).state, DownloadState::Starting));
+    assert!(matches!(snap(&m, id).state, WireState::Starting));
     gated.after.add_permits(1);
     wait_completed(&m, id).await;
     assert_eq!(

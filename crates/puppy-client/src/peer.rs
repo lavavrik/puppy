@@ -2,13 +2,42 @@
 //! user, so a client never talks to (and hands download requests, cookies and auth
 //! to) a socket or pipe squatted by someone else.
 
+use crate::ClientError;
 use interprocess::local_socket::tokio::{Stream, prelude::*};
 use std::io;
 
-/// `Ok(false)`: the peer runs as another user (or, on Windows, cannot even be
-/// inspected by us, which also means it is not ours).
+/// Who runs the process at the other end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owner {
+    CurrentUser,
+    OtherUser,
+    /// Windows: the process cannot be inspected (access denied), e.g. because it runs
+    /// elevated or as another user. Never ours to trust.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Uninspectable,
+}
+
+/// `Ok` if the daemon at the other end of `stream` runs as the current user, else
+/// [`ClientError::NotOwnedByUser`].
+pub(crate) fn check_owner(stream: &Stream) -> Result<(), ClientError> {
+    verdict(owner(stream)?)
+}
+
+fn verdict(owner: Owner) -> Result<(), ClientError> {
+    match owner {
+        Owner::CurrentUser => Ok(()),
+        Owner::OtherUser => Err(ClientError::NotOwnedByUser { hint: None }),
+        Owner::Uninspectable => Err(ClientError::NotOwnedByUser {
+            hint: Some(
+                "access to the daemon's process was denied: it may be running elevated \
+                 (as administrator); stop it and start puppy normally",
+            ),
+        }),
+    }
+}
+
 #[cfg(unix)]
-pub(crate) fn owned_by_current_user(stream: &Stream) -> io::Result<bool> {
+fn owner(stream: &Stream) -> io::Result<Owner> {
     let creds = stream.peer_creds()?;
     let Some(peer) = creds.euid() else {
         return Err(io::Error::new(
@@ -18,13 +47,17 @@ pub(crate) fn owned_by_current_user(stream: &Stream) -> io::Result<bool> {
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    Ok(peer == me)
+    Ok(if peer == me {
+        Owner::CurrentUser
+    } else {
+        Owner::OtherUser
+    })
 }
 
 /// Compares the user SID of the pipe server's process (`GetNamedPipeServerProcessId`,
 /// via interprocess) with the current process's.
 #[cfg(windows)]
-pub(crate) fn owned_by_current_user(stream: &Stream) -> io::Result<bool> {
+fn owner(stream: &Stream) -> io::Result<Owner> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::Security::EqualSid;
     use windows_sys::Win32::System::Threading::{
@@ -40,19 +73,27 @@ pub(crate) fn owned_by_current_user(stream: &Stream) -> io::Result<bool> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
         let e = io::Error::last_os_error();
-        return if denied(&e) { Ok(false) } else { Err(e) };
+        return if denied(&e) {
+            Ok(Owner::Uninspectable)
+        } else {
+            Err(e)
+        };
     }
     let peer = token_user(process);
     // SAFETY: `process` is a valid handle we own.
     unsafe { CloseHandle(process) };
     let peer = match peer {
         Ok(p) => p,
-        Err(e) if denied(&e) => return Ok(false),
+        Err(e) if denied(&e) => return Ok(Owner::Uninspectable),
         Err(e) => return Err(e),
     };
     // SAFETY: both buffers hold a TOKEN_USER whose SID points into the same buffer,
     // and both stay alive for the call.
-    Ok(unsafe { EqualSid(sid(&me), sid(&peer)) } != 0)
+    Ok(if unsafe { EqualSid(sid(&me), sid(&peer)) } != 0 {
+        Owner::CurrentUser
+    } else {
+        Owner::OtherUser
+    })
 }
 
 /// The `TOKEN_USER` of a process, in a u64-aligned buffer (the SID it points to
@@ -87,4 +128,22 @@ fn sid(token_user: &[u64]) -> windows_sys::Win32::Security::PSID {
     use windows_sys::Win32::Security::TOKEN_USER;
     // SAFETY: the buffer was filled by GetTokenInformation(TokenUser) and is aligned.
     unsafe { (*token_user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_owned_messages() {
+        assert!(verdict(Owner::CurrentUser).is_ok());
+        let other = verdict(Owner::OtherUser).unwrap_err();
+        assert!(matches!(other, ClientError::NotOwnedByUser { hint: None }));
+        assert_eq!(
+            other.to_string(),
+            "the daemon socket is owned by another user; refusing to use it"
+        );
+        let denied = verdict(Owner::Uninspectable).unwrap_err().to_string();
+        assert!(denied.contains("may be running elevated"), "{denied}");
+    }
 }

@@ -57,9 +57,13 @@ pub enum ClientError {
     /// Connecting or talking to the daemon failed (e.g. no daemon is listening).
     #[error("cannot talk to the daemon: {0}")]
     Io(#[from] io::Error),
-    /// The socket or pipe belongs to a process running as another user.
-    #[error("the daemon socket is owned by another user; refusing to use it")]
-    NotOwnedByUser,
+    /// The socket or pipe belongs to a process running as another user (or, on
+    /// Windows, one this user may not inspect, e.g. an elevated daemon: `hint` says so).
+    #[error(
+        "the daemon socket is owned by another user; refusing to use it{}",
+        hint.map(|h| format!(" ({h})")).unwrap_or_default()
+    )]
+    NotOwnedByUser { hint: Option<&'static str> },
     /// The daemon said something this client does not understand.
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -90,6 +94,7 @@ pub struct Client {
     next_id: AtomicU64,
     events: Option<mpsc::Receiver<Event>>,
     reader: JoinHandle<()>,
+    daemon_version: String,
 }
 
 /// State shared between the client and its reader task.
@@ -153,9 +158,7 @@ impl Client {
     /// ([`ClientError::NotOwnedByUser`] otherwise) and performs the `hello` handshake.
     pub async fn connect(name: &SocketName, client_name: &str) -> Result<Self, ClientError> {
         let stream = connect_stream(name).await?;
-        if !peer::owned_by_current_user(&stream)? {
-            return Err(ClientError::NotOwnedByUser);
-        }
+        peer::check_owner(&stream)?;
         let (rd, mut wr) = tokio::io::split(stream);
         let mut rd = MsgReader::new(BufReader::new(rd));
         const HELLO_ID: u64 = 1;
@@ -181,17 +184,17 @@ impl Client {
         let reply = timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| ClientError::Timeout)??;
-        match reply_data(reply)? {
+        let daemon_version = match reply_data(reply)? {
             ReplyData::Hello {
                 protocol: PROTOCOL_VERSION,
-                ..
-            } => {}
+                daemon_version,
+            } => daemon_version,
             other => {
                 return Err(ClientError::Protocol(format!(
                     "unexpected hello reply: {other:?}"
                 )));
             }
-        }
+        };
 
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending {
@@ -210,7 +213,54 @@ impl Client {
             next_id: AtomicU64::new(HELLO_ID + 1),
             events: Some(events),
             reader,
+            daemon_version,
         })
+    }
+
+    /// The daemon's version, from its `hello` reply.
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
+    /// Stops a daemon that speaks another protocol version (e.g. one left running by
+    /// an older `puppy`), at `paths.socket`. Sends `hello` with this client's protocol
+    /// and, if the daemon answers `protocol_mismatch`, a `shutdown` on the same
+    /// connection (daemons accept one within 5 s of the mismatch), then waits for its
+    /// reply. A daemon that turns out to be compatible is left running (`Ok`); use
+    /// [`call`](Self::call) with `Request::Shutdown` to stop that one. Like
+    /// [`connect`](Self::connect), refuses a daemon run by another user.
+    pub async fn shutdown_incompatible(paths: &Paths) -> Result<(), ClientError> {
+        let stream = connect_stream(&paths.socket).await?;
+        peer::check_owner(&stream)?;
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut rd = MsgReader::new(BufReader::new(rd));
+        let exchange = async {
+            let hello = Envelope {
+                req_id: 1,
+                body: Request::Hello {
+                    client: "puppy-shutdown".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            };
+            write_msg(&mut wr, &hello).await.map_err(codec_error)?;
+            match reply_to(&mut rd, 1).await? {
+                Reply::Ok { .. } => return Ok(()),
+                Reply::Err {
+                    code: ErrorCode::ProtocolMismatch,
+                    ..
+                } => {}
+                Reply::Err { code, message } => return Err(ClientError::Daemon { code, message }),
+            }
+            let shutdown = Envelope {
+                req_id: 2,
+                body: Request::Shutdown,
+            };
+            write_msg(&mut wr, &shutdown).await.map_err(codec_error)?;
+            reply_data(reply_to(&mut rd, 2).await?).map(drop)
+        };
+        timeout(HANDSHAKE_TIMEOUT, exchange)
+            .await
+            .map_err(|_| ClientError::Timeout)?
     }
 
     /// Like [`connect`](Self::connect) to `paths.socket`, but when no daemon answers,
@@ -441,6 +491,38 @@ async fn read_loop(
         }
     }
     shared.disconnect();
+}
+
+/// Reads until the response to `req_id` (skipping anything else); `Disconnected` on EOF.
+/// The response is decoded leniently (only `status`, `code` and `message`), so a
+/// daemon speaking another protocol version is still understood.
+async fn reply_to(
+    rd: &mut MsgReader<BufReader<ReadHalf<Stream>>>,
+    req_id: u64,
+) -> Result<Reply, ClientError> {
+    loop {
+        let Some(v) = rd.next::<serde_json::Value>().await.map_err(codec_error)? else {
+            return Err(ClientError::Disconnected);
+        };
+        if response_req_id(&v) != Some(req_id) {
+            debug!("ignoring {v} while waiting for reply {req_id}");
+            continue;
+        }
+        let str_field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+        return Ok(match str_field("status") {
+            Some("ok") => Reply::Ok {
+                data: ReplyData::deserialize(v.get("data").unwrap_or(&serde_json::Value::Null))
+                    .unwrap_or(ReplyData::Unknown),
+            },
+            _ => Reply::Err {
+                code: v
+                    .get("code")
+                    .and_then(|c| ErrorCode::deserialize(c).ok())
+                    .unwrap_or(ErrorCode::Unknown),
+                message: str_field("message").unwrap_or_default().to_string(),
+            },
+        });
+    }
 }
 
 /// The `req_id` of a message that claims to be a response.

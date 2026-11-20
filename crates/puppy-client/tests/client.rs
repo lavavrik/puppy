@@ -505,6 +505,64 @@ async fn protocol_mismatch_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_version_from_hello() {
+    let env = Env::new();
+    let d = env.start().await;
+    let c = env.client().await;
+    assert_eq!(c.daemon_version(), env!("CARGO_PKG_VERSION"));
+    drop(c);
+    env.shutdown(d).await;
+}
+
+/// A daemon speaking another protocol: `shutdown_incompatible` answers its mismatch
+/// with a `shutdown` on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_incompatible_stops_a_mismatched_daemon() {
+    let env = Env::new();
+    let sock = match &env.socket {
+        SocketName::Path(p) => p.as_path().to_fs_name::<GenericFilePath>().unwrap(),
+        SocketName::Pipe(n) => n.as_str().to_ns_name::<GenericNamespaced>().unwrap(),
+    };
+    let listener = ListenerOptions::new().name(sock).create_tokio().unwrap();
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut rd = MsgReader::new(BufReader::new(rd));
+        let hello: serde_json::Value = rd.next().await.unwrap().unwrap();
+        assert_eq!(hello["method"], "hello");
+        assert_eq!(hello["protocol"], PROTOCOL_VERSION);
+        // An older daemon's reply, with a field this client does not know.
+        let reply = serde_json::json!({"type": "response", "req_id": hello["req_id"],
+            "status": "err", "code": "protocol_mismatch", "message": "old", "extra": 1});
+        write_msg(&mut wr, &reply).await.unwrap();
+        let shutdown: serde_json::Value = rd.next().await.unwrap().unwrap();
+        assert_eq!(shutdown["method"], "shutdown");
+        let done = serde_json::json!({"type": "response", "req_id": shutdown["req_id"],
+            "status": "ok", "data": {"kind": "done"}});
+        write_msg(&mut wr, &done).await.unwrap();
+    });
+    tokio::time::timeout(TIMEOUT, Client::shutdown_incompatible(&env.paths()))
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}
+
+/// A compatible daemon is left running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_incompatible_leaves_a_compatible_daemon() {
+    let env = Env::new();
+    let d = env.start().await;
+    Client::shutdown_incompatible(&env.paths()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!d.is_finished());
+    let c = env.client().await;
+    assert!(c.list().await.unwrap().is_empty());
+    drop(c);
+    env.shutdown(d).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_or_spawn_uses_running_daemon() {
     let env = Env::new();
     let d = env.start().await;

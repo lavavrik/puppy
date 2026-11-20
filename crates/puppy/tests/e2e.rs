@@ -7,9 +7,9 @@
 //! that, kills the process named in `<data_dir>/puppyd.pid`.
 
 use puppy_client::{Client, ClientError};
-use puppy_core::types::{AddRequest, DownloadId, DownloadState, RequestContext, Source};
+use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
 use puppy_daemon::{Paths, SocketName};
-use puppy_proto::{DownloadSnapshot, ReplyData, Request};
+use puppy_proto::{DownloadSnapshot, ReplyData, Request, WireState};
 use puppy_testserver::{ServerCfg, TestServer, body_byte};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -276,7 +276,7 @@ async fn wait_state(
         if done(&d) {
             return d;
         }
-        if let DownloadState::Failed { reason } = &d.state {
+        if let WireState::Failed { reason } = &d.state {
             panic!("download failed: {reason}");
         }
         assert!(Instant::now() < deadline, "never {what}: {d:?}");
@@ -285,7 +285,7 @@ async fn wait_state(
 }
 
 async fn wait_completed(c: &Client, id: DownloadId) {
-    wait_state(c, id, "completed", |d| d.state == DownloadState::Completed).await;
+    wait_state(c, id, "completed", |d| d.state == WireState::Completed).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -356,7 +356,7 @@ async fn restart_daemon_resumes_download() {
     let c = env.spawn_client().await.unwrap();
     let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
     wait_state(&c, id, "transferring", |d| {
-        d.state == DownloadState::Active && d.done_bytes > 0
+        d.state == WireState::Active && d.done_bytes > 0
     })
     .await;
     assert_eq!(c.call(Request::Shutdown).await.unwrap(), ReplyData::Done);
