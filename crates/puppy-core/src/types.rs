@@ -54,6 +54,9 @@ pub enum DownloadState {
 pub struct DownloadStatus {
     pub state: DownloadState,
     pub name: String,
+    /// Where the finished file is (or will be). Can differ from the path `add` returned:
+    /// if a file appeared there meanwhile, the download is finalized under a free name.
+    pub path: PathBuf,
     pub total_bytes: Option<u64>,
     pub done_bytes: u64,
     pub down_bps: u64,

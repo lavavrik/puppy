@@ -899,6 +899,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "http",
+ "libc",
  "percent-encoding",
  "reqwest",
  "serde",
@@ -909,6 +910,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

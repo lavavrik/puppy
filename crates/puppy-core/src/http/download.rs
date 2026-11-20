@@ -72,6 +72,9 @@ struct Shared {
     plan: Plan,
     /// Where segment requests go; replaced when an expired redirect target is re-resolved.
     final_url: url::Url,
+    /// Where the finished file is (or will be): `final_path` unless finalizing found that
+    /// name taken.
+    path: PathBuf,
 }
 
 struct Plan {
@@ -214,6 +217,7 @@ impl Env {
             total_bytes: remote.total,
         };
         let final_url = remote.final_url.clone();
+        let path = final_path.clone();
         let inner = Arc::new(Inner {
             id: self.id,
             request,
@@ -230,6 +234,7 @@ impl Env {
                 state: DownloadState::Starting,
                 plan,
                 final_url,
+                path,
             }),
             bps: AtomicU64::new(0),
             control: tokio::sync::Mutex::new(Control::default()),
@@ -352,11 +357,17 @@ impl HttpDownload {
             return;
         }
         // All workers are reaped, so no handle to `.part` is open any more.
-        let completed = matches!(self.inner.lock().state, DownloadState::Completed);
-        let final_path = self.inner.final_path.clone();
-        let mut paths = vec![part_path(&final_path), sidecar_path(&final_path)];
+        let (completed, path) = {
+            let st = self.inner.lock();
+            (
+                matches!(st.state, DownloadState::Completed),
+                st.path.clone(),
+            )
+        };
+        let final_path = &self.inner.final_path;
+        let mut paths = vec![part_path(final_path), sidecar_path(final_path)];
         if completed {
-            paths.push(final_path);
+            paths.push(path);
         }
         for p in paths {
             match tokio::fs::remove_file(&p).await {
@@ -382,6 +393,7 @@ impl HttpDownload {
         DownloadStatus {
             state: st.state.clone(),
             name: self.inner.name.clone(),
+            path: st.path.clone(),
             total_bytes: total,
             done_bytes: done,
             down_bps: bps,

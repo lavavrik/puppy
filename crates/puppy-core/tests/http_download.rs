@@ -535,3 +535,31 @@ async fn expired_redirect_reresolves_without_etag() {
     // No strong validator: the new URL is accepted after a spot check of the bytes so far.
     expiring_download(|c| c.etag = false).await;
 }
+
+#[tokio::test]
+async fn finalize_does_not_overwrite_appeared_file() {
+    let s = server(|c| {
+        c.len = MIB;
+        c.bytes_per_sec = Some(2 * MIB);
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = broadcast::channel(256);
+    let (dl, added) = start_with_events(&s, dir.path(), cfg(dir.path()), tx).await;
+    assert_eq!(added.path, dir.path().join("file.bin"));
+    wait_status(&dl, |s| s.done_bytes > 0, TIMEOUT).await;
+    // The user (or another program) creates the destination file mid-download.
+    std::fs::write(&added.path, b"user data").unwrap();
+    let st = wait_state(&dl, is_completed, TIMEOUT).await;
+    let moved = dir.path().join("file (1).bin");
+    assert_eq!(st.path, moved);
+    assert_eq!(std::fs::read(&added.path).unwrap(), b"user data");
+    assert_file(&moved, MIB, 0);
+    assert_no_leftovers(&added.path);
+    assert_no_leftovers(&moved);
+    let mut changed = false;
+    while let Ok(ev) = rx.try_recv() {
+        changed |= matches!(ev, EngineEvent::StateChanged { id: 1, .. });
+    }
+    assert!(changed);
+}

@@ -3,7 +3,10 @@
 use super::{Inner, SegEntry};
 use crate::config::HttpConfig;
 use crate::engine::EngineError;
-use crate::fsutil::{sanitize_filename, sync_parent_dir, unique_path};
+use crate::engine::EngineEvent;
+use crate::fsutil::{
+    mark_sparse, rename_no_replace, sanitize_filename, sync_parent_dir, unique_path,
+};
 use crate::http::probe::{RemoteInfo, probe};
 use crate::http::resume::{part_path, sidecar_path};
 use crate::http::segments::Segment;
@@ -52,6 +55,10 @@ fn create_part(dir: &Path, name: &str, total: Option<u64>) -> io::Result<PathBuf
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
+        // NTFS would otherwise zero-fill up to every out-of-order write synchronously.
+        if let Err(e) = mark_sparse(&file) {
+            tracing::warn!(path = %part.display(), "cannot mark sparse: {e}");
+        }
         if let Some(t) = total
             && let Err(e) = file.set_len(t)
         {
@@ -94,6 +101,8 @@ pub(super) async fn blocking<T: Send + 'static>(
 }
 
 /// fsyncs the data, renames `.part` to the final name, then removes the sidecar.
+/// Never replaces a file that appeared at the final name meanwhile: the download is then
+/// finalized under a free name, recorded as its `path` (with a `StateChanged` event).
 /// Must only run after `transfer` returned (no open handles).
 pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
     let total = inner.remote.total;
@@ -122,7 +131,7 @@ pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
         }
     };
     let final_path = inner.final_path.clone();
-    blocking(move || {
+    let target = blocking(move || {
         let part = part_path(&final_path);
         let file = OpenOptions::new().read(true).write(true).open(&part)?;
         if total.is_none() {
@@ -132,16 +141,60 @@ pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
         }
         file.sync_all()?;
         drop(file); // Windows: no handle may be open during rename.
-        fs::rename(&part, &final_path)?;
-        sync_parent_dir(&final_path)?;
+        let target = rename_part(&part, &final_path)?;
+        if let Err(e) = sync_parent_dir(&target) {
+            // The data itself is fsynced; at worst the rename is not yet durable.
+            tracing::warn!(path = %target.display(), "cannot sync directory: {e}");
+        }
         // Renaming first means a crash here leaves the finished file plus a stale sidecar,
         // never an unrenamed file without its sidecar.
-        if let Err(e) = fs::remove_file(sidecar_path(&final_path))
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!("cannot remove resume sidecar: {e}");
-        }
-        Ok(())
+        remove_if_exists(&sidecar_path(&final_path))?;
+        Ok(target)
     })
-    .await
+    .await?;
+    if target != inner.final_path {
+        let state = {
+            let mut st = inner.lock();
+            st.path = target;
+            st.state.clone()
+        };
+        let _ = inner.events.send(EngineEvent::StateChanged {
+            id: inner.id,
+            state,
+        });
+    }
+    Ok(())
+}
+
+/// Renames `part` to `final_path`, or to a free variant of it if that name is taken.
+fn rename_part(part: &Path, final_path: &Path) -> io::Result<PathBuf> {
+    let mut target = final_path.to_path_buf();
+    for _ in 0..1000 {
+        match rename_no_replace(part, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // The sidecar goes first: after a crash, a sidecar next to a file at
+                // `final_path` would claim that (foreign) file as this finished download.
+                remove_if_exists(&sidecar_path(final_path))?;
+                let dir = final_path.parent().unwrap_or(Path::new("."));
+                let name = final_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                target = unique_path(dir, &name);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free file name found",
+    ))
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
