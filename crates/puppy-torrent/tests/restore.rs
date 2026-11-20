@@ -26,6 +26,7 @@ async fn engine(root: &Path, peers: Vec<SocketAddr>) -> TorrentEngine {
     TorrentEngine::new(TorrentEngineOptions {
         dht: false,
         upnp: false,
+        lsd: false,
         listen_port: 0,
         seed_ratio: 0.0,
         data_dir: root.join("data"),
@@ -312,4 +313,35 @@ async fn pause_right_after_verification_sticks() {
     let later = second.status(3).unwrap();
     assert_eq!(later.state, DownloadState::Paused, "the pause was undone");
     assert_eq!(later.done_bytes, paused.done_bytes, "progress while paused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_restores_offline_from_its_stored_metadata() {
+    let seeder = Seeder::start_with_limit(MULTI, SLOW).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let req = req(
+        root,
+        Source::Magnet {
+            uri: seeder.magnet.clone(),
+        },
+    );
+    let (added, before) = download_part_then_stop(root, &seeder, 9, req.clone()).await;
+    assert!(stored(root, 9).exists(), "the fetched metadata is kept");
+    drop(seeder); // offline from now on
+
+    let second = engine(root, Vec::new()).await;
+    let (mode, opts) = restore(&added.path, true);
+    let restored = second.add(9, req, mode, opts).await.unwrap();
+    assert_eq!(
+        restored.name, MULTI_NAME,
+        "the real name, no network needed"
+    );
+    assert_eq!(restored.path, added.path);
+    let st = wait(&second, 9, "verified data", |s| {
+        s.state == DownloadState::Paused && s.done_bytes >= before
+    })
+    .await;
+    assert_eq!(st.name, MULTI_NAME);
+    assert_eq!(st.total_bytes, Some(MULTI.iter().map(|f| f.1 as u64).sum()));
 }

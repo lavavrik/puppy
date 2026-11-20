@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use librqbit::api::TorrentIdOrHash;
-use librqbit::dht::DhtPersistenceConfig;
+use librqbit::dht::{DhtPersistenceConfig, Id20};
 use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
@@ -21,7 +22,7 @@ use puppy_core::engine::{
 use puppy_core::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{OnceCell, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +39,9 @@ pub struct TorrentEngineOptions {
     pub dht: bool,
     /// Ask the router to forward the listen port via UPnP (ignored in `test_mode`).
     pub upnp: bool,
+    /// Find peers on the local network (local service discovery; ignored in
+    /// `test_mode`: always off).
+    pub lsd: bool,
     /// Port for incoming peer connections on `0.0.0.0`; an OS-assigned port is used if it
     /// cannot be bound. 0: always OS-assigned.
     pub listen_port: u16,
@@ -60,6 +64,10 @@ pub struct TorrentEngineOptions {
 /// Torrent engine: owns one librqbit [`Session`] (its own persistence off: puppy's store is
 /// the source of truth, torrents are re-added on restore).
 ///
+/// - The session (listener, DHT, its state dirs) starts with the first torrent that
+///   needs it, not with the engine: a daemon that only downloads over HTTP opens no
+///   torrent sockets. If it cannot start, the add fails transiently ("torrent engine
+///   unavailable (see daemon log)") and the next attempt tries again.
 /// - `add` never waits for the network: a `.torrent` is handed to librqbit at once; a
 ///   magnet's metadata is fetched in the background (the download is `Starting` meanwhile
 ///   and can be paused or removed).
@@ -68,14 +76,16 @@ pub struct TorrentEngineOptions {
 /// - Unlike the HTTP engine, dropping it stops its torrents (the session goes with it).
 pub struct TorrentEngine {
     shared: Arc<Shared>,
-    /// The session's cancellation token: cancelling it stops every session task.
-    cancel: CancellationToken,
 }
 
 /// Shown when a torrent (same info hash) is added twice.
 const DUPLICATE: &str = "already downloading this torrent";
 /// Restore found neither the stored `.torrent` copy nor the original file.
 const TORRENT_MISSING: &str = "torrent file missing";
+/// The session could not be started (the details are logged).
+const UNAVAILABLE: &str = "torrent engine unavailable (see daemon log)";
+/// A fresh add found a file of the torrent already there (librqbit does not overwrite).
+const EXISTS: &str = "refusing to overwrite: a file of this torrent already exists";
 
 /// What the engine knows about one torrent besides librqbit's handle.
 pub(crate) struct Entry {
@@ -87,6 +97,9 @@ pub(crate) struct Entry {
     layout: Layout,
     /// The magnet link, to fetch the metadata again (resume after pause or failure).
     magnet: Option<String>,
+    /// librqbit may write over existing files (restored downloads only: their files are
+    /// ours). Fresh adds never do.
+    overwrite: bool,
     /// Per-download limit applied when the torrent is (re)added to librqbit.
     limit: Option<u64>,
     /// `limit` as a magnet's metadata task reads it just before the real add (0: none).
@@ -171,7 +184,14 @@ impl View {
 
 /// State shared by the engine, its poll task and the magnet tasks.
 pub(crate) struct Shared {
-    session: Arc<Session>,
+    /// Started by the first torrent that needs it (see [`Shared::session`]).
+    session: OnceCell<Arc<Session>>,
+    /// The global `(download, upload)` limits, applied to the session (also when it
+    /// starts).
+    limits: Mutex<(Option<u64>, Option<u64>)>,
+    /// The engine's token: the session's tokens are its children, so dropping the
+    /// engine stops the session and the poll task.
+    cancel: CancellationToken,
     torrents: Mutex<Torrents>,
     pub(crate) events: broadcast::Sender<EngineEvent>,
     pub(crate) opts: TorrentEngineOptions,
@@ -184,6 +204,59 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Torrents> {
         self.torrents.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The session, started now if it is not yet (creating the engine's dirs, then
+    /// listening). A failure is logged and reported as [`UNAVAILABLE`] (transient); it is
+    /// not remembered: the next call tries again.
+    async fn session(&self) -> Result<&Arc<Session>, EngineError> {
+        let session = self
+            .session
+            .get_or_try_init(|| self.start_session())
+            .await
+            .map_err(|e| {
+                tracing::error!("cannot start the torrent session: {e:#}");
+                EngineError::Unavailable(UNAVAILABLE.into())
+            })?;
+        // Also covers limits set while the session was starting.
+        self.apply_limits(session);
+        Ok(session)
+    }
+
+    async fn start_session(&self) -> anyhow::Result<Arc<Session>> {
+        create_private_dir(&self.opts.data_dir.join("torrent"))?;
+        create_private_dir(&self.opts.data_dir.join("torrents"))?;
+        let session = SessionPlan::from_options(&self.opts)
+            .start_with_fallback(&self.cancel)
+            .await
+            .map_err(|e| e.context("starting the torrent session"))?;
+        tracing::info!(listen = ?session.listen_addr(), "torrent session started");
+        Ok(session)
+    }
+
+    /// The session if it has been started.
+    fn started(&self) -> Option<&Arc<Session>> {
+        self.session.get()
+    }
+
+    /// The session, for a torrent already in it (so it has been started).
+    fn live(&self) -> Result<&Arc<Session>, EngineError> {
+        self.started()
+            .ok_or_else(|| EngineError::Invalid("the torrent session is not running".into()))
+    }
+
+    fn apply_limits(&self, session: &Session) {
+        let (down, up) = *self.limits.lock().unwrap_or_else(|e| e.into_inner());
+        session.ratelimits.set_download_bps(bps_limit(down));
+        session.ratelimits.set_upload_bps(bps_limit(up));
+    }
+
+    /// Records a global limit and applies it if the session runs.
+    fn set_limit(&self, f: impl FnOnce(&mut (Option<u64>, Option<u64>))) {
+        f(&mut self.limits.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(s) = self.started() {
+            self.apply_limits(s);
+        }
     }
 
     /// What is needed to compute `e`'s status, taken under the torrents lock; librqbit's
@@ -230,7 +303,7 @@ impl Shared {
         if idle {
             return Ok(());
         }
-        self.session.pause(h).await.map_err(lib_error)
+        self.live()?.pause(h).await.map_err(lib_error)
     }
 
     /// Restarts a torrent left stopped against our wishes: one resumed while librqbit
@@ -261,15 +334,19 @@ impl Shared {
             id,
             "restarting a torrent resumed while it was being checked"
         );
-        self.session.unpause(h).await.map_err(lib_error)
+        self.live()?.unpause(h).await.map_err(lib_error)
     }
 
-    /// librqbit add options for a torrent going to `layout`.
+    /// librqbit add options for a torrent going to `layout`. `overwrite`: only for
+    /// restored torrents (see [`Entry::overwrite`]); `trackers`: a magnet's `tr`s (its
+    /// fetched metadata has none).
     fn add_options(
         &self,
         layout: &Layout,
         paused: bool,
         limit: Option<u64>,
+        overwrite: bool,
+        trackers: Vec<String>,
     ) -> Result<AddTorrentOptions, EngineError> {
         let output_folder = layout
             .output_folder
@@ -284,8 +361,9 @@ impl Shared {
         let peers = &self.opts.test_initial_peers;
         Ok(AddTorrentOptions {
             paused,
-            overwrite: true,
+            overwrite,
             output_folder: Some(output_folder),
+            trackers: (!trackers.is_empty()).then_some(trackers),
             ratelimits: LimitsConfig {
                 download_bps: bps_limit(limit),
                 upload_bps: None,
@@ -311,10 +389,20 @@ impl Shared {
         limit: Arc<AtomicU64>,
     ) -> Slot {
         let r#gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
-        let session = self.session.clone();
         let weak = Arc::downgrade(self);
+        let stored = self.stored_torrent(id);
         let task = tokio::spawn(async move {
-            let outcome = resolve_and_add(&session, uri, opts, &limit).await;
+            let session = match weak.upgrade() {
+                Some(shared) => shared.session().await.cloned(),
+                None => return None,
+            };
+            let outcome = match session {
+                Ok(session) => resolve_and_add(&session, uri, opts, &limit, &stored).await,
+                Err(e) => Err(ResolveFailure {
+                    reason: e.to_string(),
+                    transient: e.is_transient(),
+                }),
+            };
             let added = outcome.as_ref().ok().cloned();
             let Some(shared) = weak.upgrade() else {
                 return added;
@@ -365,17 +453,73 @@ impl Shared {
         delete_files: bool,
     ) -> Result<(), EngineError> {
         let id = TorrentIdOrHash::Id(h.id());
+        let session = self.live()?;
         if delete_files && layout.single_file {
-            self.session.delete(id, false).await.map_err(lib_error)?;
+            session.delete(id, false).await.map_err(lib_error)?;
             match std::fs::remove_file(&layout.path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),
             }
         } else {
-            self.session
-                .delete(id, delete_files)
-                .await
-                .map_err(lib_error)
+            session.delete(id, delete_files).await.map_err(lib_error)
+        }
+    }
+
+    /// After a metadata task was aborted (pause or remove): a torrent it may have added
+    /// to librqbit just before the abort (and not handed back) is settled like a
+    /// finished task would be ([`settle`]): adopted, paused, if download `id` is still
+    /// waiting for it (`Held`); otherwise dropped from librqbit, keeping its files,
+    /// unless another download owns that torrent.
+    async fn settle_slipped(&self, id: DownloadId, info_hash: &str) {
+        let Some(session) = self.started() else {
+            return;
+        };
+        let Ok(hash) = Id20::from_str(info_hash) else {
+            return;
+        };
+        let Some(h) = session.get(TorrentIdOrHash::Hash(hash)) else {
+            return;
+        };
+        let adopt = {
+            let mut map = self.lock();
+            let owned = map.iter().any(|(other, e)| {
+                (*other != id && e.info_hash == info_hash)
+                    || matches!(&e.slot, Slot::Managed(x) if Arc::ptr_eq(x, &h))
+            });
+            if owned {
+                return;
+            }
+            match map.get_mut(&id) {
+                // Paused while fetching (see `settle`): keep the torrent, paused.
+                Some(e) if e.info_hash == info_hash && matches!(e.slot, Slot::Held) => {
+                    e.slot = Slot::Managed(h.clone());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if adopt {
+            tracing::debug!(id, "adopting a torrent added while its fetch was aborted");
+            let bytes = h.with_metadata(|m| m.torrent_bytes.clone());
+            if let Ok(bytes) = bytes {
+                self.write_stored(id, &bytes);
+            }
+            if let Err(e) = self.pause_managed(&h).await {
+                tracing::warn!(id, "pausing an adopted torrent: {e}");
+            }
+        } else {
+            tracing::debug!(id, "dropping a torrent added while its fetch was aborted");
+            if let Err(e) = session.delete(TorrentIdOrHash::Id(h.id()), false).await {
+                tracing::warn!(id, "dropping a torrent left by an aborted fetch: {e:#}");
+            }
+        }
+    }
+
+    /// Writes the stored `.torrent` copy of download `id` (a failure is only logged:
+    /// restoring then falls back to the original source).
+    fn write_stored(&self, id: DownloadId, bytes: &[u8]) {
+        if let Err(e) = write_stored_copy(&self.stored_torrent(id), bytes) {
+            tracing::warn!(id, "keeping the torrent's metadata: {e}");
         }
     }
 
@@ -385,6 +529,16 @@ impl Shared {
             .data_dir
             .join("torrents")
             .join(format!("{id}.torrent"))
+    }
+
+    /// Deletes the stored `.torrent` copy of download `id`, if any.
+    fn forget(&self, id: DownloadId) {
+        match std::fs::remove_file(self.stored_torrent(id)) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(id, "removing the stored .torrent copy: {err}");
+            }
+            _ => {}
+        }
     }
 
     /// Aborts every metadata fetch (engine shutdown).
@@ -439,11 +593,14 @@ impl ResolveFailure {
 /// Fetches a magnet's metadata without adding it (`list_only`: nothing is written),
 /// checks its file names ([`source::validate_layout`]), then adds it for real from the
 /// fetched torrent bytes (no second metadata fetch; the peers already seen are reused).
+/// Once added, the metadata is kept at `stored` (restore needs no network then, and
+/// knows the torrent's name and files).
 async fn resolve_and_add(
     session: &Arc<Session>,
     uri: String,
     mut opts: AddTorrentOptions,
     limit: &AtomicU64,
+    stored: &Path,
 ) -> Result<ManagedTorrentHandle, ResolveFailure> {
     let list_opts = AddTorrentOptions {
         list_only: true,
@@ -483,17 +640,41 @@ async fn resolve_and_add(
         }
     }
     opts.initial_peers = (!peers.is_empty()).then_some(peers);
+    let bytes = listed.torrent_bytes;
     match session
-        .add_torrent(AddTorrent::from_bytes(listed.torrent_bytes), Some(opts))
+        .add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(opts))
         .await
     {
-        Ok(AddTorrentResponse::Added(_, h)) => Ok(h),
+        Ok(AddTorrentResponse::Added(_, h)) => {
+            // Not awaited: an abort cannot leave a half-written copy behind its remover.
+            if let Err(e) = write_stored_copy(stored, &bytes) {
+                tracing::warn!("keeping the torrent's metadata: {e}");
+            }
+            Ok(h)
+        }
         Ok(AddTorrentResponse::AlreadyManaged(..)) => Err(ResolveFailure::permanent(DUPLICATE)),
         Ok(AddTorrentResponse::ListOnly(_)) => Err(ResolveFailure::permanent(
             "unexpected list-only answer from librqbit",
         )),
+        Err(e) if is_already_exists(&e) => {
+            tracing::warn!("{e:#}");
+            Err(ResolveFailure::permanent(EXISTS))
+        }
         Err(e) => Err(ResolveFailure::new(format!("{e:#}"))),
     }
+}
+
+/// Writes a stored `.torrent` copy (synchronously: it is small).
+fn write_stored_copy(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// librqbit refused to create a file that already exists (`overwrite: false`).
+fn is_already_exists(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+    })
 }
 
 /// A librqbit error as an engine error: I/O if an `io::Error` is behind it, else invalid.
@@ -528,18 +709,33 @@ impl Drop for Reservation<'_> {
 /// Where an added torrent's files go.
 #[derive(Clone, Copy)]
 enum Target<'a> {
-    /// A new download: into this output dir (its own folder unless single-file).
+    /// A new download: into this output dir, never where something already is (see
+    /// [`Layout::fresh_torrent`]).
     Fresh(&'a Path),
-    /// A restored download: back where its files were (its `Added::path`).
-    Restore(&'a Path),
+    /// A restored download: back where its files were (its `Added::path`). `folder`:
+    /// `path` is the torrent's folder whatever its layout (a magnet's).
+    Restore { path: &'a Path, folder: bool },
 }
 
 impl Target<'_> {
-    fn layout(self, info: &source::TorrentInfo) -> Layout {
+    /// The layout, and whether librqbit may write over existing files (restore only).
+    fn layout(self, info: &source::TorrentInfo, map: &Torrents) -> (Layout, bool) {
         match self {
-            Target::Fresh(base) => Layout::for_torrent(base, info),
-            Target::Restore(path) => Layout::restored(path, info.single_file.is_some()),
+            Target::Fresh(base) => (Layout::fresh_torrent(base, info, claimed(map)), false),
+            Target::Restore { path, folder } => (
+                Layout::restored(path, !folder && info.single_file.is_some()),
+                true,
+            ),
         }
+    }
+}
+
+/// Paths that downloads in the engine already use (a fresh add must avoid them even
+/// before their files exist).
+fn claimed(map: &Torrents) -> impl Fn(&Path) -> bool + '_ {
+    |p| {
+        map.values()
+            .any(|e| e.layout.path == p || e.layout.output_folder == p)
     }
 }
 
@@ -555,52 +751,74 @@ enum StoredCopy {
 }
 
 impl TorrentEngine {
-    /// Starts the librqbit session (listener, DHT unless disabled) and the poll task.
+    /// Creates the engine and its poll task. Nothing is opened yet: the librqbit session
+    /// (listener, DHT, the engine's dirs) starts with the first torrent that needs it.
+    /// Never fails today; the `Result` is kept for engines that check more up front.
     pub async fn new(opts: TorrentEngineOptions) -> Result<Self, EngineError> {
-        create_private_dir(&opts.data_dir.join("torrent"))?;
-        create_private_dir(&opts.data_dir.join("torrents"))?;
-        let plan = SessionPlan::from_options(&opts);
-        let (session, cancel) = plan
-            .start_with_fallback()
-            .await
-            .map_err(|e| EngineError::Network(format!("starting the torrent session: {e:#}")))?;
-        tracing::info!(listen = ?session.listen_addr(), "torrent session started");
         let (events, _) = broadcast::channel(256);
+        let cancel = CancellationToken::new();
         let shared = Arc::new(Shared {
-            session,
+            session: OnceCell::new(),
+            limits: Mutex::new((None, None)),
+            cancel: cancel.clone(),
             torrents: Mutex::new(HashMap::new()),
             events,
             opts,
             next_gen: AtomicU64::new(0),
             ops: tokio::sync::Mutex::new(()),
         });
-        tokio::spawn(poll::run(Arc::downgrade(&shared), cancel.clone()));
-        Ok(Self { shared, cancel })
+        tokio::spawn(poll::run(Arc::downgrade(&shared), cancel));
+        Ok(Self { shared })
     }
 
-    /// The session's current global `(download, upload)` limits in bytes/s (tests).
+    /// The session's current global `(download, upload)` limits in bytes/s, or the ones
+    /// it will start with (tests).
     #[doc(hidden)]
     pub fn global_limits(&self) -> (Option<u32>, Option<u32>) {
-        let l = &self.shared.session.ratelimits;
-        (
-            l.get_download_bps().map(NonZeroU32::get),
-            l.get_upload_bps().map(NonZeroU32::get),
-        )
+        match self.shared.started() {
+            Some(s) => (
+                s.ratelimits.get_download_bps().map(NonZeroU32::get),
+                s.ratelimits.get_upload_bps().map(NonZeroU32::get),
+            ),
+            None => {
+                let (d, u) = *self.shared.limits.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    bps_limit(d).map(NonZeroU32::get),
+                    bps_limit(u).map(NonZeroU32::get),
+                )
+            }
+        }
     }
 
-    /// Where the session accepts incoming peer connections.
+    /// Whether the librqbit session has been started (tests).
+    #[doc(hidden)]
+    pub fn session_started(&self) -> bool {
+        self.shared.started().is_some()
+    }
+
+    /// Starts the session now if it is not running yet (tests).
+    #[doc(hidden)]
+    pub async fn start_session(&self) -> Result<(), EngineError> {
+        self.shared.session().await.map(|_| ())
+    }
+
+    /// Where the session accepts incoming peer connections (`None` until it is started).
     pub fn listen_addr(&self) -> Option<SocketAddr> {
-        self.shared.session.listen_addr()
+        self.shared.started()?.listen_addr()
     }
 
     /// Pauses every torrent and stops the session's tasks (listener, DHT, peers, poll).
-    /// Takes about 1 s (librqbit gives its tasks a moment to wind down).
+    /// Takes about 1 s (librqbit gives its tasks a moment to wind down); nothing to do if
+    /// the session never started.
     pub async fn shutdown(&self) {
         self.shared.abort_resolving();
-        self.shared.session.stop().await;
+        if let Some(session) = self.shared.started() {
+            session.stop().await;
+        }
     }
 
-    /// Adds a `.torrent` (already read) to librqbit.
+    /// Adds a `.torrent` (already read) to librqbit. `trackers`: a magnet's `tr`s (a
+    /// magnet restored from its stored metadata).
     async fn add_torrent_file(
         &self,
         id: DownloadId,
@@ -608,15 +826,14 @@ impl TorrentEngine {
         target: Target<'_>,
         copy: StoredCopy,
         opts: &AddOptions,
+        trackers: Vec<String>,
     ) -> Result<Added, EngineError> {
         let info = source::parse_torrent(&bytes)?;
-        let layout = target.layout(&info);
-        let add_opts = self
-            .shared
-            .add_options(&layout, opts.start_paused, opts.limit)?;
-        {
+        let session = self.shared.session().await?;
+        let (layout, overwrite) = {
             let mut map = self.shared.lock();
             check_free(&map, id, &info.info_hash)?;
+            let (layout, overwrite) = target.layout(&info, &map);
             map.insert(
                 id,
                 Entry {
@@ -624,6 +841,7 @@ impl TorrentEngine {
                     name: info.name.clone(),
                     layout: layout.clone(),
                     magnet: None,
+                    overwrite,
                     limit: opts.limit,
                     limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
                     detail: None,
@@ -634,7 +852,8 @@ impl TorrentEngine {
                     run_wanted: !opts.start_paused,
                 },
             );
-        }
+            (layout, overwrite)
+        };
         let stored = self.shared.stored_torrent(id);
         let mut guard = Reservation {
             shared: &self.shared,
@@ -642,15 +861,23 @@ impl TorrentEngine {
             stored: (copy == StoredCopy::Write).then(|| stored.clone()),
             armed: true,
         };
+        let add_opts =
+            self.shared
+                .add_options(&layout, opts.start_paused, opts.limit, overwrite, trackers)?;
         if copy != StoredCopy::Keep {
             tokio::fs::write(&stored, &bytes).await?;
         }
-        let res = self
-            .shared
-            .session
+        let res = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(add_opts))
             .await
-            .map_err(lib_error)?;
+            .map_err(|e| {
+                if is_already_exists(&e) {
+                    tracing::warn!(id, "{e:#}");
+                    EngineError::Invalid(EXISTS.into())
+                } else {
+                    lib_error(e)
+                }
+            })?;
         let handle = match res {
             AddTorrentResponse::Added(_, h) => h,
             AddTorrentResponse::AlreadyManaged(..) => {
@@ -674,6 +901,10 @@ impl TorrentEngine {
     }
 
     /// Registers a magnet; its metadata is fetched in the background (unless paused).
+    ///
+    /// A magnet restored from its link never had its metadata added (its stored copy is
+    /// written once it is), so nothing at its path is ours: librqbit does not overwrite
+    /// there either.
     fn add_magnet(
         &self,
         id: DownloadId,
@@ -682,14 +913,16 @@ impl TorrentEngine {
         opts: &AddOptions,
     ) -> Result<Added, EngineError> {
         let info = source::parse_magnet(&uri)?;
-        let layout = match target {
-            Target::Fresh(base) => Layout::for_magnet(base, &info),
-            Target::Restore(path) => Layout::restored(path, false),
-        };
-        let add_opts = self.shared.add_options(&layout, false, opts.limit)?;
         let name = info.display_name();
         let mut map = self.shared.lock();
         check_free(&map, id, &info.info_hash)?;
+        let layout = match target {
+            Target::Fresh(base) => Layout::fresh_magnet(base, &info, claimed(&map)),
+            Target::Restore { path, .. } => Layout::restored(path, false),
+        };
+        let add_opts =
+            self.shared
+                .add_options(&layout, false, opts.limit, false, info.trackers.clone())?;
         let limit_cell = Arc::new(AtomicU64::new(opts.limit.unwrap_or(0)));
         let slot = if opts.start_paused {
             Slot::Held
@@ -704,6 +937,7 @@ impl TorrentEngine {
                 name: name.clone(),
                 layout: layout.clone(),
                 magnet: Some(uri),
+                overwrite: false,
                 limit: opts.limit,
                 limit_cell,
                 detail: None,
@@ -720,14 +954,67 @@ impl TorrentEngine {
             total_bytes: None,
         })
     }
+
+    /// Removes download `id`: from librqbit (deleting only its own files if asked: see
+    /// [`Shared::delete_managed`]), and its stored `.torrent` copy unless `keep_copy`. A
+    /// magnet still fetching its metadata is cancelled.
+    async fn remove_inner(
+        &self,
+        id: DownloadId,
+        delete_files: bool,
+        keep_copy: bool,
+    ) -> Result<(), EngineError> {
+        let _ops = self.shared.ops.lock().await;
+        let e = {
+            let mut map = self.shared.lock();
+            match map.get(&id) {
+                Some(e) if !matches!(e.slot, Slot::Adding) => map.remove(&id),
+                _ => None,
+            }
+        }
+        .ok_or(EngineError::NotFound(id))?;
+        let handle = match e.slot {
+            Slot::Managed(h) => Some(h),
+            Slot::Resolving { task, .. } => {
+                task.abort();
+                let h = task.await.ok().flatten();
+                if h.is_none() {
+                    self.shared.settle_slipped(id, &e.info_hash).await;
+                }
+                h
+            }
+            Slot::Attention(_) if delete_files => {
+                tracing::warn!(
+                    id,
+                    path = %e.layout.path.display(),
+                    "removed without its .torrent: its files are left on disk"
+                );
+                None
+            }
+            Slot::Held | Slot::PendingFailed { .. } | Slot::Attention(_) | Slot::Adding => None,
+        };
+        let deleted = match handle {
+            Some(h) => {
+                self.shared
+                    .delete_managed(&h, &e.layout, delete_files)
+                    .await
+            }
+            None => Ok(()),
+        };
+        if !keep_copy {
+            // The download is gone either way: drop its stored copy before reporting.
+            self.shared.forget(id);
+        }
+        deleted
+    }
 }
 
 impl TorrentEngine {
     /// Restores a download added before a restart, its files at `path`: a `.torrent`
     /// from its stored copy (else the original file, if still there), a magnet from its
-    /// link (the metadata is fetched again). librqbit checks the existing data before
-    /// the torrent goes on. With neither copy nor original, the download is registered
-    /// as needing attention.
+    /// stored metadata (else its link: the metadata is fetched again). librqbit checks
+    /// the existing data before the torrent goes on. With neither copy nor original, a
+    /// `.torrent` download is registered as needing attention.
     async fn restore(
         &self,
         id: DownloadId,
@@ -735,17 +1022,42 @@ impl TorrentEngine {
         path: &Path,
         opts: &AddOptions,
     ) -> Result<Added, EngineError> {
-        let target = Target::Restore(path);
+        let stored = self.shared.stored_torrent(id);
+        let have_copy = tokio::fs::try_exists(&stored).await.unwrap_or(false);
         let original = match source {
-            Source::Magnet { uri } => return self.add_magnet(id, uri, target, opts),
+            Source::Magnet { uri } => {
+                let target = Target::Restore { path, folder: true };
+                if have_copy {
+                    let trackers = source::parse_magnet(&uri)?.trackers;
+                    match source::read_torrent_file(&stored).await {
+                        Ok(bytes) => {
+                            return self
+                                .add_torrent_file(
+                                    id,
+                                    bytes,
+                                    target,
+                                    StoredCopy::Keep,
+                                    opts,
+                                    trackers,
+                                )
+                                .await;
+                        }
+                        Err(e) => tracing::warn!(id, "reading the stored metadata: {e}"),
+                    }
+                }
+                return self.add_magnet(id, uri, target, opts);
+            }
             Source::TorrentFile { path } => path,
             Source::Http { .. } => return Err(EngineError::Unsupported("not a torrent source")),
         };
-        let stored = self.shared.stored_torrent(id);
-        if tokio::fs::try_exists(&stored).await.unwrap_or(false) {
+        let target = Target::Restore {
+            path,
+            folder: false,
+        };
+        if have_copy {
             let bytes = source::read_torrent_file(&stored).await?;
             return self
-                .add_torrent_file(id, bytes, target, StoredCopy::Keep, opts)
+                .add_torrent_file(id, bytes, target, StoredCopy::Keep, opts, Vec::new())
                 .await;
         }
         if tokio::fs::try_exists(&original).await.unwrap_or(false) {
@@ -756,7 +1068,7 @@ impl TorrentEngine {
             );
             let bytes = source::read_torrent_file(&original).await?;
             return self
-                .add_torrent_file(id, bytes, target, StoredCopy::Rewrite, opts)
+                .add_torrent_file(id, bytes, target, StoredCopy::Rewrite, opts, Vec::new())
                 .await;
         }
         tracing::warn!(id, "cannot restore: the .torrent file is gone");
@@ -774,6 +1086,7 @@ impl TorrentEngine {
                 name: name.clone(),
                 layout,
                 magnet: None,
+                overwrite: true,
                 limit: opts.limit,
                 limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
                 detail: None,
@@ -811,7 +1124,7 @@ impl Drop for TorrentEngine {
         // Unlike the HTTP engine, a dropped torrent engine stops its session: nothing else
         // could reach it, and a new engine (restore) must be able to take the files over.
         self.shared.abort_resolving();
-        self.cancel.cancel();
+        self.shared.cancel.cancel();
     }
 }
 
@@ -841,9 +1154,18 @@ struct SessionPlan {
     listen_addr: SocketAddr,
     /// DHT state file; `None`: DHT off.
     dht_state: Option<PathBuf>,
+    /// DHT UDP port; `None`: the one stored in `dht_state` (else OS-assigned), `Some(0)`:
+    /// OS-assigned.
+    dht_port: Option<u16>,
+    /// DHT bootstrap nodes; `None`: librqbit's defaults (tests: none).
+    dht_bootstrap: Option<Vec<String>>,
+    /// How often the DHT state is saved; `None`: librqbit's default (tests: often).
+    dht_dump_interval: Option<Duration>,
     trackers: bool,
     lsd: bool,
     upnp: bool,
+    /// Check the listen port with a plain bind first (see [`Self::start_recording_attempts`]).
+    probe_port: bool,
 }
 
 impl SessionPlan {
@@ -857,40 +1179,71 @@ impl SessionPlan {
                 (Ipv4Addr::UNSPECIFIED, opts.listen_port).into()
             },
             dht_state: (opts.dht && !test).then(|| opts.data_dir.join("torrent").join("dht.json")),
+            dht_port: None,
+            dht_bootstrap: None,
+            dht_dump_interval: None,
             trackers: !test,
-            lsd: !test,
+            lsd: opts.lsd && !test,
             upnp: opts.upnp && !test,
+            probe_port: true,
         }
     }
 
-    /// Starts the session on the planned port; if that port can't be bound (in use, or
-    /// privileged), once more on an OS-assigned one. Any other error is returned as is.
-    async fn start_with_fallback(&self) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
-        self.start_recording_attempts(&mut Vec::new()).await
+    /// Starts the session (its tasks stop when `parent` is cancelled); see
+    /// [`Self::start_recording_attempts`].
+    async fn start_with_fallback(
+        &self,
+        parent: &CancellationToken,
+    ) -> anyhow::Result<Arc<Session>> {
+        let (session, _) = self
+            .start_recording_attempts(parent, &mut Vec::new())
+            .await?;
+        Ok(session)
     }
 
-    /// [`Self::start_with_fallback`], pushing each attempt's cancellation token to
-    /// `attempts` (tests check failed attempts are cancelled).
+    /// Starts the session on the planned ports, falling back to OS-assigned ones:
+    /// - The listen port is first checked with a plain `TcpListener` bind (released at
+    ///   once): if it is in use or privileged, an OS-assigned port is used from the
+    ///   start (on Windows librqbit may otherwise bind a port another program holds).
+    /// - If librqbit still cannot bind the listen port, once more on an OS-assigned one.
+    /// - If the DHT's UDP port (the one stored in its state file) is busy, once more on
+    ///   an OS-assigned DHT port.
+    ///
+    /// Any other error is returned as is. Each attempt's cancellation token (a child of
+    /// `parent`) is pushed to `attempts` (tests check failed attempts are cancelled).
     async fn start_recording_attempts(
         &self,
+        parent: &CancellationToken,
         attempts: &mut Vec<CancellationToken>,
     ) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
-        let mut attempt = |addr| {
-            let cancel = CancellationToken::new();
+        let mut plan = self.clone();
+        if plan.probe_port && plan.listen_addr.port() != 0 && !port_free(plan.listen_addr) {
+            tracing::warn!(
+                addr = %plan.listen_addr,
+                "torrent listen port unavailable; using an OS-assigned port"
+            );
+            plan.listen_addr.set_port(0);
+        }
+        loop {
+            let cancel = parent.child_token();
             attempts.push(cancel.clone());
-            self.start(addr, cancel)
-        };
-        match attempt(self.listen_addr).await {
-            Err(e) if self.listen_addr.port() != 0 && is_port_unavailable(&e) => {
+            let e = match plan.start(cancel).await {
+                Ok(r) => return Ok(r),
+                Err(e) if is_port_unavailable(&e) => e,
+                Err(e) => return Err(e),
+            };
+            if is_dht_error(&e) && plan.dht_state.is_some() && plan.dht_port != Some(0) {
+                tracing::warn!("DHT port unavailable ({e:#}); using an OS-assigned port");
+                plan.dht_port = Some(0);
+            } else if !is_dht_error(&e) && plan.listen_addr.port() != 0 {
                 tracing::warn!(
-                    addr = %self.listen_addr,
+                    addr = %plan.listen_addr,
                     "torrent listen port unavailable ({e:#}); using an OS-assigned port"
                 );
-                let mut any_port = self.listen_addr;
-                any_port.set_port(0);
-                attempt(any_port).await
+                plan.listen_addr.set_port(0);
+            } else {
+                return Err(e);
             }
-            r => r,
         }
     }
 
@@ -898,15 +1251,14 @@ impl SessionPlan {
     /// nothing it started (listener, DHT) outlives it.
     async fn start(
         &self,
-        listen_addr: SocketAddr,
         cancel: CancellationToken,
     ) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
         let dht = self.dht_state.as_ref().map(|state| DhtSessionConfig {
-            bootstrap_addrs: None,
-            port: None,
+            bootstrap_addrs: self.dht_bootstrap.clone(),
+            port: self.dht_port,
             // The DHT routing table (not torrents) is kept between runs for a quick bootstrap.
             persistence: Some(DhtPersistenceConfig {
-                dump_interval: None,
+                dump_interval: self.dht_dump_interval,
                 config_filename: Some(state.clone()),
             }),
         });
@@ -919,7 +1271,7 @@ impl SessionPlan {
             // IPv4 only (listen on 0.0.0.0; DHT/LSD on IPv4): works on IPv6-less hosts.
             ipv4_only: true,
             listen: Some(ListenerOptions {
-                listen_addr,
+                listen_addr: self.listen_addr,
                 enable_upnp_port_forwarding: self.upnp,
                 ipv4_only: true,
                 ..Default::default()
@@ -937,18 +1289,48 @@ impl SessionPlan {
     }
 }
 
-/// Whether a session start failed because the listen port can't be bound. librqbit wraps
+/// Whether a plain TCP bind of `addr` works (the socket is closed again at once). Only
+/// "in use" and "permission denied" count as not free.
+fn port_free(addr: SocketAddr) -> bool {
+    use std::io::ErrorKind::{AddrInUse, PermissionDenied};
+    !matches!(
+        std::net::TcpListener::bind(addr),
+        Err(e) if matches!(e.kind(), AddrInUse | PermissionDenied)
+    )
+}
+
+/// Whether a session start failed while setting up the DHT (librqbit's context).
+fn is_dht_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let m = c.to_string();
+        m.starts_with("error initializing") && m.contains("DHT")
+    })
+}
+
+/// Whether a session start failed because a port can't be bound. librqbit wraps
 /// the socket error in `librqbit_dualstack_sockets::Error::Bind`, whose io::Error is not
-/// exposed as a `source()`, so both forms are looked for along the chain.
+/// exposed as a `source()` (and the DHT boxes that error in its own `Error::Bind`), so
+/// every form is looked for along the chain.
 fn is_port_unavailable(e: &anyhow::Error) -> bool {
     use std::io::ErrorKind::{AddrInUse, PermissionDenied};
+    fn bind_io(e: &librqbit_dualstack_sockets::Error) -> Option<&std::io::Error> {
+        match e {
+            librqbit_dualstack_sockets::Error::Bind(io) => Some(io),
+            _ => None,
+        }
+    }
     e.chain().any(|cause| {
-        let io = cause.downcast_ref::<std::io::Error>().or_else(|| {
-            match cause.downcast_ref::<librqbit_dualstack_sockets::Error>() {
-                Some(librqbit_dualstack_sockets::Error::Bind(io)) => Some(io),
+        let io = cause
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<librqbit_dualstack_sockets::Error>()
+                    .and_then(bind_io)
+            })
+            .or_else(|| match cause.downcast_ref::<librqbit::dht::Error>() {
+                Some(librqbit::dht::Error::Bind(b)) => bind_io(b),
                 _ => None,
-            }
-        });
+            });
         io.is_some_and(|io| matches!(io.kind(), AddrInUse | PermissionDenied))
     })
 }
@@ -987,7 +1369,7 @@ impl Engine for TorrentEngine {
         match req.source {
             Source::TorrentFile { path } => {
                 let bytes = source::read_torrent_file(&path).await?;
-                self.add_torrent_file(id, bytes, target, StoredCopy::Write, &opts)
+                self.add_torrent_file(id, bytes, target, StoredCopy::Write, &opts, Vec::new())
                     .await
             }
             Source::Magnet { uri } => self.add_magnet(id, uri, target, &opts),
@@ -1030,12 +1412,21 @@ impl Engine for TorrentEngine {
         // A task that finished meanwhile installed its torrent (paused) itself; it only
         // hands one back if the download was removed or superseded meanwhile: drop that
         // torrent from librqbit, keeping any files.
-        if let Ok(Some(h)) = task.await {
-            let _ = self
-                .shared
-                .session
-                .delete(TorrentIdOrHash::Id(h.id()), false)
-                .await;
+        match task.await {
+            Ok(Some(h)) => {
+                let _ = self
+                    .shared
+                    .live()?
+                    .delete(TorrentIdOrHash::Id(h.id()), false)
+                    .await;
+            }
+            // Aborted: it may have added the torrent to librqbit just before.
+            _ => {
+                let hash = self.shared.lock().get(&id).map(|e| e.info_hash.clone());
+                if let Some(hash) = hash {
+                    self.shared.settle_slipped(id, &hash).await;
+                }
+            }
         }
         // The abort may have interrupted the task's own pause of an installed torrent.
         let installed = match self.shared.lock().get(&id).map(|e| &e.slot) {
@@ -1064,7 +1455,14 @@ impl Engine for TorrentEngine {
                 Slot::Resolving { .. } => return Ok(()),
                 Slot::Held | Slot::PendingFailed { .. } => {
                     let uri = e.magnet.clone().expect("only magnets wait for metadata");
-                    let opts = self.shared.add_options(&e.layout, false, e.limit)?;
+                    let trackers = source::parse_magnet(&uri)?.trackers;
+                    let opts = self.shared.add_options(
+                        &e.layout,
+                        false,
+                        e.limit,
+                        e.overwrite,
+                        trackers,
+                    )?;
                     e.slot = self
                         .shared
                         .spawn_resolve(id, uri, opts, e.limit_cell.clone());
@@ -1084,54 +1482,51 @@ impl Engine for TorrentEngine {
         if st.finished || !stopped {
             return Ok(());
         }
-        self.shared.session.unpause(&h).await.map_err(lib_error)
+        self.shared.live()?.unpause(&h).await.map_err(lib_error)
     }
 
     /// Removes the torrent from librqbit (deleting only its own files if asked: a
     /// multi-file torrent's or magnet's folder, a single-file torrent's file) and its
     /// stored `.torrent` copy. A magnet still fetching its metadata is cancelled.
     async fn remove(&self, id: DownloadId, delete_files: bool) -> Result<(), EngineError> {
-        let _ops = self.shared.ops.lock().await;
-        let e = {
-            let mut map = self.shared.lock();
-            match map.get(&id) {
-                Some(e) if !matches!(e.slot, Slot::Adding) => map.remove(&id),
-                _ => None,
-            }
-        }
-        .ok_or(EngineError::NotFound(id))?;
-        let handle = match e.slot {
-            Slot::Managed(h) => Some(h),
-            Slot::Resolving { task, .. } => {
-                task.abort();
-                task.await.ok().flatten()
-            }
-            Slot::Attention(_) if delete_files => {
+        self.remove_inner(id, delete_files, false).await
+    }
+
+    /// Like `remove(id, false)`, but the stored `.torrent` copy is kept: it lists the
+    /// files [`Engine::delete_completed`] deletes.
+    async fn drop_completed(&self, id: DownloadId) -> Result<(), EngineError> {
+        self.remove_inner(id, false, true).await
+    }
+
+    /// Deletes exactly the files the stored `.torrent` copy lists, where they were put
+    /// (`path` as recorded), then the folders they were in once empty (a torrent's own
+    /// folder included, the download dir never). Without the copy, nothing is deleted.
+    async fn delete_completed(&self, id: DownloadId, path: &Path) -> Result<(), EngineError> {
+        let stored = self.shared.stored_torrent(id);
+        let bytes = match source::read_torrent_file(&stored).await {
+            Ok(b) => b,
+            Err(e) => {
                 tracing::warn!(
                     id,
-                    path = %e.layout.path.display(),
-                    "removed without its .torrent: its files are left on disk"
+                    path = %path.display(),
+                    "cannot tell the torrent's files ({e}): they are left on disk"
                 );
-                None
+                return Ok(());
             }
-            Slot::Held | Slot::PendingFailed { .. } | Slot::Attention(_) | Slot::Adding => None,
         };
-        let deleted = match handle {
-            Some(h) => {
-                self.shared
-                    .delete_managed(&h, &e.layout, delete_files)
-                    .await
-            }
-            None => Ok(()),
+        let info = source::parse_torrent(&bytes)?;
+        let Some((output, keep)) = source::completed_folders(path, &info) else {
+            return Ok(());
         };
-        // The download is gone either way: drop its stored copy before reporting.
-        match std::fs::remove_file(self.shared.stored_torrent(id)) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                tracing::warn!(id, "removing the stored .torrent copy: {err}");
-            }
-            _ => {}
-        }
-        deleted
+        tokio::task::spawn_blocking(move || source::delete_listed(&output, &info.files, &keep))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
+    /// Deletes the stored `.torrent` copy.
+    async fn forget(&self, id: DownloadId) {
+        self.shared.forget(id);
     }
 
     fn status(&self, id: DownloadId) -> Option<DownloadStatus> {
@@ -1243,18 +1638,14 @@ impl Engine for TorrentEngine {
         }
     }
 
+    /// Kept for the session if it has not started yet.
     fn set_global_download_budget(&self, bps: Option<u64>) {
-        self.shared
-            .session
-            .ratelimits
-            .set_download_bps(bps_limit(bps));
+        self.shared.set_limit(|l| l.0 = bps);
     }
 
+    /// Kept for the session if it has not started yet.
     fn set_global_upload_budget(&self, bps: Option<u64>) {
-        self.shared
-            .session
-            .ratelimits
-            .set_upload_bps(bps_limit(bps));
+        self.shared.set_limit(|l| l.1 = bps);
     }
 
     fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
@@ -1272,10 +1663,36 @@ mod tests {
             default_dir: dir.to_owned(),
             listen_addr,
             dht_state: None,
+            dht_port: None,
+            dht_bootstrap: Some(Vec::new()),
+            dht_dump_interval: None,
             trackers: false,
             lsd: false,
             upnp: false,
+            probe_port: true,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_listen_port_is_seen_by_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let busy_addr = busy.local_addr().unwrap();
+
+        let mut attempts = Vec::new();
+        let (session, _) = local_plan(dir.path(), busy_addr)
+            .start_recording_attempts(&CancellationToken::new(), &mut attempts)
+            .await
+            .expect("an OS-assigned port is used");
+        let got = session.listen_addr().unwrap();
+        assert!(got.ip().is_loopback());
+        assert_ne!(got.port(), busy_addr.port());
+        assert_eq!(
+            attempts.len(),
+            1,
+            "librqbit was not asked to bind the busy port"
+        );
+        session.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1284,9 +1701,14 @@ mod tests {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let busy_addr = busy.local_addr().unwrap();
 
+        // Without the probe, librqbit's own bind error makes it fall back.
         let mut attempts = Vec::new();
-        let (session, cancel) = local_plan(dir.path(), busy_addr)
-            .start_recording_attempts(&mut attempts)
+        let plan = SessionPlan {
+            probe_port: false,
+            ..local_plan(dir.path(), busy_addr)
+        };
+        let (session, cancel) = plan
+            .start_recording_attempts(&CancellationToken::new(), &mut attempts)
             .await
             .expect("falls back to an OS-assigned port");
         let got = session.listen_addr().unwrap();
@@ -1334,7 +1756,7 @@ mod tests {
 
         let mut attempts = Vec::new();
         let err = plan
-            .start_recording_attempts(&mut attempts)
+            .start_recording_attempts(&CancellationToken::new(), &mut attempts)
             .await
             .err()
             .expect("start fails");
@@ -1391,5 +1813,191 @@ mod tests {
         assert!(!is_port_unavailable(&anyhow::anyhow!(
             "error initializing DHT"
         )));
+        let dht = anyhow::Error::from(librqbit::dht::Error::Bind(Box::new(
+            librqbit_dualstack_sockets::Error::Bind(Error::from(ErrorKind::AddrInUse)),
+        )))
+        .context("error initializing persistent DHT");
+        assert!(is_port_unavailable(&dht));
+        assert!(is_dht_error(&dht));
+        assert!(!is_dht_error(&wrapped(ErrorKind::AddrInUse)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_stored_dht_port_falls_back_to_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("torrent/dht.json");
+        let plan = SessionPlan {
+            dht_state: Some(state.clone()),
+            dht_dump_interval: Some(Duration::from_millis(100)),
+            ..local_plan(dir.path(), (Ipv4Addr::LOCALHOST, 0).into())
+        };
+        let (first, _) = plan
+            .start_recording_attempts(&CancellationToken::new(), &mut Vec::new())
+            .await
+            .expect("starts");
+        let port = first.get_dht().expect("DHT on").listen_addr().port();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.exists() {
+            assert!(Instant::now() < deadline, "DHT state never saved");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        first.stop().await;
+        // Someone else takes the stored DHT port meanwhile.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _busy = loop {
+            match std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "port {port} never released: {e}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        let mut attempts = Vec::new();
+        let (second, _) = plan
+            .start_recording_attempts(&CancellationToken::new(), &mut attempts)
+            .await
+            .expect("falls back to a fresh DHT port");
+        assert_ne!(second.get_dht().unwrap().listen_addr().port(), port);
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].is_cancelled(), "failed attempt left running");
+        second.stop().await;
+    }
+
+    fn test_options(dir: &Path) -> TorrentEngineOptions {
+        TorrentEngineOptions {
+            dht: false,
+            upnp: false,
+            lsd: false,
+            listen_port: 0,
+            seed_ratio: 0.0,
+            data_dir: dir.join("data"),
+            default_dir: dir.join("downloads"),
+            test_mode: true,
+            test_initial_peers: Vec::new(),
+        }
+    }
+
+    /// A single-file torrent `x.bin` of 1000 bytes (piece hashes all zero).
+    fn crafted_torrent() -> Vec<u8> {
+        let mut out =
+            b"d4:infod6:lengthi1000e4:name5:x.bin12:piece lengthi16384e6:pieces20:".to_vec();
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    fn held_entry(info_hash: &str, dir: &Path) -> Entry {
+        Entry {
+            info_hash: info_hash.into(),
+            name: "x".into(),
+            layout: Layout::restored(dir, false),
+            magnet: Some(format!("magnet:?xt=urn:btih:{info_hash}")),
+            overwrite: false,
+            limit: None,
+            limit_cell: Arc::new(AtomicU64::new(0)),
+            detail: None,
+            uploaded: 0,
+            slot: Slot::Held,
+            last_state: None,
+            completed_sent: false,
+            run_wanted: false,
+        }
+    }
+
+    /// The seam behind pause/remove of a magnet whose fetch was aborted right after it
+    /// added the torrent to librqbit (an end-to-end race test is not deterministic).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn torrents_slipped_in_after_an_aborted_fetch_are_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let engine = TorrentEngine::new(test_options(dir.path())).await.unwrap();
+        let shared = &engine.shared;
+        let session = shared.session().await.unwrap().clone();
+        let bytes = crafted_torrent();
+        let hash = source::parse_torrent(&bytes).unwrap().info_hash;
+        let lookup = || session.get(TorrentIdOrHash::Hash(Id20::from_str(&hash).unwrap()));
+        let h = session
+            .add_torrent(
+                AddTorrent::from_bytes(bytes.clone()),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    output_folder: Some(out.to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+
+        // Paused while fetching (`Held`): adopted, with its metadata kept.
+        shared.lock().insert(1, held_entry(&hash, &out));
+        shared.settle_slipped(1, &hash).await;
+        assert!(matches!(&shared.lock()[&1].slot, Slot::Managed(x) if Arc::ptr_eq(x, &h)));
+        assert_eq!(std::fs::read(shared.stored_torrent(1)).unwrap(), bytes);
+
+        // Another download owns it: left alone.
+        shared.settle_slipped(2, &hash).await;
+        assert!(lookup().is_some(), "another download's torrent was dropped");
+
+        // Removed meanwhile: dropped from librqbit, its files kept.
+        shared.lock().remove(&1);
+        shared.settle_slipped(1, &hash).await;
+        assert!(lookup().is_none(), "left in librqbit");
+        assert!(out.join("x.bin").exists(), "its files were deleted");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_start_failure_is_transient_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TorrentEngine::new(test_options(dir.path())).await.unwrap();
+        assert!(!engine.session_started(), "started before any torrent");
+        assert!(engine.listen_addr().is_none());
+        // The engine's dir cannot be created: a file is in the way.
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("data/torrent"), b"x").unwrap();
+
+        let err = engine.start_session().await.unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Unavailable(m) if m == UNAVAILABLE),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
+        let uri = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+        let req = AddRequest {
+            source: Source::Magnet { uri },
+            output_dir: Some(dir.path().join("out")),
+            filename: None,
+            context: Default::default(),
+        };
+        engine
+            .add(1, req, StartMode::Fresh, AddOptions::default())
+            .await
+            .expect("a magnet is registered at once");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = engine.status(1).unwrap().state;
+            if st
+                == (DownloadState::Failed {
+                    reason: UNAVAILABLE.into(),
+                    transient: true,
+                })
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{st:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Fixed: the next attempt starts the session.
+        std::fs::remove_file(dir.path().join("data/torrent")).unwrap();
+        engine.resume(1).await.unwrap();
+        engine.start_session().await.expect("starts now");
+        assert!(engine.session_started());
+        assert!(engine.listen_addr().is_some());
+        engine.shutdown().await;
     }
 }

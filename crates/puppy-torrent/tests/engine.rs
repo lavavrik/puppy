@@ -36,6 +36,7 @@ impl Env {
         let engine = TorrentEngine::new(TorrentEngineOptions {
             dht: false,
             upnp: false,
+            lsd: false,
             listen_port: 0,
             seed_ratio,
             data_dir: dir.path().join("data"),
@@ -743,4 +744,95 @@ async fn unsafe_file_names_are_refused_on_every_os() {
         assert!(!env.stored(id).exists());
     }
     assert!(!env.dir.path().join("C:evil").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_adds_never_overwrite_existing_files() {
+    let single = Seeder::start(&[("one.iso", 100 * KIB)]).await;
+    let multi = Seeder::start(MULTI).await;
+    let env = Env::new(vec![single.addr, multi.addr]).await;
+    std::fs::create_dir_all(env.out().join(MULTI_NAME).join("sub")).unwrap();
+    let user = |p: &Path| std::fs::write(p, b"the user's own data").unwrap();
+    user(&env.out().join("one.iso"));
+    user(&env.out().join(MULTI_NAME).join("a.bin"));
+    user(&env.out().join(MULTI_NAME).join("sub/b.bin"));
+    // A magnet's folder name taken by a user's file.
+    let hash = &multi.info_hash_hex;
+    user(&env.out().join(hash));
+
+    // Single-file: its own fresh folder, since `out/one.iso` is taken.
+    let added = env.add(1, env.torrent_req(&single)).await.unwrap();
+    assert_eq!(added.path, env.out().join("one.iso (1)").join("one.iso"));
+    // Multi-file: a fresh folder next to the existing one.
+    let added = env.add(2, env.torrent_req(&multi)).await.unwrap();
+    assert_eq!(added.path, env.out().join(format!("{MULTI_NAME} (1)")));
+    env.wait_state(1, DownloadState::Completed).await;
+    env.wait_state(2, DownloadState::Completed).await;
+    assert_files(&env.out().join("one.iso (1)"), &[("one.iso", 100 * KIB)]);
+    assert_files(&env.out().join(format!("{MULTI_NAME} (1)")), MULTI);
+    env.engine.remove(2, true).await.unwrap();
+
+    let added = env
+        .add(
+            3,
+            env.req(Source::Magnet {
+                uri: multi.magnet.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.path, env.out().join(format!("{hash} (1)")));
+    env.wait_state(3, DownloadState::Completed).await;
+    assert_files(&env.out().join(format!("{hash} (1)")), MULTI);
+
+    for p in [
+        env.out().join("one.iso"),
+        env.out().join(MULTI_NAME).join("a.bin"),
+        env.out().join(MULTI_NAME).join("sub/b.bin"),
+        env.out().join(hash),
+    ] {
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"the user's own data",
+            "{} was touched",
+            p.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_torrent_files_are_deleted_from_the_stored_copy() {
+    let seeder = Seeder::start(MULTI).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    std::fs::create_dir_all(env.out()).unwrap();
+    std::fs::write(env.out().join("keep.txt"), b"mine").unwrap();
+    let added = env.add(1, env.torrent_req(&seeder)).await.unwrap();
+    env.wait_state(1, DownloadState::Completed).await;
+
+    // Dropped like the daemon drops completed downloads: the copy stays.
+    env.engine.drop_completed(1).await.unwrap();
+    assert!(env.engine.status(1).is_none());
+    assert!(
+        env.stored(1).exists(),
+        "the copy is needed to delete the files later"
+    );
+    assert_files(&added.path, MULTI);
+
+    env.engine.delete_completed(1, &added.path).await.unwrap();
+    assert!(
+        !added.path.exists(),
+        "the torrent's files and folder are gone"
+    );
+    assert!(env.out().join("keep.txt").exists());
+    env.engine.forget(1).await;
+    assert!(!env.stored(1).exists());
+
+    // Without the copy nothing is deleted.
+    let env2 = Env::new(vec![seeder.addr]).await;
+    let added = env2.add(2, env2.torrent_req(&seeder)).await.unwrap();
+    env2.wait_state(2, DownloadState::Completed).await;
+    env2.engine.drop_completed(2).await.unwrap();
+    env2.engine.forget(2).await;
+    env2.engine.delete_completed(2, &added.path).await.unwrap();
+    assert_files(&added.path, MULTI);
 }

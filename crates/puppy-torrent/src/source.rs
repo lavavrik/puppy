@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use librqbit::{Magnet, ValidatedTorrentMetaV1Info, torrent_from_bytes};
 use puppy_core::engine::EngineError;
-use puppy_core::fsutil::{is_reserved_windows_name, sanitize_filename};
+use puppy_core::fsutil::{is_reserved_windows_name, sanitize_filename, unique_dir_path};
 
 /// Largest `.torrent` file accepted (real ones are well under 1 MiB).
 pub(crate) const MAX_TORRENT_FILE: u64 = 16 * 1024 * 1024;
@@ -17,6 +17,8 @@ pub(crate) struct MagnetInfo {
     pub info_hash: String,
     /// The `dn` (display name) parameter, if any.
     pub name: Option<String>,
+    /// The `tr` (tracker) parameters.
+    pub trackers: Vec<String>,
 }
 
 impl MagnetInfo {
@@ -48,6 +50,7 @@ pub(crate) fn parse_magnet(uri: &str) -> Result<MagnetInfo, EngineError> {
     Ok(MagnetInfo {
         info_hash: hash.as_string(),
         name: magnet.name.filter(|n| !n.trim().is_empty()),
+        trackers: magnet.trackers,
     })
 }
 
@@ -63,6 +66,9 @@ pub(crate) struct TorrentInfo {
     /// it, directly in the output dir. `None`: the files go in a folder named after the
     /// torrent.
     pub single_file: Option<PathBuf>,
+    /// Every (non-padding) file's path relative to the folder librqbit writes the
+    /// torrent into (its output folder).
+    pub files: Vec<PathBuf>,
 }
 
 /// Parses and validates `.torrent` bytes (as librqbit will when adding them).
@@ -81,6 +87,11 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
                 .map(|f| f.filename.to_pathbuf())
         })
         .flatten();
+    let files = info
+        .iter_file_details()
+        .filter(|f| !f.attrs().padding)
+        .map(|f| f.filename.to_pathbuf())
+        .collect();
     let name = info
         .name()
         .map(|n| n.into_owned())
@@ -90,6 +101,7 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
         name,
         total_bytes: info.lengths().total_length(),
         single_file,
+        files,
     })
 }
 
@@ -97,7 +109,8 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
 /// `validate()` checks (`..`, separators, empty names): every component of every file
 /// path must be one plain name with no `:` (Windows drive prefix such as `C:evil`, which
 /// replaces the base dir when joined; NTFS alternate data streams), no control
-/// characters, and no Windows device name (`con.txt`, `NUL`, `COM1`...). Applied on every
+/// characters, no trailing dot or space (Windows drops them, so `a.` would be `a`), and
+/// no Windows device name (`con.txt`, `NUL`, `CONIN$`, `COM1`, `COM¹`...). Applied on every
 /// platform, so a torrent behaves the same everywhere.
 pub(crate) fn validate_layout<B: AsRef<[u8]>>(
     info: &ValidatedTorrentMetaV1Info<B>,
@@ -129,6 +142,9 @@ fn unsafe_component(c: &str) -> Option<&'static str> {
     }
     if c.chars().any(char::is_control) {
         return Some("control character");
+    }
+    if c.ends_with(['.', ' ']) {
+        return Some("trailing dot or space");
     }
     if is_reserved_windows_name(c) {
         return Some("reserved Windows device name");
@@ -164,9 +180,11 @@ pub(crate) async fn read_torrent_file(path: &Path) -> Result<Vec<u8>, EngineErro
 
 /// Where a torrent's files go.
 ///
-/// Folders are named after the torrent (or magnet `dn`/hash) only, so two different
-/// torrents with the same name in the same output dir share a folder (and a file with the
-/// same path inside it would be overwritten: librqbit adds with `overwrite`).
+/// A fresh add never goes where something already is (see [`Layout::fresh_torrent`]):
+/// a taken folder name gets a counter (`name (1)`), and a single file whose name is
+/// taken goes into a fresh folder of its own. librqbit is told not to overwrite for
+/// fresh adds either; only restored torrents (whose files are ours) may write over
+/// existing files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Layout {
     /// Passed to librqbit as `output_folder`: it writes the torrent's files (their paths
@@ -174,7 +192,8 @@ pub(crate) struct Layout {
     pub output_folder: PathBuf,
     /// Shown as the download's path: the file (single-file) or the folder.
     pub path: PathBuf,
-    /// `output_folder` is the shared download dir, holding only one file of ours.
+    /// `output_folder` is the shared download dir, holding only one file of ours (it is
+    /// never removed). Otherwise the output folder is the torrent's own.
     pub single_file: bool,
 }
 
@@ -188,10 +207,46 @@ impl Layout {
         }
     }
 
-    /// Anything else (multi-file, or a magnet whose layout is unknown) goes into
-    /// `base/<folder>`.
-    pub fn folder(base: &Path, folder: &str) -> Self {
-        let dir = base.join(folder);
+    /// A single file in a fresh folder of its own, `base/<folder>/<file>` (its name
+    /// was taken in `base`).
+    fn single_in_folder(dir: PathBuf, file: &Path) -> Self {
+        Layout {
+            path: dir.join(file),
+            output_folder: dir,
+            single_file: false,
+        }
+    }
+
+    /// Where a new download of `t` goes in `base`, never where something is already:
+    /// a single file directly in `base` unless its name is taken there (then in a fresh
+    /// folder `base/<name> (n)/`); anything else in a fresh folder named after the
+    /// torrent (`<name>`, else `<name> (1)`...). `taken` adds paths claimed by other
+    /// downloads.
+    pub fn fresh_torrent(base: &Path, t: &TorrentInfo, taken: impl Fn(&Path) -> bool) -> Self {
+        let name = sanitize_filename(&t.name);
+        match &t.single_file {
+            Some(file) => {
+                let plain = base.join(file);
+                if std::fs::symlink_metadata(&plain).is_err() && !taken(&plain) {
+                    Self::single(base, file)
+                } else {
+                    Self::single_in_folder(unique_dir_path(base, &name, taken), file)
+                }
+            }
+            None => {
+                let dir = unique_dir_path(base, &name, taken);
+                Layout {
+                    output_folder: dir.clone(),
+                    path: dir,
+                    single_file: false,
+                }
+            }
+        }
+    }
+
+    /// Where a new magnet goes in `base`: a fresh folder (see [`Layout::fresh_torrent`]).
+    pub fn fresh_magnet(base: &Path, m: &MagnetInfo, taken: impl Fn(&Path) -> bool) -> Self {
+        let dir = unique_dir_path(base, &m.folder_name(), taken);
         Layout {
             output_folder: dir.clone(),
             path: dir,
@@ -199,30 +254,103 @@ impl Layout {
         }
     }
 
-    pub fn for_torrent(base: &Path, t: &TorrentInfo) -> Self {
-        match &t.single_file {
-            Some(file) => Self::single(base, file),
-            None => Self::folder(base, &sanitize_filename(&t.name)),
-        }
-    }
-
-    pub fn for_magnet(base: &Path, m: &MagnetInfo) -> Self {
-        Self::folder(base, &m.folder_name())
-    }
-
     /// The layout of a torrent restored from `path` (what [`Layout::path`] was when it
     /// was added), so its files land where they were: a single file's output folder is
     /// its parent; otherwise the folder is `path` itself.
     pub fn restored(path: &Path, single_file: bool) -> Self {
-        Layout {
-            output_folder: match path.parent() {
-                Some(parent) if single_file => parent.to_owned(),
-                _ => path.to_owned(),
+        match path.parent() {
+            Some(parent) if single_file => Layout {
+                output_folder: parent.to_owned(),
+                path: path.to_owned(),
+                single_file: !in_own_folder(path),
             },
-            path: path.to_owned(),
-            single_file,
+            _ => Layout {
+                output_folder: path.to_owned(),
+                path: path.to_owned(),
+                single_file: false,
+            },
         }
     }
+}
+
+/// Whether a single file at `path` sits in a folder of its own made by
+/// [`Layout::fresh_torrent`]: `<dir>/<file> (n)/<file>`.
+fn in_own_folder(path: &Path) -> bool {
+    let (Some(file), Some(folder)) = (
+        path.file_name().and_then(|f| f.to_str()),
+        path.parent()
+            .and_then(Path::file_name)
+            .and_then(|f| f.to_str()),
+    ) else {
+        return false;
+    };
+    folder
+        .strip_prefix(&sanitize_filename(file))
+        .and_then(|rest| rest.strip_prefix(" ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Where a completed torrent recorded at `path` has its files: `(output folder, the
+/// folder above it that is never removed)`. A single file directly in the download dir
+/// (`path` is the file): `(its dir, its dir)`; in a folder of its own: `(that folder,
+/// the dir above)`; anything else (`path` is the torrent's folder, also a magnet's
+/// single file): `(path, its parent)`.
+pub(crate) fn completed_folders(path: &Path, t: &TorrentInfo) -> Option<(PathBuf, PathBuf)> {
+    let parent = path.parent()?.to_owned();
+    if t.single_file.is_some() && !path.is_dir() {
+        if in_own_folder(path) {
+            let above = parent.parent()?.to_owned();
+            return Some((parent, above));
+        }
+        return Some((parent.clone(), parent));
+    }
+    Some((path.to_owned(), parent))
+}
+
+/// Deletes exactly `files` (relative to `output_folder`), then every folder they were
+/// in that is now empty, up to `output_folder` itself unless it is `keep`. Never
+/// deletes a directory that still holds anything, nor follows a symlinked folder. Goes
+/// on past errors and returns the first.
+pub(crate) fn delete_listed(
+    output_folder: &Path,
+    files: &[PathBuf],
+    keep: &Path,
+) -> std::io::Result<()> {
+    use std::collections::BTreeSet;
+    let mut first_err = None;
+    let mut dirs = BTreeSet::new();
+    for rel in files {
+        let path = output_folder.join(rel);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_dir() => {
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), "cannot delete: {e}");
+                    first_err.get_or_insert(e);
+                }
+            }
+            Ok(_) => tracing::warn!(path = %path.display(), "not deleting a directory"),
+            Err(_) => {}
+        }
+        let mut dir = rel.parent();
+        while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
+            dirs.insert(d.to_owned());
+            dir = d.parent();
+        }
+    }
+    // Deepest first.
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        // Only removes an empty directory (and not a symlink to one).
+        let _ = std::fs::remove_dir(output_folder.join(d));
+    }
+    if output_folder != keep {
+        let _ = std::fs::remove_dir(output_folder);
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -289,8 +417,26 @@ mod tests {
     #[test]
     fn unsafe_components() {
         for bad in [
-            "C:evil", "a:b", "con.txt", "CON", "nul", "com1.log", "LPT9", "a\u{1}b", "", ".", "..",
-            "a/b", "a\\b",
+            "C:evil",
+            "a:b",
+            "con.txt",
+            "CON",
+            "nul",
+            "com1.log",
+            "LPT9",
+            "a\u{1}b",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "trailing.",
+            "trailing ",
+            "CONIN$",
+            "conout$.txt",
+            "COM\u{b9}",
+            "lpt\u{b2}.bin",
+            "LPT\u{b3}",
         ] {
             assert!(unsafe_component(bad).is_some(), "{bad:?} accepted");
         }
@@ -306,27 +452,121 @@ mod tests {
         }
     }
 
+    fn info(name: &str, single: bool) -> TorrentInfo {
+        TorrentInfo {
+            info_hash: HASH.into(),
+            name: name.into(),
+            total_bytes: 1,
+            single_file: single.then(|| PathBuf::from(name)),
+            files: if single {
+                vec![PathBuf::from(name)]
+            } else {
+                vec![PathBuf::from("a.bin"), PathBuf::from("sub/b.bin")]
+            },
+        }
+    }
+
     #[test]
-    fn layouts() {
-        let base = Path::new("/dl");
-        let single = Layout::single(base, Path::new("a.iso"));
-        assert_eq!(single.output_folder, base);
-        assert_eq!(single.path, base.join("a.iso"));
-        assert!(single.single_file);
-        let multi = Layout::folder(base, "bundle");
+    fn fresh_layouts_avoid_existing_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let none = |_: &Path| false;
+        let single = Layout::fresh_torrent(base, &info("a.iso", true), none);
+        assert_eq!(single, Layout::single(base, Path::new("a.iso")));
+        let multi = Layout::fresh_torrent(base, &info("bundle", false), none);
         assert!(!multi.single_file);
         assert_eq!(multi.output_folder, base.join("bundle"));
         assert_eq!(multi.path, base.join("bundle"));
         let m = parse_magnet(&format!("magnet:?xt=urn:btih:{HASH}")).unwrap();
-        assert_eq!(Layout::for_magnet(base, &m).output_folder, base.join(HASH));
+        assert_eq!(Layout::fresh_magnet(base, &m, none).path, base.join(HASH));
+
+        std::fs::write(base.join("a.iso"), b"user").unwrap();
+        std::fs::create_dir(base.join("bundle")).unwrap();
+        std::fs::create_dir(base.join(HASH)).unwrap();
+        let single = Layout::fresh_torrent(base, &info("a.iso", true), none);
+        assert_eq!(single.output_folder, base.join("a.iso (1)"));
+        assert_eq!(single.path, base.join("a.iso (1)/a.iso"));
+        assert!(!single.single_file, "its own folder");
+        let multi = Layout::fresh_torrent(base, &info("bundle", false), none);
+        assert_eq!(multi.path, base.join("bundle (1)"));
+        // Claimed by another download.
+        let claimed = base.join("bundle (1)");
+        let multi = Layout::fresh_torrent(base, &info("bundle", false), |p| p == claimed);
+        assert_eq!(multi.path, base.join("bundle (2)"));
+        assert_eq!(
+            Layout::fresh_magnet(base, &m, none).path,
+            base.join(format!("{HASH} (1)"))
+        );
     }
 
     #[test]
     fn restored_layouts_match_the_original() {
-        let base = Path::new("/dl");
-        let single = Layout::single(base, Path::new("a.iso"));
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let none = |_: &Path| false;
+        let single = Layout::fresh_torrent(base, &info("a.iso", true), none);
         assert_eq!(Layout::restored(&single.path, true), single);
-        let multi = Layout::folder(base, "bundle");
+        let multi = Layout::fresh_torrent(base, &info("bundle", false), none);
         assert_eq!(Layout::restored(&multi.path, false), multi);
+        std::fs::write(base.join("a.iso"), b"user").unwrap();
+        let own = Layout::fresh_torrent(base, &info("a.iso", true), none);
+        assert_eq!(Layout::restored(&own.path, true), own);
+    }
+
+    #[test]
+    fn delete_listed_removes_only_the_torrents_files() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("dl");
+        let folder = base.join("bundle");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::create_dir_all(folder.join("other")).unwrap();
+        std::fs::write(folder.join("a.bin"), b"a").unwrap();
+        std::fs::write(folder.join("sub/b.bin"), b"b").unwrap();
+        std::fs::write(base.join("keep.txt"), b"k").unwrap();
+        let t = info("bundle", false);
+        let (out, keep) = completed_folders(&folder, &t).unwrap();
+        assert_eq!((&out, &keep), (&folder, &base));
+        // Something of the user's in the torrent's folder keeps the folder.
+        std::fs::write(folder.join("other/x"), b"x").unwrap();
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert!(!folder.join("a.bin").exists());
+        assert!(!folder.join("sub").exists(), "empty sub-folder removed");
+        assert!(folder.join("other/x").exists());
+        std::fs::remove_file(folder.join("other/x")).unwrap();
+        delete_listed(&out, &t.files, &keep).expect("already gone is fine");
+        assert!(
+            folder.join("other").exists(),
+            "a folder not of the torrent stays"
+        );
+        assert!(base.join("keep.txt").exists());
+
+        // Single file directly in the download dir: the dir stays.
+        let t = info("a.iso", true);
+        std::fs::write(base.join("a.iso"), b"a").unwrap();
+        let (out, keep) = completed_folders(&base.join("a.iso"), &t).unwrap();
+        assert_eq!((&out, &keep), (&base, &base));
+        std::fs::remove_file(base.join("keep.txt")).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert!(!base.join("a.iso").exists());
+        assert!(base.is_dir(), "the download dir is kept even if empty");
+
+        // In a folder of its own: that folder goes too.
+        let own = base.join("a.iso (1)");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::write(own.join("a.iso"), b"a").unwrap();
+        let (out, keep) = completed_folders(&own.join("a.iso"), &t).unwrap();
+        assert_eq!((&out, &keep), (&own, &base));
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert!(!own.exists());
+        // A magnet's single file (path: its folder).
+        let mag = base.join(HASH);
+        std::fs::create_dir(&mag).unwrap();
+        std::fs::write(mag.join("a.iso"), b"a").unwrap();
+        let (out, keep) = completed_folders(&mag, &t).unwrap();
+        assert_eq!((&out, &keep), (&mag, &base));
+        delete_listed(&out, &t.files, &keep).unwrap();
+        assert!(!mag.exists());
+        assert!(base.is_dir());
     }
 }

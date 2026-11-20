@@ -214,6 +214,7 @@ async fn start_torrent_engine(
     let opts = TorrentEngineOptions {
         dht: t.dht,
         upnp: t.upnp,
+        lsd: t.lsd,
         listen_port: t.listen_port,
         seed_ratio: t.seed_ratio,
         data_dir: paths.data_dir.clone(),

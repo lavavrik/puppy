@@ -39,6 +39,8 @@ pub struct TorrentConfig {
     pub dht: bool,
     /// Map the listen port with UPnP.
     pub upnp: bool,
+    /// Find peers on the local network (local service discovery).
+    pub lsd: bool,
     /// Port to listen on for peers (an OS-assigned one if busy).
     pub listen_port: u16,
     /// Seed until this share ratio is reached. Reserved: only `0.0` (stop at
@@ -51,6 +53,7 @@ impl Default for TorrentConfig {
         Self {
             dht: true,
             upnp: false,
+            lsd: true,
             listen_port: 42069,
             seed_ratio: 0.0,
         }
@@ -180,7 +183,7 @@ mod tests {
         let p = d.path().join("c.toml");
         std::fs::write(&p, "max_active = 5\n").unwrap();
         let t = Config::load(&p).unwrap().torrent;
-        assert!(t.dht && !t.upnp);
+        assert!(t.dht && !t.upnp && t.lsd);
         assert_eq!(t.listen_port, 42069);
         assert_eq!(t.seed_ratio, 0.0);
         std::fs::write(&p, "[torrent]\ndht = false\nlisten_port = 51413\n").unwrap();
@@ -192,6 +195,8 @@ mod tests {
         let t = Config::load(&p).unwrap().torrent;
         assert!(t.dht && t.upnp);
         assert_eq!(t.seed_ratio, 1.5);
+        std::fs::write(&p, "[torrent]\nlsd = false\n").unwrap();
+        assert!(!Config::load(&p).unwrap().torrent.lsd);
     }
 
     #[test]

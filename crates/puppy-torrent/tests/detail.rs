@@ -28,6 +28,7 @@ impl Env {
         let engine = TorrentEngine::new(TorrentEngineOptions {
             dht: false,
             upnp: false,
+            lsd: false,
             listen_port: 0,
             seed_ratio: 0.0,
             data_dir: dir.path().join("data"),
@@ -174,8 +175,11 @@ async fn pending_torrents_have_no_detail() {
 async fn global_limits_apply_to_session() {
     let env = Env::new(Vec::new()).await;
     assert_eq!(env.engine.global_limits(), (None, None));
+    // Set before the session runs: applied when it starts.
     env.engine.set_global_download_budget(Some(500_000));
     env.engine.set_global_upload_budget(Some(40_000));
+    assert!(!env.engine.session_started());
+    env.engine.start_session().await.unwrap();
     assert_eq!(env.engine.global_limits(), (Some(500_000), Some(40_000)));
     // 0 and None are unlimited; too-large values clamp.
     env.engine.set_global_download_budget(Some(0));

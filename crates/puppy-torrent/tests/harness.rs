@@ -14,6 +14,7 @@ fn test_options(dir: &std::path::Path) -> TorrentEngineOptions {
     TorrentEngineOptions {
         dht: true, // ignored in test mode
         upnp: true,
+        lsd: true, // ignored in test mode
         listen_port: 42069,
         seed_ratio: 0.0,
         data_dir: dir.join("data"),
@@ -29,6 +30,12 @@ async fn engine_starts_and_stops_cleanly() {
     let engine = TorrentEngine::new(test_options(dir.path()))
         .await
         .expect("engine starts");
+    // Nothing is opened (or created) until a torrent needs the session.
+    assert!(!engine.session_started());
+    assert!(engine.listen_addr().is_none());
+    assert!(!dir.path().join("data/torrent").exists());
+    engine.start_session().await.expect("session starts");
+    assert!(engine.session_started());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

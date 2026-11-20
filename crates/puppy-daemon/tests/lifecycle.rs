@@ -584,27 +584,34 @@ async fn slow_restore_does_not_block_the_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn torrent_engine_failure_runs_without_torrents() {
+async fn torrent_engine_failure_fails_torrents_transiently() {
     let env = Env::new();
-    // The torrent engine cannot create its state dir: a regular file is in the way.
+    // The torrent session cannot create its state dir: a regular file is in the way.
     std::fs::write(env.paths().data_dir.join("torrent"), b"in the way").unwrap();
     let d = env.start(None).await;
     let mut c = env.client().await;
-    let r = c
-        .request(Request::Add {
-            request: AddRequest {
-                source: Source::Magnet {
-                    uri: format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)),
-                },
-                output_dir: Some(env.dl_dir()),
-                filename: None,
-                context: RequestContext::default(),
+    let magnet = c
+        .add(AddRequest {
+            source: Source::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)),
             },
-            start_paused: true,
-            limit: None,
+            output_dir: Some(env.dl_dir()),
+            filename: None,
+            context: RequestContext::default(),
         })
         .await;
-    assert!(matches!(r, Reply::Err { .. }), "magnet accepted: {r:?}");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match c.get(magnet).await.0 {
+            WireState::Failed { reason, transient } => {
+                assert_eq!(reason, "torrent engine unavailable (see daemon log)");
+                assert!(transient, "retried automatically");
+                break;
+            }
+            other => assert!(Instant::now() < deadline, "magnet never failed: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     // HTTP downloads still work.
     let s = server(|_| {}).await;
     let id = c
