@@ -795,8 +795,16 @@ async fn restore_after_kill_mid_steal() {
                 assert!(Instant::now() < deadline, "no steal: {segments:?}");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // Let a periodic flush record the split.
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Wait for a periodic flush to record the split.
+            loop {
+                if let Ok(st) = HttpResumeState::load(&added.path).await
+                    && st.segments.len() > 4
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "split never flushed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let EngineDetail::Http { segments, .. } = dl.detail() else {
                 unreachable!()
             };
