@@ -20,8 +20,13 @@ use crate::widgets::{ConnectionBars, PieceMap, SegmentStrip};
 
 /// Speed samples (one per second) shown in the sparkline.
 const SPARK_SAMPLES: usize = 60;
-/// The sparkline's heading.
-pub const SPEED_HEADING: &str = "speed · last 60 s";
+/// The sparkline's heading for `n` samples (one per second) actually drawn.
+pub fn speed_heading(n: usize) -> String {
+    match n {
+        0 => "speed".into(),
+        n => format!("speed · last {n} s"),
+    }
+}
 /// Rows the HTTP section needs at least (heading and segment strip): a placeholder
 /// reserves as many, so the pane does not jump when the detail arrives.
 const HTTP_MIN: u16 = 2;
@@ -434,7 +439,7 @@ fn field(t: &Theme, buf: &mut Buffer, x: u16, y: u16, w: u16, key: &str, value: 
     }
 }
 
-/// The [`SPEED_HEADING`] with the peak on the right, then `rows` of sparkline.
+/// The [`speed_heading`] with the peak on the right, then `rows` of sparkline.
 fn speed(app: &App, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, rows: u16) {
     let t = &app.theme;
     let Some(head) = c.line() else { return };
@@ -447,7 +452,7 @@ fn speed(app: &App, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, rows
         .copied();
     let peak = recent.clone().max().unwrap_or(0);
     let peak_text = format!("peak {}", format::speed(peak));
-    heading(t, buf, head, SPEED_HEADING, &peak_text);
+    heading(t, buf, head, &speed_heading(shown), &peak_text);
     let Some(r) = c.take(rows.min(c.left())) else {
         return;
     };

@@ -720,7 +720,25 @@ fn narrow_detail_keeps_engine_section() {
     let mut a = app(vec![active(1, "ubuntu.iso")]);
     a.detail = Some((1, http_detail()));
     let r = render(&mut a, 90, 30);
-    assert!(find(&r, "speed · last 60 s").is_some(), "{r:#?}");
+    assert!(find(&r, "speed").is_some(), "{r:#?}");
+}
+
+#[test]
+fn speed_heading_shows_the_samples_drawn() {
+    let mut a = app(vec![active(1, "ubuntu.iso")]);
+    a.detail = Some((1, http_detail()));
+    let mut h = puppy_tui::app::History::default();
+    let t0 = Instant::now();
+    for i in 0..12u64 {
+        let mut d = a.downloads.clone();
+        d[0].down_bps = (i + 1) * MIB;
+        let totals = Totals::default();
+        h.record(&d, &totals, t0 + std::time::Duration::from_secs(i));
+    }
+    a.history = h;
+    let r = render(&mut a, 90, 30);
+    assert!(find(&r, "speed · last 12 s").is_some(), "{r:#?}");
+    assert!(find(&r, "last 60 s").is_none(), "{r:#?}");
 }
 
 /// The fg of the first full-block bar cell on the list row of `name`.
@@ -1034,7 +1052,7 @@ fn detail_placeholder_reserves_the_http_height() {
         let before = render(&mut a, w, h);
         a.detail = Some((1, detail.clone()));
         let after = render(&mut a, w, h);
-        let head = |r: &[String]| find(r, "speed · last 60 s");
+        let head = |r: &[String]| find(r, "speed");
         if h >= 30 {
             assert!(head(&before).is_some(), "{w}×{h}: {before:#?}");
         }
