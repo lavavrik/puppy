@@ -138,7 +138,21 @@ impl SessionPlan {
     /// Starts the session on the planned port; if that port can't be bound (in use, or
     /// privileged), once more on an OS-assigned one. Any other error is returned as is.
     async fn start_with_fallback(&self) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
-        match self.start(self.listen_addr).await {
+        self.start_recording_attempts(&mut Vec::new()).await
+    }
+
+    /// [`Self::start_with_fallback`], pushing each attempt's cancellation token to
+    /// `attempts` (tests check failed attempts are cancelled).
+    async fn start_recording_attempts(
+        &self,
+        attempts: &mut Vec<CancellationToken>,
+    ) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
+        let mut attempt = |addr| {
+            let cancel = CancellationToken::new();
+            attempts.push(cancel.clone());
+            self.start(addr, cancel)
+        };
+        match attempt(self.listen_addr).await {
             Err(e) if self.listen_addr.port() != 0 && is_port_unavailable(&e) => {
                 tracing::warn!(
                     addr = %self.listen_addr,
@@ -146,7 +160,7 @@ impl SessionPlan {
                 );
                 let mut any_port = self.listen_addr;
                 any_port.set_port(0);
-                self.start(any_port).await
+                attempt(any_port).await
             }
             r => r,
         }
@@ -157,8 +171,8 @@ impl SessionPlan {
     async fn start(
         &self,
         listen_addr: SocketAddr,
+        cancel: CancellationToken,
     ) -> anyhow::Result<(Arc<Session>, CancellationToken)> {
-        let cancel = CancellationToken::new();
         let dht = self.dht_state.as_ref().map(|state| DhtSessionConfig {
             bootstrap_addrs: None,
             port: None,
@@ -286,13 +300,20 @@ mod tests {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let busy_addr = busy.local_addr().unwrap();
 
+        let mut attempts = Vec::new();
         let (session, cancel) = local_plan(dir.path(), busy_addr)
-            .start_with_fallback()
+            .start_recording_attempts(&mut attempts)
             .await
             .expect("falls back to an OS-assigned port");
         let got = session.listen_addr().unwrap();
         assert!(got.ip().is_loopback());
         assert_ne!(got.port(), busy_addr.port());
+
+        // The failed attempt was torn down; the winner's token is the one returned.
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].is_cancelled(), "failed attempt left running");
+        assert!(!attempts[1].is_cancelled());
+        assert!(!cancel.is_cancelled());
 
         // Nothing from the failed attempt holds the busy port once its owner lets go.
         drop(busy);
@@ -300,20 +321,51 @@ mod tests {
             TcpListener::bind(busy_addr).is_ok(),
             "{busy_addr} held by a leaked listener"
         );
-        cancel.cancel();
+
+        // Shutdown leaves no attempt running.
+        session.stop().await;
+        assert!(attempts.iter().all(|t| t.is_cancelled()));
+    }
+
+    /// A free loopback port (bound, then released).
+    fn free_port() -> SocketAddr {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn other_start_errors_are_not_retried() {
-        // An address no interface has: not "in use", so no silent fallback.
+    async fn other_start_errors_are_not_retried_and_torn_down() {
+        // The listener binds fine, then the DHT fails deterministically (its state file's
+        // parent is a regular file) before it touches the network: not a port problem.
         let dir = tempfile::tempdir().unwrap();
-        let addr: SocketAddr = "192.0.2.1:6881".parse().unwrap();
-        let err = local_plan(dir.path(), addr)
-            .start_with_fallback()
+        let not_a_dir = dir.path().join("file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let addr = free_port();
+        let plan = SessionPlan {
+            dht_state: Some(not_a_dir.join("dht.json")),
+            ..local_plan(dir.path(), addr)
+        };
+
+        let mut attempts = Vec::new();
+        let err = plan
+            .start_recording_attempts(&mut attempts)
             .await
             .err()
             .expect("start fails");
         assert!(!is_port_unavailable(&err), "{err:#}");
+        assert_eq!(attempts.len(), 1, "a non-port error is not retried");
+        assert!(attempts[0].is_cancelled(), "failed attempt left running");
+        // The attempt's listener is gone.
+        let rebound = (0..20).any(|_| {
+            let ok = TcpListener::bind(addr).is_ok();
+            if !ok {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            ok
+        });
+        assert!(rebound, "{addr} still held by the failed attempt");
     }
 
     #[test]
