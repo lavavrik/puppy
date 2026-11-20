@@ -357,7 +357,16 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
         initial_peers: std::env::var("PUPPY_TORRENT_TEST_PEERS")
             .unwrap_or_default()
             .split(',')
-            .filter_map(|a| a.trim().parse().ok())
+            .filter(|a| !a.trim().is_empty())
+            .filter_map(|a| {
+                let r = a.trim().parse().ok();
+                if r.is_none() {
+                    err(format_args!(
+                        "puppy: ignoring bad PUPPY_TORRENT_TEST_PEERS entry {a:?}"
+                    ));
+                }
+                r
+            })
             .collect(),
         ..TorrentTestOptions::default()
     });

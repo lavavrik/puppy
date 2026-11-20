@@ -1175,6 +1175,13 @@ async fn add_files_spec_and_files_listing() {
     assert!(err.contains("only applies to torrents"), "{err}");
     assert!(snapshots(&env, &["--json", "ls"]).is_empty());
 
+    // A number past the last file: the daemon refuses it up front; usage-class failure.
+    let (out, _) = run_code(&env, &["--json", "add", "--files", "9", &torrent], 2);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["failed"][0]["code"], 2, "{out}");
+    assert!(v["added"].as_array().unwrap().is_empty(), "{out}");
+    assert!(snapshots(&env, &["--json", "ls"]).is_empty());
+
     // A glob selects `sub/b.bin` only.
     let id = add_torrent(&env, &["-o", dl, "--files", "sub/*", &torrent]);
     run_code(&env, &["wait", &id], 0);

@@ -273,10 +273,19 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                 }
                 Err(e) => {
                     err(format_args!("puppy: {shown}: {e}"));
+                    // The daemon refused the request itself (e.g. `--files 9` past the
+                    // last file of a torrent): a usage problem, not a failed attempt.
+                    let code = match e {
+                        super::ClientError::Daemon {
+                            code: puppy_proto::ErrorCode::BadRequest,
+                            ..
+                        } => 2,
+                        _ => 1,
+                    };
                     failed.push(Failed {
                         source: shown,
                         error: e.to_string(),
-                        code: 1,
+                        code,
                     });
                 }
             }
@@ -289,7 +298,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
             "puppy: {} of {total} sources could not be added",
             failed.len()
         ));
-        code = 1;
+        code = failed.iter().map(|f| f.code).max().unwrap_or(1);
     }
     Ok(AddOutcome {
         added,

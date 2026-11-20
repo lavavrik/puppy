@@ -11,10 +11,11 @@ use std::time::Duration;
 /// `--seed-ratio` / `--ratio`: a number (`0` turns the ratio trigger off) or `default`
 /// (inherit the daemon's `seed_ratio`).
 pub fn parse_ratio(s: &str) -> Result<Option<f32>, CliError> {
+    let s = s.trim();
     if s.eq_ignore_ascii_case("default") {
         return Ok(None);
     }
-    match s.trim().parse::<f32>() {
+    match s.parse::<f32>() {
         Ok(r) if r.is_finite() && r >= 0.0 => Ok(Some(r)),
         _ => Err(CliError::Usage(format!(
             "bad seed ratio {s:?}: expected a number like 1.5, 0 or `default`"

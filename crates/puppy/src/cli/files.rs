@@ -12,7 +12,7 @@ use serde::Serialize;
 /// The most files one range may name (a typo like `1-99999999999` must not allocate).
 const MAX_RANGE: usize = 100_000;
 
-/// Parses file specs into a [`Selection`]. Specs are comma- or space-separated tokens:
+/// Parses file specs into a [`Selection`]. Specs are comma-separated tokens (a space is part of a glob):
 /// a number (`3`) or a range (`2-5`) names files by their 1-based number as `puppy files`
 /// shows them; anything else is a glob matched against the file paths (`*.mkv`).
 /// Numbers go to the wire 0-based.
@@ -20,7 +20,8 @@ pub fn parse_spec(specs: &[String]) -> Result<Selection, CliError> {
     let mut sel = Selection::default();
     for token in specs
         .iter()
-        .flat_map(|s| s.split(|c: char| c == ',' || c.is_whitespace()))
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
         .filter(|t| !t.is_empty())
     {
         let number = |s: &str| -> Result<usize, CliError> {
@@ -48,6 +49,11 @@ pub fn parse_spec(specs: &[String]) -> Result<Selection, CliError> {
                     return Err(CliError::Usage(format!("range {token:?} is too large")));
                 }
                 sel.indices.extend(a - 1..b);
+            }
+            _ if token.contains(['*', '?', '[']) => sel.globs.push(token.to_string()),
+            // Only digits and dashes: a malformed range, not a file name.
+            _ if token.bytes().all(|b| b.is_ascii_digit() || b == b'-') => {
+                return Err(CliError::Usage(format!("not a number or range: {token:?}")));
             }
             _ => sel.globs.push(token.to_string()),
         }
@@ -167,19 +173,30 @@ mod tests {
 
     #[test]
     fn numbers_ranges_and_globs() {
-        let s = spec(&["1,3-5", "*.mkv sub/*"]).unwrap();
+        let s = spec(&["1,3-5", "*.mkv, sub/*"]).unwrap();
         assert_eq!(s.indices, vec![0, 2, 3, 4]);
         assert_eq!(s.globs, vec!["*.mkv", "sub/*"]);
         let s = spec(&["2", "2", "1-2"]).unwrap();
         assert_eq!(s.indices, vec![0, 1]);
         // A name with a dash is a glob, not a range.
         assert_eq!(spec(&["a-b.txt"]).unwrap().globs, vec!["a-b.txt"]);
-        assert_eq!(spec(&["1-"]).unwrap().globs, vec!["1-"]);
+        assert_eq!(spec(&["Season 1/*"]).unwrap().globs, vec!["Season 1/*"]);
+        assert_eq!(spec(&["1-?"]).unwrap().globs, vec!["1-?"]);
     }
 
     #[test]
     fn bad_specs_are_usage_errors() {
-        for bad in [&["0"][..], &["0-3"], &["5-2"], &["1-99999999"], &[""], &[]] {
+        for bad in [
+            &["0"][..],
+            &["0-3"],
+            &["5-2"],
+            &["1-99999999"],
+            &["1-3-5"],
+            &["-3"],
+            &["1-"],
+            &[""],
+            &[],
+        ] {
             assert!(matches!(spec(bad), Err(CliError::Usage(_))), "{bad:?}");
         }
     }

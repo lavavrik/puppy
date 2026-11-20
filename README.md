@@ -202,10 +202,12 @@ download (for example a file pattern that matched nothing) appears after the
 name of a `choosing` row in `ls`, and as `note` in `info`.
 
 File specs (`add --files`, `select`) are numbers (`3`), ranges (`2-5`) and
-globs (`*.mkv`, `sub/*`), separated by commas or spaces; numbers are the 1-based
-ones `puppy files` prints. `0`, empty ranges (`5-2`) and numbers past the last
-file are usage errors (exit 2); for a magnet the file list is not known when
-adding, so the daemon rejects those. `--files` and `--choose` cannot be
+globs (`*.mkv`, `Season 1/*`), separated by commas (a space belongs to the
+glob; `select` also takes several arguments); numbers are the 1-based
+ones `puppy files` prints. `0`, empty ranges (`5-2`) and malformed ones (`1-3-5`, `-3`, `1-`; "not a
+number or range") are usage errors (exit 2), as are numbers past the last
+file; for a magnet the file list is not known when
+adding, so the daemon rejects those (`add` then exits 2 too, with `"code":2` in `failed`). `--files` and `--choose` cannot be
 combined, and neither (nor `--seed-*`) applies to a non-torrent source. `puppy
 files` on a download that is not a torrent, or one that already completed
 (and so left the torrent engine), fails with exit 1 and the daemon's message.
