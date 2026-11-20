@@ -265,9 +265,11 @@ impl View {
 }
 
 /// The seeding view of a managed torrent's status: stopped seeding ⇒ `Completed`;
-/// complete and seeding (also while librqbit re-checks a restored seeding torrent, and
-/// before the poll task has seen the completion, unless both targets are 0) ⇒
-/// `Seeding`, with its upload speed; a restored seeding torrent whose data failed the
+/// complete, live and seeding (also while librqbit re-checks a restored seeding
+/// torrent, and before the poll task has seen the completion, unless both targets are
+/// 0) ⇒ `Seeding`, with its upload speed; complete with seeding to do but paused in
+/// librqbit (data found complete by the check of a torrent restored paused without a
+/// seeding record) ⇒ `Paused` until `resume` makes it live; a restored seeding torrent whose data failed the
 /// check ⇒ `NeedsAttention` (see [`RECHECK_FAILED`]). An error wins.
 fn apply_seed(st: &mut DownloadStatus, s: &map::Stats, seed: &SeedView) {
     if matches!(st.state, DownloadState::Failed { .. }) {
@@ -283,6 +285,7 @@ fn apply_seed(st: &mut DownloadStatus, s: &map::Stats, seed: &SeedView) {
         (st.down_bps, st.up_bps, st.eta_secs) = (0, 0, None);
         return;
     }
+    let live = s.finished && s.phase == map::Phase::Live;
     let seeding = match seed.phase {
         SeedPhase::Done => {
             st.state = DownloadState::Completed;
@@ -290,9 +293,24 @@ fn apply_seed(st: &mut DownloadStatus, s: &map::Stats, seed: &SeedView) {
             (st.down_bps, st.up_bps, st.eta_secs) = (0, 0, None);
             return;
         }
-        SeedPhase::Seeding => s.finished || matches!(s.phase, map::Phase::Initializing { .. }),
-        SeedPhase::Downloading => s.finished && !seed.targets.none(),
+        SeedPhase::Seeding => live || matches!(s.phase, map::Phase::Initializing { .. }),
+        SeedPhase::Downloading => live && !seed.targets.none(),
     };
+    // Complete but stopped in librqbit, with seeding still to do: paused until resumed
+    // (which seeds it), never `Seeding` with a stopped clock.
+    let paused_complete = s.finished
+        && s.phase == map::Phase::Paused
+        && match seed.phase {
+            SeedPhase::Seeding => true,
+            SeedPhase::Downloading => !seed.targets.none(),
+            SeedPhase::Done => false,
+        };
+    if paused_complete {
+        st.state = DownloadState::Paused;
+        st.done_bytes = s.total_bytes;
+        (st.down_bps, st.up_bps, st.eta_secs) = (0, 0, None);
+        return;
+    }
     if seeding {
         st.state = seed.seeding_state(s.uploaded, s.total_bytes);
         st.done_bytes = s.total_bytes;
@@ -453,6 +471,16 @@ impl Shared {
         self.live()?.pause(h).await.map_err(lib_error)
     }
 
+    /// Whether complete torrent `id` still has seeding to do: seeding, or not seen
+    /// complete yet with a target set (not stopped seeding, nor both targets 0).
+    fn seeding_to_do(&self, id: DownloadId) -> bool {
+        self.lock().get(&id).is_some_and(|e| match e.seed.phase {
+            SeedPhase::Seeding => true,
+            SeedPhase::Downloading => !self.targets(&e.seed.policy).none(),
+            SeedPhase::Done => false,
+        })
+    }
+
     /// Restarts a torrent left stopped against our wishes: one resumed while librqbit
     /// was still checking its data after a paused add. librqbit then clears its paused
     /// flag but its check task still ends in `Paused`, where it would stay. Acts only
@@ -474,7 +502,8 @@ impl Shared {
             return Ok(());
         }
         let _ops = self.ops.lock().await;
-        if !stuck() || h.stats().finished {
+        // A complete torrent only if it still has seeding to do (not stopped seeding).
+        if !stuck() || (h.stats().finished && !self.seeding_to_do(id)) {
             return Ok(());
         }
         tracing::debug!(
@@ -2384,7 +2413,7 @@ impl Engine for TorrentEngine {
 
     async fn resume(&self, id: DownloadId) -> Result<(), EngineError> {
         // Complete torrents stay as they are: seeding goes on, stopped seeding (pause,
-        // target met) stays stopped.
+        // target met) stays stopped; one paused with seeding still to do goes live.
         let _ops = self.shared.ops.lock().await;
         let (h, overwrite) = {
             let mut map = self.shared.lock();
@@ -2431,9 +2460,11 @@ impl Engine for TorrentEngine {
             }
         };
         let st = map::Stats::from(&h.stats());
-        // Finished: see above. Running or starting: nothing to do.
+        // Finished: see above, unless it still has seeding to do (data found complete
+        // by the check of a torrent restored paused): then it goes live and seeds.
+        // Running or starting: nothing to do.
         let stopped = h.is_paused() || matches!(st.phase, map::Phase::Paused | map::Phase::Error);
-        if st.finished || !stopped {
+        if !stopped || (st.finished && !self.shared.seeding_to_do(id)) {
             return Ok(());
         }
         if readd_on_resume(st.phase, overwrite) {

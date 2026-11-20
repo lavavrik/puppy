@@ -440,14 +440,20 @@ impl App {
                     | WireState::Active
                     | WireState::Seeding { .. }
             ),
-            Action::Resume => matches!(d.state, WireState::Paused | WireState::Failed { .. }),
+            // Also a seeding torrent whose data failed its check: resuming downloads it
+            // again (other reasons need a restart).
+            Action::Resume => match &d.state {
+                WireState::Paused | WireState::Failed { .. } => true,
+                WireState::NeedsAttention { reason } => reason.is_resumable(),
+                _ => false,
+            },
             Action::Restart => matches!(
                 d.state,
                 WireState::Failed { .. } | WireState::NeedsAttention { .. }
             ),
-            // A torrent takes its limit when it starts.
+            // A torrent takes its limit when it starts (or once its files are chosen).
             Action::Limit if d.kind == EngineKindTag::Torrent => {
-                matches!(d.state, WireState::Queued)
+                matches!(d.state, WireState::Queued | WireState::ChoosingFiles)
             }
             Action::Limit => !matches!(d.state, WireState::Completed),
             Action::MoveUp => d.queue_position.is_some_and(|p| p > 0),
@@ -1389,6 +1395,33 @@ mod tests {
         assert!(a.can(Action::Resume, &d(1, failed.clone())));
         assert!(a.can(Action::Restart, &d(1, failed)));
         assert!(!a.can(Action::Limit, &d(1, WireState::Completed)));
+        use puppy_proto::WireAttention;
+        let attention = |detail: &str| WireState::NeedsAttention {
+            reason: WireAttention::ValidationFailed {
+                detail: detail.into(),
+            },
+        };
+        // A failed re-check resumes (downloads again); other reasons only restart.
+        let recheck = d(1, attention(puppy_core::types::RECHECK_FAILED));
+        assert!(a.can(Action::Resume, &recheck));
+        assert!(a.can(Action::Restart, &recheck));
+        assert!(!a.can(Action::Resume, &d(1, attention("checksum mismatch"))));
+        assert!(!a.can(
+            Action::Resume,
+            &d(
+                1,
+                WireState::NeedsAttention {
+                    reason: WireAttention::RemoteChanged
+                }
+            )
+        ));
+        // A torrent choosing its files takes a limit (applied once it starts).
+        let mut choosing = d(1, WireState::ChoosingFiles);
+        choosing.kind = EngineKindTag::Torrent;
+        assert!(a.can(Action::Limit, &choosing));
+        let mut active = d(1, WireState::Active);
+        active.kind = EngineKindTag::Torrent;
+        assert!(!a.can(Action::Limit, &active));
         let mut unknown_kind = d(1, WireState::Active);
         unknown_kind.kind = EngineKindTag::Unknown;
         assert!(!a.can(Action::Pause, &unknown_kind));

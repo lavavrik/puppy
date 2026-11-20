@@ -102,7 +102,8 @@ enum Command {
         #[arg(long)]
         wait: bool,
         /// Torrent: download only these files, by number as `puppy files` shows
-        /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable.
+        /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable. Every comma splits
+        /// specs: use numbers for brace globs or names containing a comma.
         #[arg(long = "files", value_name = "SPEC")]
         files: Vec<String>,
         /// Torrent: wait for you to pick the files with `puppy select` (with
@@ -140,7 +141,8 @@ enum Command {
         /// The torrent's id.
         id: String,
         /// File numbers or ranges as `puppy files` shows them (`1,3-5`), and/or
-        /// globs (`*.mkv`).
+        /// globs (`*.mkv`). Every comma splits specs: use numbers for brace globs
+        /// or names containing a comma.
         #[arg(required = true, value_name = "SPEC")]
         specs: Vec<String>,
     },

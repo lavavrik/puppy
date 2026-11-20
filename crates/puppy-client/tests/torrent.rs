@@ -949,6 +949,31 @@ async fn restart_keeps_new_states() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_without_seed_record_seeds_again() {
+    let a = Seeder::start(MULTI).await;
+    let env = Env::new(&a);
+    let (d, c) = env.start().await;
+    let ida = c.add(env.torrent_req(&a), false, None).await.unwrap();
+    watch(&c, ida, "seeding", is_seeding).await;
+    env.shutdown(d, c).await;
+    // Its seeding record is lost while the daemon is down.
+    let seed = env.home.path().join(format!("data/torrents/{ida}.seed"));
+    std::fs::remove_file(&seed).unwrap();
+
+    let (d, c) = env.start().await;
+    // Seeding again for real: live, its clock running.
+    watch(
+        &c,
+        ida,
+        "seeding time advancing",
+        |s| matches!(s.state, WireState::Seeding { seeded_secs, .. } if seeded_secs >= 1),
+    )
+    .await;
+    assert_eq!(snapshot(&c, ida).await.done_bytes, total(MULTI));
+    env.shutdown(d, c).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_recheck_resumes_through_a_slot() {
     let a = Seeder::start(MULTI).await;
     let cs = Seeder::start_with_limit(MULTI_C, SLOW / 2).await;

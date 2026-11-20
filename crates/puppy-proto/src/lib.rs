@@ -314,6 +314,15 @@ pub enum WireAttention {
     Unknown,
 }
 
+impl WireAttention {
+    /// A seeding torrent's data failed its check (see
+    /// [`puppy_core::types::RECHECK_FAILED`]): `resume` downloads it again.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, WireAttention::ValidationFailed { detail }
+            if detail == puppy_core::types::RECHECK_FAILED)
+    }
+}
+
 impl From<&AttentionReason> for WireAttention {
     fn from(r: &AttentionReason) -> Self {
         match r {

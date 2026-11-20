@@ -1380,8 +1380,12 @@ async fn ls_new_states() {
         std::slice::from_ref(&seeding)
     );
     assert_eq!(ids(&["--json", "ls", "-s", "choosing,seeding"]).len(), 2);
-    // `done` is completed only: a seeding torrent is not in it.
-    assert!(ids(&["--json", "ls", "--state", "done"]).is_empty());
+    // `done` is completed or seeding; `completed` is completed only.
+    assert_eq!(
+        ids(&["--json", "ls", "--state", "done"]),
+        std::slice::from_ref(&seeding)
+    );
+    assert!(ids(&["--json", "ls", "--state", "completed"]).is_empty());
 
     let (out, _) = run_code(&env, &["ls"], 0);
     let row = |id: &str| {

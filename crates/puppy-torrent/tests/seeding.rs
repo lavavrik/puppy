@@ -664,3 +664,66 @@ async fn failed_recheck_needs_attention_then_downloads_again() {
     );
     second.shutdown().await;
 }
+
+/// Complete data restored paused without a seeding record (lost, or never written: the
+/// engine sees a download whose data turns out complete): `Paused` until resumed, then
+/// live and seeding (its clock running); with both targets 0, `Completed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn complete_data_without_record_seeds_on_resume() {
+    let seeder = Seeder::start(&[("r.bin", 64 * KIB)]).await;
+    let root = tempfile::tempdir().unwrap();
+    let hour = Duration::from_secs(3600);
+    let first = engine(root.path(), vec![seeder.addr], 0.0, hour).await;
+    let added = add(&first, 1, torrent_req(root.path(), &seeder, None)).await;
+    wait(&first, 1, "seeding", is_seeding).await;
+    first.shutdown().await;
+    drop(first);
+    let total = Some(64 * KIB as u64);
+
+    for resume_at_once in [false, true] {
+        std::fs::remove_file(seed_file(root.path(), 1)).unwrap();
+        let next = engine(root.path(), Vec::new(), 0.0, hour).await;
+        restore(
+            &next,
+            1,
+            torrent_req(root.path(), &seeder, None),
+            &added.path,
+        )
+        .await;
+        if !resume_at_once {
+            let st = wait(&next, 1, "checked", |s| s.done_bytes == 64 * KIB as u64).await;
+            assert_eq!(st.state, DownloadState::Paused, "not seeding while paused");
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(next.status(1).unwrap().state, DownloadState::Paused);
+        }
+        next.resume(1).await.unwrap();
+        let st = wait(
+            &next,
+            1,
+            "seeding, its clock running",
+            |s| matches!(s.state, DownloadState::Seeding { seeded_secs, .. } if seeded_secs >= 1),
+        )
+        .await;
+        assert_eq!(st.total_bytes, total);
+        next.shutdown().await;
+    }
+
+    // Both targets 0: complete is `Completed`, and it stays so on resume.
+    std::fs::remove_file(seed_file(root.path(), 1)).unwrap();
+    let last = engine(root.path(), Vec::new(), 0.0, Duration::ZERO).await;
+    restore(
+        &last,
+        1,
+        torrent_req(root.path(), &seeder, None),
+        &added.path,
+    )
+    .await;
+    wait(&last, 1, "completed", |s| {
+        s.state == DownloadState::Completed
+    })
+    .await;
+    last.resume(1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(last.status(1).unwrap().state, DownloadState::Completed);
+    last.shutdown().await;
+}

@@ -45,8 +45,10 @@ pub enum StateFilter {
     Starting,
     Active,
     Paused,
-    #[value(alias = "done")]
+    /// Completed only (not seeding).
     Completed,
+    /// Finished downloading: completed or seeding.
+    Done,
     /// Failed for good (not being retried).
     Failed,
     /// Failed, and puppy will retry it.
@@ -67,6 +69,10 @@ impl StateFilter {
                 | (StateFilter::Active, WireState::Active)
                 | (StateFilter::Paused, WireState::Paused)
                 | (StateFilter::Completed, WireState::Completed)
+                | (
+                    StateFilter::Done,
+                    WireState::Completed | WireState::Seeding { .. }
+                )
                 | (StateFilter::Choosing, WireState::ChoosingFiles)
                 | (StateFilter::Seeding, WireState::Seeding { .. })
                 | (
