@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon", "crates/puppy-client", "crates/puppy-tui", "crates/puppy"]
+members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon", "crates/puppy-torrent", "crates/puppy-client", "crates/puppy-tui", "crates/puppy"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,3 +32,6 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# BitTorrent (only inside crates/puppy-torrent). rustls TLS (ring sha1), never native-tls/OpenSSL.
+librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
+bytes = "1"

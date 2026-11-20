@@ -1,0 +1,18 @@
+[package]
+name = "puppy-torrent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+puppy-core = { path = "../puppy-core" }
+librqbit.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+bytes.workspace = true
