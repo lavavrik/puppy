@@ -495,7 +495,7 @@ async fn failed_probe_is_failed_and_restartable() {
     wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
     assert!(matches!(
         next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await,
-        Event::Failed { id: got, .. } if got == id
+        Event::Failed { id: got, transient: false, .. } if got == id
     ));
     assert!(m.is_idle());
     m.restart(id).await.unwrap();
@@ -937,8 +937,13 @@ async fn transient_probe_failure_is_retried() {
     })
     .await;
     let m = retrying_manager(&env).await;
+    let mut rx = m.events();
     let id = m.add(env.req(&s, "a.bin"), false, None).await.unwrap();
     wait_state(&m, id, is_transient_failure).await;
+    assert!(matches!(
+        next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await,
+        Event::Failed { id: got, transient: true, .. } if got == id
+    ));
     let d = snap(&m, id);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

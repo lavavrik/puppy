@@ -180,6 +180,10 @@ pub enum Event {
     Failed {
         id: DownloadId,
         reason: String,
+        /// Retried automatically (the snapshot's `next_retry_unix` says when). Absent
+        /// from older daemons: treated as permanent.
+        #[serde(default)]
+        transient: bool,
     },
     Removed {
         id: DownloadId,
@@ -439,6 +443,7 @@ mod tests {
             Event::Failed {
                 id: 1,
                 reason: "boom".into(),
+                transient: true,
             },
             Event::Removed { id: 1 },
             Event::NeedsAttention {

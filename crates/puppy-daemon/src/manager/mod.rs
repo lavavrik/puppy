@@ -393,9 +393,10 @@ impl Inner {
                     name: e.rec.name.clone().unwrap_or_default(),
                 });
             }
-            DownloadState::Failed { reason, .. } => self.emit(Event::Failed {
+            DownloadState::Failed { reason, transient } => self.emit(Event::Failed {
                 id,
                 reason: reason.clone(),
+                transient: *transient,
             }),
             DownloadState::NeedsAttention { reason } => self.emit(Event::NeedsAttention {
                 id,

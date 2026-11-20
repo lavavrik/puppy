@@ -527,3 +527,136 @@ fn limit_popups_parse_rates() {
         }]
     );
 }
+
+#[test]
+fn transient_failure_does_not_toast_and_permanent_toasts_once() {
+    let (mut a, now) = connected(vec![snap(1, "a", WireState::Active)]);
+    let failed = |transient| {
+        Msg::Daemon(Event::Failed {
+            id: 1,
+            reason: "503".into(),
+            transient,
+        })
+    };
+    a.update(failed(true), now);
+    a.update(failed(true), now + Duration::from_secs(1));
+    assert!(a.toasts.is_empty());
+    a.update(failed(false), now);
+    a.update(failed(false), now + Duration::from_secs(1));
+    assert_eq!(a.toasts.len(), 1);
+    assert_eq!(a.toasts[0].kind, ToastKind::Error);
+    // Once it has expired, the same text may show again.
+    a.update(failed(false), now + Duration::from_secs(5));
+    a.update(Msg::Tick, now + Duration::from_secs(5));
+    assert_eq!(a.toasts.len(), 1);
+}
+
+#[test]
+fn selection_survives_filter_hiding_everything() {
+    let (mut a, now) = connected(vec![
+        snap(1, "a", WireState::Active),
+        snap(2, "b", WireState::Active),
+        snap(3, "c", WireState::Active),
+    ]);
+    a.update(ch('G'), now);
+    assert_eq!(a.selected, Some(3));
+    a.update(ch('/'), now);
+    for c in "zzz".chars() {
+        a.update(ch(c), now);
+    }
+    assert!(a.visible().is_empty());
+    assert_eq!(a.selected, Some(3));
+    // Hidden selection is not acted on.
+    a.update(key(KeyCode::Enter), now);
+    assert!(a.update(ch('p'), now).is_empty());
+    assert!(matches!(a.mode, Mode::Normal));
+    // A snapshot while everything is hidden keeps it too.
+    a.update(
+        snapshot(vec![
+            snap(1, "a", WireState::Active),
+            snap(2, "b", WireState::Active),
+            snap(3, "c", WireState::Active),
+        ]),
+        now,
+    );
+    assert_eq!(a.selected, Some(3));
+    a.update(key(KeyCode::Esc), now);
+    assert_eq!(a.visible().len(), 3);
+    assert_eq!(a.selected, Some(3));
+}
+
+#[test]
+fn keymap_chars_are_text_in_filter_and_add_popup() {
+    let typed = "qdj/?pR+";
+    // Filter.
+    let (mut a, now) = connected(vec![snap(1, "a", WireState::Active)]);
+    a.update(ch('/'), now);
+    for c in typed.chars() {
+        assert!(a.update(ch(c), now).is_empty(), "{c}");
+    }
+    assert!(!a.should_quit);
+    assert!(matches!(a.mode, Mode::Filter));
+    assert_eq!(a.filter.value, typed);
+    // Add popup.
+    let (mut a, now) = connected(vec![snap(1, "a", WireState::Active)]);
+    a.update(ch('a'), now);
+    for c in typed.chars() {
+        assert!(a.update(ch(c), now).is_empty(), "{c}");
+    }
+    assert!(!a.should_quit);
+    match &a.mode {
+        Mode::Popup(Popup::Add(f)) => assert_eq!(f.source.value, typed),
+        m => panic!("unexpected {m:?}"),
+    }
+    assert_eq!(a.settings.as_ref().unwrap().max_active, 3);
+}
+
+#[test]
+fn navigation_on_empty_list_is_a_no_op() {
+    let (mut a, now) = connected(vec![]);
+    for m in [
+        ch('j'),
+        ch('k'),
+        ch('g'),
+        ch('G'),
+        key(KeyCode::Up),
+        key(KeyCode::Down),
+        key(KeyCode::Home),
+        key(KeyCode::End),
+        ch('p'),
+        ch('r'),
+        ch('d'),
+        ch('R'),
+        ch('l'),
+        ch('K'),
+        ch('J'),
+    ] {
+        assert!(a.update(m, now).is_empty());
+    }
+    assert_eq!(a.selected, None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert!(a.toasts.is_empty());
+}
+
+#[test]
+fn confirm_delete_space_toggles_and_only_enter_confirms() {
+    let (mut a, now) = connected(vec![snap(7, "x", WireState::Active)]);
+    a.update(ch('d'), now);
+    a.update(ch(' '), now);
+    assert!(matches!(
+        a.mode,
+        Mode::Popup(Popup::ConfirmDelete {
+            delete_files: true,
+            ..
+        })
+    ));
+    assert!(a.update(ch('y'), now).is_empty());
+    assert!(matches!(a.mode, Mode::Popup(Popup::ConfirmDelete { .. })));
+    assert_eq!(
+        a.update(key(KeyCode::Enter), now),
+        vec![Cmd::Remove {
+            id: 7,
+            delete_files: true
+        }]
+    );
+}

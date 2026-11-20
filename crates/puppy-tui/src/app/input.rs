@@ -131,16 +131,23 @@ impl TextInput {
         self.cursor = start;
     }
 
-    /// Inserts the first line of `s` (capped at [`MAX_INPUT_BYTES`] overall).
+    /// Inserts the first non-blank line of `s` (capped at [`MAX_INPUT_BYTES`] overall).
     pub fn paste(&mut self, s: &str) {
-        let line = s.split(['\n', '\r']).next().unwrap_or("");
+        let line = s
+            .split(['\n', '\r'])
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
         self.insert_str(line);
     }
 
     /// Applies an editing key. Returns whether the key was an editing key.
     pub fn handle_key(&mut self, key: &KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl_alt = key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // Ctrl+Alt is AltGr on Windows: it types a character.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !ctrl_alt;
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !ctrl_alt;
         match key.code {
             KeyCode::Char('u') if ctrl => self.clear(),
             KeyCode::Char('w') if ctrl => self.delete_word(),
@@ -201,6 +208,16 @@ mod tests {
     }
 
     #[test]
+    fn altgr_types_characters() {
+        let mut t = TextInput::new();
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(t.handle_key(&KeyEvent::new(KeyCode::Char('@'), altgr)));
+        assert!(t.handle_key(&KeyEvent::new(KeyCode::Char('u'), altgr)));
+        assert_eq!(t.value, "@u");
+        assert!(!t.handle_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)));
+    }
+
+    #[test]
     fn ctrl_u_and_ctrl_w() {
         let mut t = TextInput::with_value("foo bar  baz");
         t.delete_word();
@@ -221,6 +238,9 @@ mod tests {
         t.paste("magnet:?xt=1\r\nsecond line\n");
         assert_eq!(t.value, "magnet:?xt=1");
         assert_eq!(t.cursor, t.len());
+        let mut t = TextInput::new();
+        t.paste("\r\n  \nhttps://x/a\nb");
+        assert_eq!(t.value, "https://x/a");
 
         let mut t = TextInput::new();
         t.paste(&"x".repeat(9 * 1024));

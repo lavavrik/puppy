@@ -280,9 +280,15 @@ impl App {
             .count()
     }
 
+    /// Shows a toast for [`TOAST_TTL`]; a toast with the same text still showing is not
+    /// repeated.
     pub fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind, now: Instant) {
+        let text = text.into();
+        if self.toasts.iter().any(|t| t.text == text && t.until > now) {
+            return;
+        }
         self.toasts.push_back(Toast {
-            text: text.into(),
+            text,
             kind,
             until: now + TOAST_TTL,
         });
@@ -372,7 +378,11 @@ impl App {
             Event::Completed { name, .. } => {
                 self.push_toast(format!("completed: {name}"), ToastKind::Info, now);
             }
-            Event::Failed { id, reason } => {
+            // A transient failure is retried by the daemon; its row shows the retry.
+            Event::Failed {
+                transient: true, ..
+            } => {}
+            Event::Failed { id, reason, .. } => {
                 let text = format!("{} failed: {reason}", self.name_of(id));
                 self.push_toast(text, ToastKind::Error, now);
             }
@@ -402,6 +412,8 @@ impl App {
     fn fix_selection(&mut self, fallback: Option<usize>) {
         let ids: Vec<DownloadId> = self.visible().iter().map(|d| d.id).collect();
         self.selected = match self.selected {
+            // Everything filtered out: keep the selection for when it reappears.
+            Some(id) if ids.is_empty() && self.downloads.iter().any(|d| d.id == id) => Some(id),
             _ if ids.is_empty() => None,
             Some(id) if ids.contains(&id) => Some(id),
             _ => Some(ids[fallback.unwrap_or(0).min(ids.len() - 1)]),
@@ -501,6 +513,8 @@ impl App {
 
     /// The selection if `action` is valid for it; otherwise an Info toast says why.
     fn target(&mut self, action: Action, now: Instant) -> Option<DownloadSnapshot> {
+        // A selection hidden by the filter is not acted on.
+        self.selected_index()?;
         let d = self.selection()?.clone();
         if self.can(action, &d) {
             return Some(d);
@@ -615,7 +629,7 @@ impl App {
                     *delete_files = !*delete_files;
                     None
                 }
-                KeyCode::Enter | KeyCode::Char('y') => Some(Cmd::Remove {
+                KeyCode::Enter => Some(Cmd::Remove {
                     id: *id,
                     delete_files: *delete_files,
                 }),
@@ -772,10 +786,21 @@ mod tests {
             Msg::Daemon(Event::Failed {
                 id: 1,
                 reason: "timeout".into(),
+                transient: false,
             }),
             now,
         );
         assert_eq!(a.toasts[0].text, "n1 failed: timeout");
         assert_eq!(a.toasts[0].kind, ToastKind::Error);
+        // Same failure again while the toast is up: not repeated.
+        a.update(
+            Msg::Daemon(Event::Failed {
+                id: 1,
+                reason: "timeout".into(),
+                transient: false,
+            }),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(a.toasts.len(), 1);
     }
 }
