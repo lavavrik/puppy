@@ -1896,9 +1896,12 @@ name = "puppy-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "puppy-core",
+ "puppy-proto",
  "ratatui",
  "unicode-segmentation",
  "unicode-width",
+ "url",
 ]
 
 [[package]]
