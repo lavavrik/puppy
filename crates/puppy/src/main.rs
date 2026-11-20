@@ -4,13 +4,18 @@
 //!   service, or detached by a client with `--idle-exit`).
 //! - `puppy` opens the full-screen dashboard (starting a daemon if none runs).
 //! - `puppy status` prints a one-line summary (scriptable).
+//! - `--json` (global) makes commands print JSON; errors map to exit codes (see
+//!   [`cli::CliError`]).
+
+mod cli;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use puppy_client::{Client, Paths};
+use cli::output::err;
+use cli::{CliError, Ctx};
+use puppy_client::Paths;
 use puppy_daemon::Config;
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run_daemon};
-use puppy_proto::WireState;
 use puppy_tui::api::ClientApi;
 use puppy_tui::theme::{Theme, ThemeChoice};
 use std::io::IsTerminal;
@@ -29,6 +34,9 @@ struct Cli {
     /// Color theme for the dashboard (overrides `theme` in config.toml).
     #[arg(long, value_enum, global = true, value_name = "THEME")]
     theme: Option<ThemeArg>,
+    /// Print machine-readable JSON instead of text.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -60,6 +68,8 @@ enum Command {
     },
     /// Print a one-line summary (`N downloads, X active`), starting a daemon if needed.
     Status,
+    /// List downloads.
+    Ls,
 }
 
 fn main() -> ExitCode {
@@ -80,17 +90,21 @@ fn main() -> ExitCode {
     };
     let result = rt.block_on(async {
         match cli.command {
-            Some(Command::Daemon { idle_exit }) => daemon(idle_exit).await,
-            Some(Command::Status) => summary().await,
-            None => dashboard(cli.theme).await,
+            Some(Command::Daemon { idle_exit }) => daemon(idle_exit).await.map_err(Into::into),
+            Some(Command::Status) => cli::list::status(&Ctx::from_env(cli.json)?).await,
+            Some(Command::Ls) => cli::list::ls(&Ctx::from_env(cli.json)?).await,
+            None => dashboard(cli.theme).await.map_err(Into::into),
         }
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("puppy: {e:#}");
-            ExitCode::FAILURE
+            match &e {
+                CliError::Other(e) => err(format_args!("puppy: {e:#}")),
+                e => err(format_args!("puppy: {e}")),
+            }
+            ExitCode::from(e.exit_code())
         }
     }
 }
@@ -117,22 +131,6 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
             anyhow::bail!("shutdown interrupted: some downloads may resume from an earlier point")
         }
     }
-}
-
-/// Placeholder for the dashboard: `N downloads, X active` (`1 download, …`).
-async fn summary() -> anyhow::Result<()> {
-    let paths = Paths::resolve().context("cannot set up puppy's directories")?;
-    let exe = std::env::current_exe().context("cannot find the puppy executable")?;
-    let client = Client::connect_or_spawn(&paths, "puppy", &exe, &[]).await?;
-    let downloads = client.list().await?;
-    let active = downloads
-        .iter()
-        .filter(|d| matches!(d.state, WireState::Starting | WireState::Active))
-        .count();
-    let n = downloads.len();
-    let noun = if n == 1 { "download" } else { "downloads" };
-    println!("{n} {noun}, {active} active");
-    Ok(())
 }
 
 /// The full-screen dashboard (the default command).

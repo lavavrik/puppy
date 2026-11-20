@@ -2794,6 +2794,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossterm",
  "fs4",
  "libc",
  "puppy-client",
@@ -2802,9 +2803,12 @@ dependencies = [
  "puppy-proto",
  "puppy-testserver",
  "puppy-tui",
+ "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
