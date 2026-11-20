@@ -1,9 +1,11 @@
-//! Puppy daemon library: platform paths, configuration, state store and the download manager.
+//! Puppy daemon library: platform paths, configuration, state store, the download manager
+//! and the local-socket server.
 
 pub mod budget;
 pub mod config;
 pub mod manager;
 pub mod paths;
+pub mod server;
 pub mod store;
 
 pub use config::{Config, ConfigError};

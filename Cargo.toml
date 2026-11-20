@@ -24,3 +24,4 @@ http = "1"
 futures-util = "0.3"
 tokio-util = "0.7"
 toml = "1"
+interprocess = { version = "2.4", features = ["tokio"] }
