@@ -280,7 +280,25 @@ async fn per_download_limit() {
     let mut c = cfg(dir.path());
     c.min_segment_bytes = 64 * KIB;
     let t = Instant::now();
-    let (dl, added) = start(&s, dir.path(), c).await;
+    // Start nearly stalled (an empty bucket at 16 KiB/s grants nothing for ~1 s), so the
+    // transfer cannot finish unthrottled before `set_limit` lands, however slow the host.
+    // From then on the bucket grants at most `rate * t` plus one burst (64 KiB) plus one
+    // chunk of debt (<= a 128 KiB segment), so 1 MiB takes >= 3.25 s.
+    let (tx, _) = broadcast::channel(256);
+    let (dl, added) = HttpDownload::start_fresh(
+        1,
+        request(&s, dir.path()),
+        AddOptions {
+            limit: Some(16 * KIB),
+            ..AddOptions::default()
+        },
+        build_client(&c).unwrap(),
+        c,
+        TokenBucket::new(None),
+        tx,
+    )
+    .await
+    .unwrap();
     dl.set_limit(Some(256 * KIB));
     let st = wait_status(
         &dl,
