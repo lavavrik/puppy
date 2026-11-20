@@ -138,6 +138,8 @@ impl Env {
             output_dir: Some(self.dl_dir()),
             filename: Some(name.into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 
@@ -598,6 +600,8 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             output_dir: Some(env.dl_dir()),
             filename: None,
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;
@@ -622,6 +626,8 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             output_dir: Some(env.dl_dir()),
             filename: Some("h.bin".into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;

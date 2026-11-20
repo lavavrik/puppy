@@ -1,6 +1,9 @@
 //! The engine abstraction implemented by the HTTP (and later torrent) engines.
 
-use crate::types::{AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source};
+use crate::types::{
+    AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, SeedPolicy, Selection,
+    Source, TorrentFile,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -152,6 +155,25 @@ pub trait Engine: Send + Sync + 'static {
     /// Forgets anything the engine still keeps for download `id` once it has been
     /// removed for good (not held by the engine anymore). Default: nothing.
     async fn forget(&self, _id: DownloadId) {}
+
+    /// The files of a torrent. Default: unsupported.
+    async fn list_files(&self, _id: DownloadId) -> Result<Vec<TorrentFile>, EngineError> {
+        Err(EngineError::Unsupported("file listing"))
+    }
+
+    /// Chooses which files of a torrent to download. Default: unsupported.
+    async fn select_files(
+        &self,
+        _id: DownloadId,
+        _selection: Selection,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("file selection"))
+    }
+
+    /// Sets the seeding policy of a torrent. Default: unsupported.
+    async fn set_seed(&self, _id: DownloadId, _policy: SeedPolicy) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("seeding policy"))
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +238,22 @@ mod tests {
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
             tokio::sync::broadcast::channel(1).1
         }
+    }
+
+    #[tokio::test]
+    async fn new_methods_default_to_unsupported() {
+        assert!(matches!(
+            Nop.list_files(1).await,
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Nop.select_files(1, Selection::default()).await,
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Nop.set_seed(1, SeedPolicy::default()).await,
+            Err(EngineError::Unsupported(_))
+        ));
     }
 
     #[tokio::test]

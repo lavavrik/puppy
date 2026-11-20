@@ -604,6 +604,8 @@ impl Inner {
             output_dir: None,
             filename: None,
             context: Default::default(),
+            files: Default::default(),
+            seed: None,
         };
         env.build(req, remote, PathBuf::from("f"), Plan::single(None, false))
             .0

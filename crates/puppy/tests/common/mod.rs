@@ -168,6 +168,8 @@ impl Env {
             output_dir: Some(self.dl_dir()),
             filename: Some(name.into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 
@@ -179,6 +181,8 @@ impl Env {
             output_dir: Some(self.dl_dir()),
             filename: Some(name.into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 

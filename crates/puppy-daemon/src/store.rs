@@ -372,6 +372,8 @@ mod tests {
                         cookies: Some("sid=secret".into()),
                         ..Default::default()
                     },
+                    files: Default::default(),
+                    seed: None,
                 },
                 limit: Some(5),
                 state: StoredState::Failed {

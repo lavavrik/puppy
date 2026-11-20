@@ -28,6 +28,51 @@ pub struct AddRequest {
     pub output_dir: Option<PathBuf>,
     pub filename: Option<String>,
     pub context: RequestContext,
+    /// Which files of a torrent to download.
+    #[serde(default)]
+    pub files: FileChoice,
+    /// Seeding policy override for a torrent (`None`: the daemon's defaults).
+    #[serde(default)]
+    pub seed: Option<SeedPolicy>,
+}
+
+/// Which files of a multi-file torrent to download.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileChoice {
+    #[default]
+    All,
+    /// Wait in `ChoosingFiles` until the user selects.
+    Ask,
+    Select {
+        selection: Selection,
+    },
+}
+
+/// A set of torrent files: 0-based indices plus path globs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Selection {
+    #[serde(default)]
+    pub indices: Vec<usize>,
+    #[serde(default)]
+    pub globs: Vec<String>,
+}
+
+/// When to stop seeding; `None`/`0` disables a trigger.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeedPolicy {
+    #[serde(default)]
+    pub ratio: Option<f32>,
+    #[serde(default)]
+    pub time_secs: Option<u64>,
+}
+
+/// One file of a torrent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentFile {
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +83,7 @@ pub enum AttentionReason {
     ValidationFailed { detail: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DownloadState {
     Queued,
@@ -55,6 +100,16 @@ pub enum DownloadState {
     },
     NeedsAttention {
         reason: AttentionReason,
+    },
+    /// Torrent metadata is known; waiting for the user to pick files.
+    ChoosingFiles,
+    /// Torrent complete and uploading.
+    Seeding {
+        uploaded: u64,
+        ratio: f32,
+        seeded_secs: u64,
+        ratio_target: Option<f32>,
+        time_target_secs: Option<u64>,
     },
 }
 
@@ -110,6 +165,66 @@ pub enum EngineDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_types_roundtrip_and_defaults() {
+        let req: AddRequest = serde_json::from_str(
+            r#"{"source":{"kind":"magnet","uri":"m"},"output_dir":null,"filename":null,"context":{"headers":[],"cookies":null,"referer":null,"user_agent":null,"basic_auth":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.files, FileChoice::All);
+        assert_eq!(req.seed, None);
+        let req = AddRequest {
+            files: FileChoice::Select {
+                selection: Selection {
+                    indices: vec![0, 2],
+                    globs: vec!["*.mkv".into()],
+                },
+            },
+            seed: Some(SeedPolicy {
+                ratio: Some(1.5),
+                time_secs: Some(60),
+            }),
+            ..req
+        };
+        let back: AddRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        assert_eq!(
+            serde_json::to_string(&FileChoice::Ask).unwrap(),
+            r#"{"kind":"ask"}"#
+        );
+        let sel: Selection = serde_json::from_str("{}").unwrap();
+        assert_eq!(sel, Selection::default());
+        let sp: SeedPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(sp, SeedPolicy::default());
+        let f = TorrentFile {
+            index: 1,
+            path: "a/b".into(),
+            size: 9,
+        };
+        assert_eq!(
+            serde_json::from_str::<TorrentFile>(&serde_json::to_string(&f).unwrap()).unwrap(),
+            f
+        );
+        for s in [
+            DownloadState::ChoosingFiles,
+            DownloadState::Seeding {
+                uploaded: 5,
+                ratio: 0.5,
+                seeded_secs: 3,
+                ratio_target: Some(1.0),
+                time_target_secs: None,
+            },
+        ] {
+            let back: DownloadState =
+                serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert_eq!(back, s);
+        }
+        assert_eq!(
+            serde_json::to_string(&DownloadState::ChoosingFiles).unwrap(),
+            r#"{"kind":"choosing_files"}"#
+        );
+    }
 
     #[test]
     fn download_state_serde_roundtrip() {

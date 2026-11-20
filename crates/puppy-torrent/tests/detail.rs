@@ -47,6 +47,8 @@ impl Env {
             output_dir: Some(self.dir.path().join("out")),
             filename: None,
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 

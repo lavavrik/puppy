@@ -119,6 +119,8 @@ impl Env {
             output_dir: Some(self.dl_dir()),
             filename: None,
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 }
@@ -300,6 +302,8 @@ async fn daemon_restart_restores_magnet_offline_with_its_name() {
         output_dir: Some(env.dl_dir()),
         filename: None,
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     let seen = watch(&c, id, "transferring", |s| {
@@ -341,6 +345,8 @@ async fn http_only_daemon_never_starts_the_torrent_session() {
         output_dir: Some(env.dl_dir()),
         filename: Some("f.bin".into()),
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "completion", |s| s.state == WireState::Completed).await;

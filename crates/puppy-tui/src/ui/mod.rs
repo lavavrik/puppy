@@ -477,7 +477,8 @@ pub(crate) fn state_icon(state: &WireState) -> (&'static str, Token) {
         WireState::Active => ("▶", Token::Ok),
         WireState::Paused => ("⏸", Token::Dim),
         WireState::Queued => ("…", Token::Dim),
-        WireState::Completed => ("✓", Token::Ok),
+        WireState::Completed | WireState::Seeding { .. } => ("✓", Token::Ok),
+        WireState::ChoosingFiles => ("?", Token::Warn),
         WireState::Failed {
             transient: true, ..
         } => ("↻", Token::Warn),
@@ -495,6 +496,8 @@ pub(crate) fn state_word(state: &WireState) -> &'static str {
         WireState::Paused => "paused",
         WireState::Queued => "queued",
         WireState::Completed => "completed",
+        WireState::Seeding { .. } => "seeding",
+        WireState::ChoosingFiles => "choosing files",
         WireState::Failed {
             transient: true, ..
         } => "failed, retrying",

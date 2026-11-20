@@ -108,6 +108,8 @@ impl Harness {
             output_dir: Some(self.dir.path().join("dl")),
             filename: Some(name.into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 

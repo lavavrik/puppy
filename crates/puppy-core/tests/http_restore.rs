@@ -36,6 +36,8 @@ fn request(s: &TestServer, dir: &Path) -> AddRequest {
         output_dir: Some(dir.to_path_buf()),
         filename: None,
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     }
 }
 

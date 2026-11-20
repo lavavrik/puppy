@@ -652,6 +652,12 @@ async fn dispatch(m: &Manager, body: Request) -> Result<ReplyData, ManagerError>
         Request::GetSettings => ReplyData::Settings {
             settings: m.settings(),
         },
+        // Wired to the manager by a later task.
+        Request::ListFiles { .. } | Request::SelectFiles { .. } | Request::SetSeed { .. } => {
+            return Err(ManagerError::Engine(puppy_core::EngineError::Unsupported(
+                "torrent file selection",
+            )));
+        }
         Request::Hello { .. }
         | Request::Subscribe { .. }
         | Request::Unsubscribe

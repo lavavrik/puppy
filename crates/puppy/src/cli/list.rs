@@ -130,6 +130,8 @@ pub fn state_word(s: &WireState) -> &'static str {
         WireState::Active => "active",
         WireState::Paused => "paused",
         WireState::Completed => "done",
+        WireState::ChoosingFiles => "choosing",
+        WireState::Seeding { .. } => "seeding",
         WireState::Failed {
             transient: true, ..
         } => "retrying",

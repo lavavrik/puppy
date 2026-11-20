@@ -319,9 +319,12 @@ impl RowCtx<'_> {
             WireState::Active | WireState::Starting => p.bar_done,
             WireState::Failed { .. } => p.err,
             WireState::NeedsAttention { .. } => p.warn,
-            WireState::Paused | WireState::Queued | WireState::Completed | WireState::Unknown => {
-                muted
-            }
+            WireState::Paused
+            | WireState::Queued
+            | WireState::Completed
+            | WireState::ChoosingFiles
+            | WireState::Seeding { .. }
+            | WireState::Unknown => muted,
         };
         if selected {
             theme.p.bar_todo = p.selection_bg;
@@ -377,8 +380,12 @@ impl RowCtx<'_> {
                 push("paused".into(), Token::Dim);
                 push(size, Token::Dim);
             }
-            WireState::Completed => {
+            WireState::Completed | WireState::Seeding { .. } => {
                 push("completed".into(), Token::Dim);
+                push(size, Token::Dim);
+            }
+            WireState::ChoosingFiles => {
+                push("choosing files".into(), Token::Dim);
                 push(size, Token::Dim);
             }
             WireState::Failed {

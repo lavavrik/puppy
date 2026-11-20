@@ -73,6 +73,8 @@ impl Env {
             output_dir: Some(self.out()),
             filename: None,
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 

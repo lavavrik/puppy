@@ -19,7 +19,10 @@
 pub mod codec;
 
 pub use codec::{CodecError, MsgReader, read_msg, write_msg};
-use puppy_core::types::{AddRequest, AttentionReason, DownloadId, DownloadState, EngineDetail};
+use puppy_core::types::{
+    AddRequest, AttentionReason, DownloadId, DownloadState, EngineDetail, SeedPolicy, Selection,
+    TorrentFile,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -76,6 +79,20 @@ pub enum Request {
         n: u16,
     },
     GetSettings,
+    /// Lists a torrent's files.
+    ListFiles {
+        id: DownloadId,
+    },
+    /// Chooses the files of a torrent to download.
+    SelectFiles {
+        id: DownloadId,
+        selection: Selection,
+    },
+    /// Sets a torrent's seeding policy.
+    SetSeed {
+        id: DownloadId,
+        policy: SeedPolicy,
+    },
     Subscribe {
         interval_ms: u64,
     },
@@ -125,6 +142,7 @@ pub enum Reply {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // wire type; boxing would change the public API
 pub enum ReplyData {
     Hello {
         daemon_version: String,
@@ -144,6 +162,9 @@ pub enum ReplyData {
         settings: Settings,
     },
     Done,
+    Files {
+        files: Vec<TorrentFile>,
+    },
     /// A kind this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
@@ -194,6 +215,9 @@ pub enum Event {
         id: DownloadId,
         reason: WireAttention,
     },
+    SeedingFinished {
+        id: DownloadId,
+    },
     /// A kind this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
@@ -235,7 +259,7 @@ pub enum EngineKindTag {
 
 /// A download's state on the wire: puppy-core's `DownloadState` (same JSON) plus a
 /// catch-all for states a newer daemon may add.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireState {
     Queued,
@@ -251,6 +275,14 @@ pub enum WireState {
     },
     NeedsAttention {
         reason: WireAttention,
+    },
+    ChoosingFiles,
+    Seeding {
+        uploaded: u64,
+        ratio: f32,
+        seeded_secs: u64,
+        ratio_target: Option<f32>,
+        time_target_secs: Option<u64>,
     },
     /// A state this client does not know (newer daemon).
     #[serde(other)]
@@ -298,6 +330,20 @@ impl From<&DownloadState> for WireState {
             },
             DownloadState::NeedsAttention { reason } => WireState::NeedsAttention {
                 reason: reason.into(),
+            },
+            DownloadState::ChoosingFiles => WireState::ChoosingFiles,
+            DownloadState::Seeding {
+                uploaded,
+                ratio,
+                seeded_secs,
+                ratio_target,
+                time_target_secs,
+            } => WireState::Seeding {
+                uploaded: *uploaded,
+                ratio: *ratio,
+                seeded_secs: *seeded_secs,
+                ratio_target: *ratio_target,
+                time_target_secs: *time_target_secs,
             },
         }
     }
@@ -374,6 +420,8 @@ mod tests {
                     output_dir: None,
                     filename: None,
                     context: RequestContext::default(),
+                    files: Default::default(),
+                    seed: None,
                 },
                 start_paused: true,
                 limit: Some(9),
@@ -608,6 +656,14 @@ mod tests {
             DownloadState::NeedsAttention {
                 reason: AttentionReason::ValidationFailed { detail: "d".into() },
             },
+            DownloadState::ChoosingFiles,
+            DownloadState::Seeding {
+                uploaded: 7,
+                ratio: 0.5,
+                seeded_secs: 3,
+                ratio_target: Some(1.0),
+                time_target_secs: None,
+            },
         ];
         for s in &states {
             let core = serde_json::to_value(s).unwrap();
@@ -668,6 +724,68 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn torrent_feature_messages_roundtrip() {
+        let reqs = [
+            Request::ListFiles { id: 1 },
+            Request::SelectFiles {
+                id: 1,
+                selection: Selection {
+                    indices: vec![0],
+                    globs: vec!["*.txt".into()],
+                },
+            },
+            Request::SetSeed {
+                id: 1,
+                policy: SeedPolicy {
+                    ratio: Some(2.0),
+                    time_secs: None,
+                },
+            },
+        ];
+        for r in reqs {
+            let e = Envelope { req_id: 1, body: r };
+            let s = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<Envelope<Request>>(&s).unwrap(), e);
+        }
+        let m = ServerMsg::Response {
+            req_id: 1,
+            result: Reply::Ok {
+                data: ReplyData::Files {
+                    files: vec![TorrentFile {
+                        index: 0,
+                        path: "a".into(),
+                        size: 1,
+                    }],
+                },
+            },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""kind":"files""#), "{s}");
+        assert_eq!(serde_json::from_str::<ServerMsg>(&s).unwrap(), m);
+        let m = ServerMsg::Event {
+            event: Event::SeedingFinished { id: 4 },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""kind":"seeding_finished""#), "{s}");
+        assert_eq!(serde_json::from_str::<ServerMsg>(&s).unwrap(), m);
+    }
+
+    /// An older client (modelled by an unknown kind) falls back to `Unknown`; and the
+    /// new states decode on this build.
+    #[test]
+    fn new_states_and_older_decoding() {
+        let w: WireState = serde_json::from_str(r#"{"kind":"choosing_files"}"#).unwrap();
+        assert_eq!(w, WireState::ChoosingFiles);
+        let w: WireState = serde_json::from_str(
+            r#"{"kind":"seeding","uploaded":1,"ratio":0.1,"seeded_secs":2,"ratio_target":null,"time_target_secs":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(w, WireState::Seeding { uploaded: 1, .. }));
+        let w: WireState = serde_json::from_str(r#"{"kind":"future_state","x":1}"#).unwrap();
+        assert_eq!(w, WireState::Unknown);
     }
 
     #[test]

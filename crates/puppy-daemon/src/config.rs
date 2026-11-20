@@ -43,9 +43,38 @@ pub struct TorrentConfig {
     pub lsd: bool,
     /// Port to listen on for peers (an OS-assigned one if busy).
     pub listen_port: u16,
-    /// Seed until this share ratio is reached. Reserved: only `0.0` (stop at
-    /// completion) is implemented.
+    /// Seed until this share ratio is reached (`0` disables the trigger).
     pub seed_ratio: f32,
+    /// Seed for at most this long (`"2h"`, `"30m"`, `0` disables the trigger). With both
+    /// triggers off a torrent stops at completion.
+    #[serde(with = "duration_text")]
+    pub seed_time: Duration,
+}
+
+/// A duration as a human string (`"2h"`, `"30m"`); a bare integer is seconds (`0`).
+mod duration_text {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&humantime::format_duration(*d))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Text {
+            Secs(u64),
+            Str(String),
+        }
+        match Text::deserialize(de)? {
+            Text::Secs(n) => Ok(Duration::from_secs(n)),
+            Text::Str(s) => match s.trim() {
+                "0" => Ok(Duration::ZERO),
+                t => humantime::parse_duration(t).map_err(de::Error::custom),
+            },
+        }
+    }
 }
 
 impl Default for TorrentConfig {
@@ -55,7 +84,8 @@ impl Default for TorrentConfig {
             upnp: false,
             lsd: true,
             listen_port: 42069,
-            seed_ratio: 0.0,
+            seed_ratio: 1.0,
+            seed_time: Duration::from_secs(2 * 3600),
         }
     }
 }
@@ -185,18 +215,42 @@ mod tests {
         let t = Config::load(&p).unwrap().torrent;
         assert!(t.dht && !t.upnp && t.lsd);
         assert_eq!(t.listen_port, 42069);
-        assert_eq!(t.seed_ratio, 0.0);
+        assert_eq!(t.seed_ratio, 1.0);
+        assert_eq!(t.seed_time, Duration::from_secs(7200));
         std::fs::write(&p, "[torrent]\ndht = false\nlisten_port = 51413\n").unwrap();
         let t = Config::load(&p).unwrap().torrent;
         assert!(!t.dht && !t.upnp);
         assert_eq!(t.listen_port, 51413);
-        assert_eq!(t.seed_ratio, 0.0);
+        assert_eq!(t.seed_ratio, 1.0);
         std::fs::write(&p, "[torrent]\nupnp = true\nseed_ratio = 1.5\n").unwrap();
         let t = Config::load(&p).unwrap().torrent;
         assert!(t.dht && t.upnp);
         assert_eq!(t.seed_ratio, 1.5);
         std::fs::write(&p, "[torrent]\nlsd = false\n").unwrap();
         assert!(!Config::load(&p).unwrap().torrent.lsd);
+    }
+
+    #[test]
+    fn config_seed_time_forms() {
+        let _env = env_lock();
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        for (text, want) in [
+            ("seed_time = \"30m\"", 1800),
+            ("seed_time = 0", 0),
+            ("seed_time = \"0\"", 0),
+            ("seed_time = \"1h 30m\"", 5400),
+        ] {
+            std::fs::write(&p, format!("[torrent]\n{text}\n")).unwrap();
+            let t = Config::load(&p).unwrap().torrent;
+            assert_eq!(t.seed_time, Duration::from_secs(want), "{text}");
+        }
+        std::fs::write(&p, "[torrent]\nseed_time = \"soon\"\n").unwrap();
+        assert!(Config::load(&p).is_err());
+        // Serializes back to something it can read.
+        let t = TorrentConfig::default();
+        let s = toml::to_string(&t).unwrap();
+        assert_eq!(toml::from_str::<TorrentConfig>(&s).unwrap(), t);
     }
 
     #[test]

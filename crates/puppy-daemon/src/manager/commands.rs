@@ -105,7 +105,7 @@ impl Manager {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
             match e.state {
-                DownloadState::Completed => {
+                DownloadState::Completed | DownloadState::Seeding { .. } => {
                     return Err(ManagerError::InvalidState("download is completed".into()));
                 }
                 DownloadState::Queued => {
@@ -129,6 +129,7 @@ impl Manager {
                     (None, false)
                 }
                 DownloadState::Paused
+                | DownloadState::ChoosingFiles
                 | DownloadState::Failed { .. }
                 | DownloadState::NeedsAttention { .. } => (None, false),
             }
@@ -152,8 +153,13 @@ impl Manager {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
             match e.state {
-                DownloadState::Completed => {
+                DownloadState::Completed | DownloadState::Seeding { .. } => {
                     return Err(ManagerError::InvalidState("download is completed".into()));
+                }
+                DownloadState::ChoosingFiles => {
+                    return Err(ManagerError::InvalidState(
+                        "choose files first: puppy select <id> ...".into(),
+                    ));
                 }
                 DownloadState::NeedsAttention { .. } => {
                     return Err(ManagerError::InvalidState(

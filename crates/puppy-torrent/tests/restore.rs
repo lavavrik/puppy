@@ -44,6 +44,8 @@ fn req(root: &Path, source: Source) -> AddRequest {
         output_dir: Some(root.join("out")),
         filename: None,
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     }
 }
 

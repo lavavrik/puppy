@@ -147,6 +147,8 @@ mod tests {
                 output_dir: None,
                 filename: None,
                 context: RequestContext::default(),
+                files: Default::default(),
+                seed: None,
             },
             context_hash: context_hash(&RequestContext::default()),
             final_url: url,
@@ -258,6 +260,8 @@ mod tests {
             },
             output_dir: None,
             filename: Some("a".into()),
+            files: Default::default(),
+            seed: None,
             context: RequestContext {
                 cookies: Some("session=secret".into()),
                 basic_auth: Some(("u".into(), Some("p".into()))),

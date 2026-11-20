@@ -217,6 +217,8 @@ impl AddForm {
                 output_dir,
                 filename: None,
                 context: RequestContext::default(),
+                files: Default::default(),
+                seed: None,
             },
             start_paused: self.start_paused,
         })

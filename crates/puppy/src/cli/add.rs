@@ -215,6 +215,8 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                 output_dir: output_dir.clone(),
                 filename: args.name.clone(),
                 context: context.clone(),
+                files: Default::default(),
+                seed: None,
             };
             match client.add(req, args.paused, limit).await {
                 Ok(id) => {

@@ -71,6 +71,8 @@ impl Env {
             output_dir: Some(self.dl_dir()),
             filename: Some(name.into()),
             context: RequestContext::default(),
+            files: Default::default(),
+            seed: None,
         }
     }
 }
@@ -467,6 +469,8 @@ async fn unsupported_source_is_bad_request() {
         output_dir: None,
         filename: None,
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     };
     let err = m.add(req, false, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::BadRequest(_)), "{err:?}");

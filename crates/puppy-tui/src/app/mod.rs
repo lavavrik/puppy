@@ -268,6 +268,8 @@ fn describe(state: &WireState) -> &'static str {
         WireState::Active => "an active download",
         WireState::Paused => "a paused download",
         WireState::Completed => "a completed download",
+        WireState::ChoosingFiles => "a download waiting for a file choice",
+        WireState::Seeding { .. } => "a seeding download",
         WireState::Failed { .. } => "a failed download",
         WireState::NeedsAttention { .. } => "a download that needs attention",
         WireState::Unknown => "a download in an unknown state",
@@ -609,7 +611,10 @@ impl App {
                 let text = format!("{} needs attention", self.name_of(id));
                 self.push_toast(text, ToastKind::Error, now);
             }
-            Event::Added { .. } | Event::Removed { .. } | Event::Unknown => {}
+            Event::Added { .. }
+            | Event::Removed { .. }
+            | Event::SeedingFinished { .. }
+            | Event::Unknown => {}
         }
     }
 

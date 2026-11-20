@@ -96,7 +96,10 @@ pub fn finish(codes: &[u8]) -> Result<(), CliError> {
 /// ended: puppy retries it.
 fn ended(d: &DownloadSnapshot) -> Option<(u8, String)> {
     match &d.state {
-        WireState::Completed => Some((0, display_safe(&d.name).into_owned())),
+        WireState::Completed | WireState::Seeding { .. } => {
+            Some((0, display_safe(&d.name).into_owned()))
+        }
+        WireState::ChoosingFiles => Some((5, format!("choose files: puppy select {} ...", d.id))),
         WireState::Failed {
             reason,
             transient: false,
@@ -446,6 +449,9 @@ pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
                     let line = format!("removed {id} {}", name(&names, id));
                     names.remove(&id);
                     line
+                }
+                Event::SeedingFinished { id } => {
+                    format!("seeding finished {id} {}", name(&names, id))
                 }
                 Event::Unknown => continue,
             };

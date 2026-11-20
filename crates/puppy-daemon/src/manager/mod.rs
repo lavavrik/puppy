@@ -234,8 +234,8 @@ fn stored_state(s: &DownloadState) -> StoredState {
         // A download being started is persisted as active: after a restart it is
         // restored (if it got a path) and queued at the front.
         DownloadState::Starting | DownloadState::Active => StoredState::Active,
-        DownloadState::Paused => StoredState::Paused,
-        DownloadState::Completed => StoredState::Completed,
+        DownloadState::Paused | DownloadState::ChoosingFiles => StoredState::Paused,
+        DownloadState::Completed | DownloadState::Seeding { .. } => StoredState::Completed,
         DownloadState::Failed { reason, transient } => StoredState::Failed {
             reason: reason.clone(),
             transient: *transient,
@@ -777,6 +777,8 @@ mod tests {
                 output_dir: None,
                 filename: None,
                 context: Default::default(),
+                files: Default::default(),
+                seed: None,
             },
             limit: None,
             state: crate::store::StoredState::Queued,

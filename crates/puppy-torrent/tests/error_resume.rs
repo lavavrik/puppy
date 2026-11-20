@@ -77,6 +77,8 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
         output_dir: Some(out.clone()),
         filename: None,
         context: RequestContext::default(),
+        files: Default::default(),
+        seed: None,
     };
     let added = engine
         .add(1, req, StartMode::Fresh, AddOptions::default())

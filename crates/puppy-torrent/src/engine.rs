@@ -2089,6 +2089,8 @@ mod tests {
             output_dir: Some(dir.path().join("out")),
             filename: None,
             context: Default::default(),
+            files: Default::default(),
+            seed: None,
         };
         engine
             .add(1, req, StartMode::Fresh, AddOptions::default())
