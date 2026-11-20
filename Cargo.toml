@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver"]
+members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +23,4 @@ percent-encoding = "2"
 http = "1"
 futures-util = "0.3"
 tokio-util = "0.7"
+toml = "1"
