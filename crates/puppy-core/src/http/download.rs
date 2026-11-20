@@ -402,6 +402,7 @@ impl HttpDownload {
             up_bps: 0,
             eta_secs,
             peers: None,
+            note: None,
         }
     }
 

@@ -802,6 +802,7 @@ mod tests {
             up_bps: 0,
             eta_secs: None,
             peers: None,
+            note: None,
         }
     }
 

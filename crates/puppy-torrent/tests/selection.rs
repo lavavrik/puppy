@@ -249,7 +249,7 @@ async fn selection_validation() {
     let err = resolve(&f, &sel(&[], &[])).unwrap_err();
     assert!(err.contains("no files selected"), "{err}");
     let err = resolve(&f, &sel(&[0, 7], &[])).unwrap_err();
-    assert!(err.contains('7') && err.contains("2 files"), "{err}");
+    assert_eq!(err, "file 8 doesn't exist — the torrent has 2 files");
     let err = resolve(&f, &sel(&[], &["*.iso"])).unwrap_err();
     assert!(
         err.contains("*.iso") && err.contains("matches no file"),
@@ -265,7 +265,7 @@ async fn selection_validation() {
     let env = Env::new(vec![seeder.addr]).await;
     // A `.torrent` with an invalid selection is refused up front, naming the culprit.
     for (choice, culprit) in [
-        (select(&[99], &[]), "99"),
+        (select(&[99], &[]), "file 100 doesn't exist"),
         (select(&[], &["*.iso"]), "*.iso"),
         (select(&[], &[]), "no files selected"),
     ] {
@@ -404,10 +404,6 @@ async fn ask_waits_without_writing() {
     env.add(2, env.magnet_req(&seeder, FileChoice::Ask))
         .await
         .unwrap();
-    assert!(matches!(
-        env.engine.list_files(2).await,
-        Err(EngineError::Invalid(_)) | Ok(_)
-    ));
     env.wait_state(2, DownloadState::ChoosingFiles).await;
     assert_eq!(env.engine.list_files(2).await.unwrap().len(), TREE.len());
     assert_eq!(env.engine.status(2).unwrap().name, MULTI_NAME);
@@ -472,6 +468,7 @@ async fn magnet_invalid_preselection_goes_choosing() {
     env.wait_state(1, DownloadState::ChoosingFiles).await;
     let reason = env.engine.choosing_reason(1).expect("a reason");
     assert!(reason.contains("*.iso"), "{reason}");
+    assert_eq!(env.engine.status(1).unwrap().note, Some(reason));
     assert_eq!(env.engine.librqbit_torrents(), 0);
     assert!(!env.out().exists());
 
@@ -620,4 +617,178 @@ async fn restore_choosing_and_selected() {
         .await;
     let st = env.wait(1, "verified", |s| s.done_bytes == P as u64).await;
     assert_eq!(st.total_bytes, Some(P as u64));
+}
+
+/// Not piece-aligned: pieces 1 and 2 are each shared by the selected `a/two.bin` and an
+/// unselected file, so librqbit writes those bytes into the unselected files.
+const SHARED: &[(&str, usize)] = &[
+    ("a/one.bin", P + 100),
+    ("a/two.bin", P + 300),
+    ("b/three.bin", 2 * P + 7),
+];
+
+async fn download_two(env: &Env, seeder: &Seeder, id: DownloadId) -> DownloadStatus {
+    env.add(id, env.torrent_req(seeder, select(&[], &["two.bin"])))
+        .await
+        .unwrap();
+    let st = env.wait_state(id, DownloadState::Completed).await;
+    let two = (P + 300) as u64;
+    assert_eq!((st.done_bytes, st.total_bytes), (two, Some(two)));
+    let got = std::fs::read(env.folder().join("a/two.bin")).unwrap();
+    assert!(got == support::content("a/two.bin", P + 300));
+    for (rel, len) in [SHARED[0], SHARED[2]] {
+        let got = std::fs::read(env.folder().join(rel)).unwrap_or_default();
+        assert!(
+            got != support::content(rel, len),
+            "unselected {rel} downloaded"
+        );
+    }
+    // The poll task has seen the completion (and the placeholders).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    st
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_pieces_selected_only_and_delete() {
+    let seeder = Seeder::start(SHARED).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    let st = download_two(&env, &seeder, 1).await;
+    assert!(
+        std::fs::metadata(env.folder().join("b/three.bin"))
+            .unwrap()
+            .len()
+            > 0,
+        "librqbit wrote the shared piece's bytes into the placeholder"
+    );
+    env.engine.remove(1, true).await.unwrap();
+    assert!(!st.path.exists(), "placeholders and folders deleted");
+    assert!(env.out().is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replaced_placeholder_is_kept() {
+    let seeder = Seeder::start(SHARED).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    download_two(&env, &seeder, 1).await;
+    // The user replaces a placeholder with a file of their own, of the same length.
+    let three = env.folder().join("b/three.bin");
+    let len = std::fs::metadata(&three).unwrap().len() as usize;
+    std::fs::remove_file(&three).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::fs::write(&three, vec![b'u'; len]).unwrap();
+    env.engine.remove(1, true).await.unwrap();
+    assert_eq!(std::fs::read(&three).unwrap(), vec![b'u'; len]);
+    assert!(!env.folder().join("a").exists(), "the rest is deleted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_choosing_never_overwrites() {
+    let seeder = Seeder::start(TREE).await;
+    let mut env = Env::new(vec![seeder.addr]).await;
+    let req = env.torrent_req(&seeder, FileChoice::Ask);
+    let added = env.add(1, req.clone()).await.unwrap();
+    env.restart().await;
+    env.restore(1, req, &added.path).await;
+    assert_eq!(
+        env.engine.status(1).unwrap().state,
+        DownloadState::ChoosingFiles
+    );
+    // Something not puppy's at a selected path.
+    let theirs = env.folder().join("readme.txt");
+    std::fs::create_dir_all(env.folder()).unwrap();
+    std::fs::write(&theirs, b"theirs").unwrap();
+    let picked = env.indices_of(1, &["readme.txt", "s1/e01.mkv"]).await;
+    let err = env
+        .engine
+        .select_files(1, sel(&picked, &[]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Invalid(m) if m.contains("already exists")),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+    let left: Vec<_> = walk(&env.folder());
+    assert_eq!(
+        left,
+        vec![theirs.clone()],
+        "the failed add left files behind"
+    );
+    // Still choosing (also after a restart).
+    assert_eq!(
+        env.engine.status(1).unwrap().state,
+        DownloadState::ChoosingFiles
+    );
+    let sc = std::fs::read_to_string(env.selection_file(1)).unwrap();
+    assert!(sc.contains("choosing"), "{sc}");
+    std::fs::remove_file(&theirs).unwrap();
+    env.engine.select_files(1, sel(&picked, &[])).await.unwrap();
+    env.engine.resume(1).await.unwrap();
+    env.wait_state(1, DownloadState::Completed).await;
+    assert_only(&env.folder(), &["readme.txt", "s1/e01.mkv"]);
+}
+
+/// Every regular file under `dir`, sorted.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_files_unknown_before_metadata() {
+    let seeder = Seeder::start(TREE).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    env.engine
+        .add(
+            1,
+            env.magnet_req(&seeder, FileChoice::Ask),
+            StartMode::Fresh,
+            AddOptions {
+                start_paused: true,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    let err = env.engine.list_files(1).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Invalid(m) if m.contains("not known yet")),
+        "{err:?}"
+    );
+    assert!(matches!(
+        env.engine.list_files(7).await,
+        Err(EngineError::NotFound(7))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limit_set_while_choosing_reaches_the_real_add() {
+    let files: &[(&str, usize)] = &[("a/big.bin", 24 * P), ("a/small.bin", P)];
+    let seeder = Seeder::start(files).await;
+    let env = Env::new(vec![seeder.addr]).await;
+    env.add(1, env.torrent_req(&seeder, FileChoice::Ask))
+        .await
+        .unwrap();
+    // 384 KiB at 96 KiB/s: about 3-4 s (unlimited, locally: well under a second).
+    env.engine.set_download_limit(1, Some(96 * 1024)).unwrap();
+    let big = env.indices_of(1, &["big.bin"]).await;
+    env.engine.select_files(1, sel(&big, &[])).await.unwrap();
+    let started = Instant::now();
+    env.engine.resume(1).await.unwrap();
+    env.wait_state(1, DownloadState::Completed).await;
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(2000), "not limited: {took:?}");
 }

@@ -245,6 +245,10 @@ pub struct DownloadSnapshot {
     /// When a transiently failed download is retried automatically (Unix seconds).
     #[serde(default)]
     pub next_retry_unix: Option<u64>,
+    /// Why the download is in its state, when the engine says (e.g. why a torrent waits
+    /// for a file choice although one was given).
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +409,7 @@ mod tests {
             connections: Some(4),
             peers: None,
             next_retry_unix: Some(99),
+            note: None,
         }
     }
 
@@ -816,6 +821,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn snapshot_note_is_optional() {
+        let mut s = snap(1);
+        s.note = Some("pattern \"*.iso\" matches no file".into());
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["note"], "pattern \"*.iso\" matches no file");
+        assert_eq!(
+            serde_json::from_value::<DownloadSnapshot>(json.clone()).unwrap(),
+            s
+        );
+        // From an older daemon: no `note`.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("note");
+        assert_eq!(
+            serde_json::from_value::<DownloadSnapshot>(old)
+                .unwrap()
+                .note,
+            None
+        );
     }
 
     #[test]

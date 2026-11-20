@@ -49,9 +49,13 @@ pub(crate) async fn poll_once(shared: &Shared) {
         }
     }
     let statuses: Vec<_> = views.into_iter().map(|(id, v)| (id, v.status())).collect();
+    // After the statuses (a completion seen now has all its writes counted), before
+    // finished torrents are stopped below.
+    shared.note_writes();
 
     let mut events = Vec::new();
     let mut to_stop = Vec::new();
+    let mut to_persist = Vec::new();
     {
         let mut map = shared.lock();
         for (id, status) in statuses {
@@ -59,6 +63,10 @@ pub(crate) async fn poll_once(shared: &Shared) {
             let Some(e) = map.get_mut(&id) else {
                 continue;
             };
+            if e.selected.is_some() && status.state == DownloadState::Completed && !e.completed_sent
+            {
+                to_persist.push(id);
+            }
             if e.last_state.as_ref() != Some(&status.state) {
                 e.last_state = Some(status.state.clone());
                 events.push(EngineEvent::StateChanged {
@@ -84,6 +92,10 @@ pub(crate) async fn poll_once(shared: &Shared) {
         if let Err(e) = shared.pause_managed(&h).await {
             tracing::warn!(id, "stopping a completed torrent: {e}");
         }
+    }
+    shared.stamp_placeholders();
+    for id in to_persist {
+        shared.persist_choice(id);
     }
     for ev in events {
         let _ = shared.events.send(ev);

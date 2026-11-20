@@ -85,7 +85,12 @@ pub struct TorrentEngineOptions {
 /// - librqbit 9.1 still opens (creates) every file of a torrent, selected or not:
 ///   unselected files appear as empty placeholders, holding only the part of a piece
 ///   they share with a selected file. Deleting removes the selected files and the
-///   placeholders this download created, never an unselected file that was there before.
+///   placeholders this download created while they are still as librqbit left them
+///   (identity stamped right after the add, see [`selection::Record`]), never an
+///   unselected file that was there before. A restored torrent may be written over
+///   (its files are puppy's), so librqbit may write shared-piece bytes into a file that
+///   was already at an unselected path; a fresh add, or a choice made after a restart,
+///   never writes over an existing file.
 pub struct TorrentEngine {
     shared: Arc<Shared>,
 }
@@ -126,7 +131,10 @@ pub(crate) struct Entry {
     /// What to do about file selection when a magnet's metadata arrives.
     choice: FileChoice,
     /// The chosen files; `None`: every file (or not chosen yet).
-    selected: Option<Arc<Chosen>>,
+    pub(crate) selected: Option<Arc<Chosen>>,
+    /// librqbit's fetched-bytes counter of the current live session as last seen (a
+    /// change means it wrote data).
+    pub(crate) last_fetched: u64,
     pub(crate) slot: Slot,
     /// The state last broadcast by the poll task.
     pub(crate) last_state: Option<DownloadState>,
@@ -325,6 +333,9 @@ impl Shared {
                     e.layout.path.clone(),
                 );
                 st.total_bytes = e.info.as_ref().map(|i| i.total_bytes);
+                if let Slot::Choosing { reason, .. } = &e.slot {
+                    st.note = reason.clone();
+                }
                 Some(View::Pending(st))
             }
             Slot::Managed(h) => Some(View::Managed {
@@ -562,7 +573,7 @@ impl Shared {
                 .parent()
                 .map(Path::to_owned)
                 .unwrap_or_else(|| output.clone());
-            let files = c.deletable(info);
+            let files = c.deletable(&output, info);
             tokio::task::spawn_blocking(move || source::delete_listed(&output, &files, &keep))
                 .await
                 .map_err(std::io::Error::other)??;
@@ -676,12 +687,9 @@ impl Shared {
                 // The fetch may have chosen files (and recorded them) before it added.
                 if let Ok(info) = source::parse_torrent(&bytes) {
                     let info = Arc::new(info);
-                    let chosen = match Sidecar::read(&self.selection_file(id)) {
-                        Some(Sidecar::Selected { indices, created }) => {
-                            Some(Arc::new(Chosen::new(&info, indices, created)))
-                        }
-                        _ => None,
-                    };
+                    let chosen = Sidecar::read(&self.selection_file(id))
+                        .and_then(|sc| sc.chosen(&info))
+                        .map(Arc::new);
                     if let Some(e) = self.lock().get_mut(&id) {
                         e.info = Some(info);
                         e.selected = chosen;
@@ -699,6 +707,95 @@ impl Shared {
         }
     }
 
+    /// Writes download `id`'s file selection (with its placeholder record) to its
+    /// sidecar, if it has one.
+    pub(crate) fn persist_choice(&self, id: DownloadId) {
+        let sidecar = self
+            .lock()
+            .get(&id)
+            .and_then(|e| e.selected.as_ref().map(|c| c.sidecar()));
+        if let Some(sc) = sidecar
+            && let Err(e) = sc.write(&self.selection_file(id))
+        {
+            tracing::warn!(id, "recording the file selection: {e}");
+        }
+    }
+
+    /// Records when librqbit last wrote the data of torrents with chosen files: now, if
+    /// it fetched anything since the last look (it may have written bytes of shared
+    /// pieces into placeholders up to then).
+    pub(crate) fn note_writes(&self) {
+        let todo: Vec<_> = self
+            .lock()
+            .iter()
+            .filter_map(|(&id, e)| match (&e.slot, &e.selected) {
+                (Slot::Managed(h), Some(_)) => Some((id, h.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, h) in todo {
+            let fetched = h.stats().live.map_or(0, |l| l.snapshot.fetched_bytes);
+            let mut map = self.lock();
+            let Some(e) = map.get_mut(&id) else {
+                continue;
+            };
+            if fetched != e.last_fetched {
+                e.last_fetched = fetched;
+                if fetched > 0
+                    && let Some(c) = &mut e.selected
+                {
+                    Arc::make_mut(c).record.last_write_ns = Some(selection::now_ns());
+                }
+            }
+        }
+    }
+
+    /// Stamps the placeholders of selected torrents once librqbit has created them
+    /// (past its initial check), and records them (see [`selection::Record`]).
+    pub(crate) fn stamp_placeholders(&self) {
+        let todo: Vec<_> = self
+            .lock()
+            .iter()
+            .filter_map(|(&id, e)| {
+                let (Slot::Managed(h), Some(c), Some(info)) = (&e.slot, &e.selected, &e.info)
+                else {
+                    return None;
+                };
+                c.needs_stamps().then(|| {
+                    (
+                        id,
+                        h.clone(),
+                        (**c).clone(),
+                        info.clone(),
+                        e.layout.output_folder.clone(),
+                    )
+                })
+            })
+            .collect();
+        for (id, h, mut c, info, output) in todo {
+            if h.with_state(|s| matches!(s, ManagedTorrentState::Initializing(_))) {
+                continue;
+            }
+            if !c.stamp(&output, &info) {
+                continue;
+            }
+            let stamped = match self.lock().get_mut(&id) {
+                Some(e) if matches!(&e.slot, Slot::Managed(x) if Arc::ptr_eq(x, &h)) => {
+                    if let Some(cur) = &mut e.selected {
+                        // Keep what the poll recorded meanwhile.
+                        c.record.last_write_ns = cur.record.last_write_ns;
+                        *cur = Arc::new(c);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if stamped {
+                self.persist_choice(id);
+            }
+        }
+    }
+
     /// The file selection recorded for download `id`, with `h`'s contents (`None`: every
     /// file).
     fn recorded_choice(
@@ -706,13 +803,10 @@ impl Shared {
         id: DownloadId,
         h: &ManagedTorrentHandle,
     ) -> Option<(Chosen, TorrentInfo)> {
-        let Some(Sidecar::Selected { indices, created }) = Sidecar::read(&self.selection_file(id))
-        else {
-            return None;
-        };
+        let sidecar = Sidecar::read(&self.selection_file(id))?;
         let bytes = h.with_metadata(|m| m.torrent_bytes.clone()).ok()?;
         let info = source::parse_torrent(&bytes).ok()?;
-        Some((Chosen::new(&info, indices, created), info))
+        Some((sidecar.chosen(&info)?, info))
     }
 
     /// Writes the stored `.torrent` copy of download `id` (a failure is only logged:
@@ -893,7 +987,12 @@ async fn resolve_and_add(
     source::validate_layout(&listed.info).map_err(invalid)?;
     let bytes = listed.torrent_bytes;
     let info = Arc::new(source::parse_torrent(&bytes).map_err(invalid)?);
-    let decision = selection::decide(&info, choice, true).map_err(ResolveFailure::permanent)?;
+    // A choice recorded for this download wins (a magnet restored from its link, or
+    // resumed after a failed add): it knows the placeholders created before.
+    let decision = match Sidecar::read(&files.selection) {
+        Some(recorded) => selection::decide_restored(Some(recorded), &info),
+        None => selection::decide(&info, choice, true).map_err(ResolveFailure::permanent)?,
+    };
     let chosen = match decision {
         Decision::Choose(reason) => {
             if let Err(e) = write_stored_copy(&files.stored, &bytes) {
@@ -915,10 +1014,10 @@ async fn resolve_and_add(
             opts.only_files = listed.only_files;
             None
         }
-        Decision::Select { indices, created } => {
+        Decision::Select { indices, record } => {
             let output = PathBuf::from(opts.output_folder.clone().unwrap_or_default());
-            let created = selection::created_stubs(&output, &info, &indices, &created);
-            let c = Chosen::new(&info, indices, created);
+            let record = selection::created_stubs(&output, &info, &indices, &record);
+            let c = Chosen::new(&info, indices, record);
             opts.only_files = Some(info.lib_indices(&c.indices));
             if let Err(e) = c.sidecar().write(&files.selection) {
                 tracing::warn!("recording the file selection: {e}");
@@ -926,6 +1025,7 @@ async fn resolve_and_add(
             Some(Arc::new(c))
         }
     };
+    let output_folder = opts.output_folder.clone();
     // A limit set while the metadata was being fetched.
     opts.ratelimits.download_bps = bps_limit(Some(limit.load(Ordering::Relaxed)));
     let mut peers = opts.initial_peers.take().unwrap_or_default();
@@ -944,6 +1044,8 @@ async fn resolve_and_add(
             if let Err(e) = write_stored_copy(&files.stored, &bytes) {
                 tracing::warn!("keeping the torrent's metadata: {e}");
             }
+            let output = PathBuf::from(output_folder.unwrap_or_default());
+            let chosen = chosen.map(|c| stamp_after_add(&c, &output, &info, &files.selection));
             Ok(Resolved::Added {
                 handle,
                 info,
@@ -960,6 +1062,23 @@ async fn resolve_and_add(
         }
         Err(e) => Err(ResolveFailure::new(format!("{e:#}"))),
     }
+}
+
+/// Stamps the placeholders librqbit has just created (its add creates every file of the
+/// torrent before it returns) and records them in `sidecar`.
+fn stamp_after_add(
+    c: &Arc<Chosen>,
+    output_folder: &Path,
+    info: &TorrentInfo,
+    sidecar: &Path,
+) -> Arc<Chosen> {
+    let mut c = (**c).clone();
+    if c.stamp(output_folder, info)
+        && let Err(e) = c.sidecar().write(sidecar)
+    {
+        tracing::warn!("recording the file selection: {e}");
+    }
+    Arc::new(c)
 }
 
 /// librqbit's `only_files` for `e` (`None`: every file).
@@ -1143,6 +1262,12 @@ impl TorrentEngine {
     /// the session never started.
     pub async fn shutdown(&self) {
         self.shared.abort_resolving();
+        // What was written so far, for deleting placeholders after a restart.
+        self.shared.note_writes();
+        let ids: Vec<_> = self.shared.lock().keys().copied().collect();
+        for id in ids {
+            self.shared.persist_choice(id);
+        }
         if let Some(session) = self.shared.started() {
             session.stop().await;
         }
@@ -1173,14 +1298,14 @@ impl TorrentEngine {
                 selection::decide_restored(Sidecar::read(&self.shared.selection_file(id)), &info)
             }
         };
-        let (indices, created) = match decision {
+        let (indices, record) = match decision {
             Decision::Choose(reason) => {
                 return self
                     .enter_choosing(id, bytes.into(), info, target, copy, opts, trackers, reason)
                     .await;
             }
-            Decision::All => (None, Vec::new()),
-            Decision::Select { indices, created } => (Some(indices), created),
+            Decision::All => (None, Default::default()),
+            Decision::Select { indices, record } => (Some(indices), record),
         };
         let session = self.shared.session().await?;
         let (layout, overwrite, chosen) = {
@@ -1188,9 +1313,9 @@ impl TorrentEngine {
             check_free(&map, id, &info.info_hash)?;
             let (layout, overwrite) = target.layout(&info, &map);
             let chosen = indices.map(|indices| {
-                let created =
-                    selection::created_stubs(&layout.output_folder, &info, &indices, &created);
-                Arc::new(Chosen::new(&info, indices, created))
+                let record =
+                    selection::created_stubs(&layout.output_folder, &info, &indices, &record);
+                Arc::new(Chosen::new(&info, indices, record))
             });
             map.insert(
                 id,
@@ -1207,6 +1332,7 @@ impl TorrentEngine {
                     info: Some(info.clone()),
                     choice: FileChoice::All,
                     selected: chosen.clone(),
+                    last_fetched: 0,
                     slot: Slot::Adding,
                     last_state: None,
                     completed_sent: false,
@@ -1264,8 +1390,17 @@ impl TorrentEngine {
                 ));
             }
         };
+        let chosen = chosen.map(|c| {
+            stamp_after_add(
+                &c,
+                &layout.output_folder,
+                &info,
+                &self.shared.selection_file(id),
+            )
+        });
         if let Some(e) = self.shared.lock().get_mut(&id) {
             e.slot = Slot::Managed(handle);
+            e.selected = chosen.clone();
         }
         guard.armed = false;
         Ok(Added {
@@ -1294,7 +1429,9 @@ impl TorrentEngine {
         let layout = {
             let mut map = self.shared.lock();
             check_free(&map, id, &info.info_hash)?;
-            let (layout, overwrite) = target.layout(&info, &map);
+            // Never overwriting, even restored: nothing at its path was written by puppy
+            // (nothing is written while choosing).
+            let (layout, _) = target.layout(&info, &map);
             map.insert(
                 id,
                 Entry {
@@ -1302,7 +1439,7 @@ impl TorrentEngine {
                     name: info.name.clone(),
                     layout: layout.clone(),
                     magnet: None,
-                    overwrite,
+                    overwrite: false,
                     limit: opts.limit,
                     limit_cell: Arc::new(AtomicU64::new(opts.limit.unwrap_or(0))),
                     detail: None,
@@ -1310,6 +1447,7 @@ impl TorrentEngine {
                     info: Some(info.clone()),
                     choice: FileChoice::All,
                     selected: None,
+                    last_fetched: 0,
                     slot: Slot::Choosing {
                         bytes: bytes.clone(),
                         trackers,
@@ -1401,6 +1539,7 @@ impl TorrentEngine {
                 info: None,
                 choice,
                 selected: None,
+                last_fetched: 0,
                 slot,
                 last_state: None,
                 completed_sent: false,
@@ -1424,6 +1563,8 @@ impl TorrentEngine {
         keep_copy: bool,
     ) -> Result<(), EngineError> {
         let _ops = self.shared.ops.lock().await;
+        // Placeholders written up to now are librqbit's (see `selection::Record`).
+        self.shared.note_writes();
         let e = {
             let mut map = self.shared.lock();
             match map.get(&id) {
@@ -1523,17 +1664,9 @@ impl TorrentEngine {
                         Err(e) => tracing::warn!(id, "reading the stored metadata: {e}"),
                     }
                 }
-                let choice = match Sidecar::read(&self.shared.selection_file(id)) {
-                    Some(Sidecar::Choosing { .. }) => FileChoice::Ask,
-                    Some(Sidecar::Selected { indices, .. }) => FileChoice::Select {
-                        selection: Selection {
-                            indices,
-                            globs: Vec::new(),
-                        },
-                    },
-                    None => req.files,
-                };
-                return self.add_magnet(id, uri, target, opts, choice);
+                // A recorded choice (with its placeholders) is applied by the metadata
+                // task (see `resolve_and_add`); else the request's.
+                return self.add_magnet(id, uri, target, opts, req.files);
             }
             Source::TorrentFile { path } => path,
             Source::Http { .. } => return Err(EngineError::Unsupported("not a torrent source")),
@@ -1590,6 +1723,7 @@ impl TorrentEngine {
                 info: None,
                 choice: FileChoice::All,
                 selected: None,
+                last_fetched: 0,
                 slot: Slot::Attention(AttentionReason::ValidationFailed {
                     detail: TORRENT_MISSING.into(),
                 }),
@@ -1914,7 +2048,12 @@ impl Engine for TorrentEngine {
             }
         };
         let task = match taken {
-            Ok(h) => return self.shared.pause_managed(&h).await,
+            Ok(h) => {
+                self.shared.note_writes();
+                let res = self.shared.pause_managed(&h).await;
+                self.shared.persist_choice(id);
+                return res;
+            }
             Err(task) => task,
         };
         task.abort();
@@ -2036,14 +2175,12 @@ impl Engine for TorrentEngine {
             }
         };
         let mut info = source::parse_torrent(&bytes)?;
-        match Sidecar::read(&self.shared.selection_file(id)) {
+        let chosen = match Sidecar::read(&self.shared.selection_file(id)) {
             // Never added to librqbit: nothing of it is on disk.
             Some(Sidecar::Choosing { .. }) => return Ok(()),
-            Some(Sidecar::Selected { indices, created }) => {
-                info.files = Chosen::new(&info, indices, created).deletable(&info);
-            }
-            None => {}
-        }
+            Some(sc) => sc.chosen(&info),
+            None => None,
+        };
         let placement = self.shared.placement(id).await;
         let Some((output, keep)) = source::completed_folders(path, &info, placement) else {
             tracing::warn!(
@@ -2053,9 +2190,14 @@ impl Engine for TorrentEngine {
             );
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || source::delete_listed(&output, &info.files, &keep))
-            .await
-            .map_err(std::io::Error::other)??;
+        tokio::task::spawn_blocking(move || {
+            if let Some(c) = chosen {
+                info.files = c.deletable(&output, &info);
+            }
+            source::delete_listed(&output, &info.files, &keep)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(())
     }
 
@@ -2212,14 +2354,16 @@ impl Engine for TorrentEngine {
     /// selection.
     async fn select_files(&self, id: DownloadId, sel: Selection) -> Result<(), EngineError> {
         let _ops = self.shared.ops.lock().await;
-        let (info, bytes, trackers, layout, limit, overwrite) = {
+        let (info, bytes, trackers, reason, layout, limit) = {
             let map = self.shared.lock();
             let e = map
                 .get(&id)
                 .filter(|e| !matches!(e.slot, Slot::Adding))
                 .ok_or(EngineError::NotFound(id))?;
             let Slot::Choosing {
-                bytes, trackers, ..
+                bytes,
+                trackers,
+                reason,
             } = &e.slot
             else {
                 return Err(EngineError::Invalid("not choosing files".into()));
@@ -2232,54 +2376,99 @@ impl Engine for TorrentEngine {
                 info,
                 bytes.clone(),
                 trackers.clone(),
+                reason.clone(),
                 e.layout.clone(),
                 e.limit,
-                e.overwrite,
             )
         };
         let indices =
             selection::resolve(&info.torrent_files(), &sel).map_err(EngineError::Invalid)?;
         let chosen = (indices.len() < info.files.len()).then(|| {
-            let created = selection::created_stubs(&layout.output_folder, &info, &indices, &[]);
-            Arc::new(Chosen::new(&info, indices, created))
+            let record = selection::created_stubs(
+                &layout.output_folder,
+                &info,
+                &indices,
+                &Default::default(),
+            );
+            Arc::new(Chosen::new(&info, indices, record))
         });
+        // Never over existing files: puppy wrote nothing at this path while choosing.
         let mut opts = self
             .shared
-            .add_options(&layout, true, limit, overwrite, trackers)?;
+            .add_options(&layout, true, limit, false, trackers)?;
         opts.only_files = chosen.as_ref().map(|c| info.lib_indices(&c.indices));
-        let session = self.shared.session().await?;
-        let handle = match session
-            .add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
-            .await
-            .map_err(|e| {
-                if is_already_exists(&e) {
-                    tracing::warn!(id, "{e:#}");
-                    EngineError::Invalid(EXISTS.into())
-                } else {
-                    lib_error(e)
-                }
-            })? {
-            AddTorrentResponse::Added(_, h) => h,
-            AddTorrentResponse::AlreadyManaged(..) => {
-                return Err(EngineError::Invalid(DUPLICATE.into()));
-            }
-            AddTorrentResponse::ListOnly(_) => {
-                return Err(EngineError::Invalid(
-                    "unexpected list-only answer from librqbit".into(),
-                ));
-            }
-        };
+        // What librqbit creates if the add fails half-way (it creates the files one by
+        // one and stops at one already there): removed again, if still empty.
+        let missing: Vec<PathBuf> = info
+            .files
+            .iter()
+            .filter(|rel| {
+                matches!(
+                    std::fs::symlink_metadata(layout.output_folder.join(rel)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+            .cloned()
+            .collect();
+        // Recorded before the add (the placeholders librqbit is about to create are
+        // ours); back to choosing if the add fails.
         let path = self.shared.selection_file(id);
-        let recorded = match &chosen {
-            Some(c) => c.sidecar().write(&path),
+        match &chosen {
+            Some(c) => c.sidecar().write(&path)?,
             None => match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
             },
-        };
-        if let Err(e) = recorded {
-            tracing::warn!(id, "recording the file selection: {e}");
         }
+        let added = async {
+            let session = self.shared.session().await?;
+            let res = session
+                .add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
+                .await
+                .map_err(|e| {
+                    if is_already_exists(&e) {
+                        tracing::warn!(id, "{e:#}");
+                        EngineError::Invalid(EXISTS.into())
+                    } else {
+                        lib_error(e)
+                    }
+                })?;
+            match res {
+                AddTorrentResponse::Added(_, h) => Ok((session, h)),
+                AddTorrentResponse::AlreadyManaged(..) => {
+                    Err(EngineError::Invalid(DUPLICATE.into()))
+                }
+                AddTorrentResponse::ListOnly(_) => Err(EngineError::Invalid(
+                    "unexpected list-only answer from librqbit".into(),
+                )),
+            }
+        }
+        .await;
+        let (session, handle) = match added {
+            Ok(x) => x,
+            Err(e) => {
+                if let Err(w) = (Sidecar::Choosing { reason }).write(&path) {
+                    tracing::warn!(id, "recording that files must be chosen: {w}");
+                }
+                let output = layout.output_folder.clone();
+                let left: Vec<PathBuf> = missing
+                    .into_iter()
+                    .filter(|rel| {
+                        std::fs::symlink_metadata(output.join(rel))
+                            .is_ok_and(|m| m.file_type().is_file() && m.len() == 0)
+                    })
+                    .collect();
+                if !left.is_empty() {
+                    let keep = output.parent().map(Path::to_owned).unwrap_or_default();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        source::delete_listed(&output, &left, &keep)
+                    })
+                    .await;
+                }
+                return Err(e);
+            }
+        };
+        let chosen = chosen.map(|c| stamp_after_add(&c, &layout.output_folder, &info, &path));
         let installed = match self.shared.lock().get_mut(&id) {
             Some(e) => {
                 e.slot = Slot::Managed(handle.clone());
@@ -2549,6 +2738,7 @@ mod tests {
             info: None,
             choice: FileChoice::All,
             selected: None,
+            last_fetched: 0,
             slot: Slot::Held,
             last_state: None,
             completed_sent: false,

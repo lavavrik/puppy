@@ -107,6 +107,7 @@ mod tests {
             connections: None,
             peers: None,
             next_retry_unix: None,
+            note: None,
         }
     }
 

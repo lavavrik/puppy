@@ -47,7 +47,10 @@ pub struct TorrentConfig {
     pub seed_ratio: f32,
     /// Seed for at most this long (`"2h"`, `"30m"`, `0` disables the trigger). With both
     /// triggers off a torrent stops at completion.
-    #[serde(with = "duration_text")]
+    #[serde(
+        serialize_with = "duration_text::serialize",
+        deserialize_with = "duration_text::seed_time"
+    )]
     pub seed_time: Duration,
 }
 
@@ -60,20 +63,31 @@ mod duration_text {
         s.collect_str(&humantime::format_duration(*d))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+    /// `seed_time` (errors name the key).
+    pub fn seed_time<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+        named(de, "seed_time")
+    }
+
+    /// A duration whose errors name `key`.
+    pub fn named<'de, D: Deserializer<'de>>(de: D, key: &str) -> Result<Duration, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Text {
             Secs(u64),
             Str(String),
         }
-        match Text::deserialize(de)? {
+        let text = Text::deserialize(de).map_err(|_| {
+            de::Error::custom(format!(
+                "{key}: expected a duration such as \"2h\", \"30m\" or 0"
+            ))
+        })?;
+        match text {
             Text::Secs(n) => Ok(Duration::from_secs(n)),
             Text::Str(s) => match s.trim() {
                 "0" => Ok(Duration::ZERO),
                 t => humantime::parse_duration(t).map_err(|e| {
                     de::Error::custom(format!(
-                        "seed_time: invalid duration {t:?} ({e}); use e.g. \"2h\", \"30m\" or 0"
+                        "{key}: invalid duration {t:?} ({e}); use e.g. \"2h\", \"30m\" or 0"
                     ))
                 }),
             },
@@ -252,6 +266,12 @@ mod tests {
         std::fs::write(&p, "[torrent]\nseed_time = \"soon\"\n").unwrap();
         let err = Config::load(&p).unwrap_err().to_string();
         assert!(err.contains("seed_time"), "{err}");
+        std::fs::write(&p, "[torrent]\nseed_time = true\n").unwrap();
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("seed_time") && err.contains("duration"),
+            "{err}"
+        );
         // Serializes back to something it can read.
         let t = TorrentConfig::default();
         let s = toml::to_string(&t).unwrap();

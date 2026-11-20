@@ -127,6 +127,7 @@ pub(crate) fn status(s: &Stats, name: String, path: PathBuf) -> DownloadStatus {
         up_bps: if active { s.up_bps } else { 0 },
         eta_secs,
         peers: Some(if s.phase == Phase::Live { s.peers } else { 0 }),
+        note: None,
     }
 }
 
@@ -142,6 +143,7 @@ pub(crate) fn pending_status(state: DownloadState, name: String, path: PathBuf) 
         up_bps: 0,
         eta_secs: None,
         peers: Some(0),
+        note: None,
     }
 }
 

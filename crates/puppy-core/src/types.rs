@@ -131,6 +131,10 @@ pub struct DownloadStatus {
     /// Connected peers (torrents); `None` for engines without peers.
     #[serde(default)]
     pub peers: Option<u32>,
+    /// Why the download is in its state, when the engine has something to say (a torrent
+    /// choosing files although a choice was given: why that choice did not fit).
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

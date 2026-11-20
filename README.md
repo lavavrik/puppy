@@ -248,6 +248,14 @@ Things to know about v1:
   the files the torrent lists, then its folders once empty; anything else in
   them stays. A torrent whose `.torrent` file is gone (shown as "torrent file
   missing") leaves its files on disk, even when asked to delete them.
+- **Choosing only some files**: librqbit still creates every file of the
+  torrent, so unselected files show up as empty placeholders. A placeholder
+  also gets the bytes of a piece it shares with a selected file. Deleting
+  removes the selected files and the placeholders puppy's download created, as
+  long as they are unchanged; a file that was already there, or that you
+  replaced or edited, stays. After a restart, a file that was already at an
+  unselected path (one puppy did not create) may still get those shared-piece
+  bytes written into it when the torrent goes on.
 - **DHT is on by default, UPnP is off.** Trackers and local peer discovery are
   used too (`lsd = false` turns the latter off). If the torrent engine cannot
   start, torrents fail with "torrent engine unavailable (see daemon log)" and

@@ -110,6 +110,7 @@ impl Inner {
             connections,
             peers,
             next_retry_unix: e.retry.map(|r| r.unix),
+            note: status.as_ref().and_then(|s| s.note.clone()),
         };
         (snap, detail)
     }
