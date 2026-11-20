@@ -6,7 +6,7 @@ use puppy_core::config::HttpConfig;
 use puppy_core::engine::Engine;
 use puppy_core::http::engine::HttpEngine;
 use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
-use puppy_daemon::server::Server;
+use puppy_daemon::server::{InFlightStats, QUEUE_CAP, Server};
 use puppy_daemon::{Config, Manager, SocketName, Store};
 use puppy_proto::{
     Envelope, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg,
@@ -57,6 +57,7 @@ struct Harness {
     name: SocketName,
     manager: Arc<Manager>,
     clients: Arc<AtomicUsize>,
+    in_flight: Arc<InFlightStats>,
     shutdown: CancellationToken,
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -83,6 +84,7 @@ impl Harness {
             assert_eq!(mode & 0o777, 0o600, "socket file mode");
         }
         let clients = server.client_count();
+        let in_flight = server.in_flight_stats();
         let shutdown = server.shutdown_requested();
         let stop = CancellationToken::new();
         let task = Some(tokio::spawn(server.run(stop.clone())));
@@ -91,6 +93,7 @@ impl Harness {
             name,
             manager,
             clients,
+            in_flight,
             shutdown,
             stop,
             task,
@@ -618,5 +621,60 @@ async fn bind_fails_if_name_in_use() {
     // The first server is unaffected.
     let mut c = h.greeted().await;
     assert!(matches!(c.request(Request::List).await, Reply::Ok { .. }));
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_flood_is_bounded() {
+    let h = Harness::new().await;
+    let s = TestServer::start(ServerCfg::default()).await;
+    let mut b = h.greeted().await;
+    // Large List replies fill the flooding client's socket buffer quickly.
+    for i in 0..200 {
+        let r = b
+            .request(Request::Add {
+                request: h.req(&s, &format!("download-with-a-long-name-{i:04}.bin")),
+                start_paused: true,
+                limit: None,
+            })
+            .await;
+        assert!(matches!(r, Reply::Ok { .. }), "{r:?}");
+    }
+    let mut a = h.greeted().await;
+    let mut line = serde_json::to_vec(&Envelope {
+        req_id: 1,
+        body: Request::List,
+    })
+    .unwrap();
+    line.push(b'\n');
+    let batch: Vec<u8> = line.repeat(1000);
+    // A pipelines requests and never reads; its writes stall once the server
+    // stops reading from it.
+    let flood = tokio::spawn(async move {
+        for _ in 0..20 {
+            if a.wr.write_all(&batch).await.is_err() {
+                break;
+            }
+        }
+        a
+    });
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let t = Instant::now();
+        let r = b.request(Request::List).await;
+        let lat = t.elapsed();
+        assert!(matches!(r, Reply::Ok { .. }), "{r:?}");
+        assert!(lat < Duration::from_millis(500), "List took {lat:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let peak = h.in_flight.peak();
+    assert!(peak <= QUEUE_CAP + 1, "{peak} requests in flight at once");
+    // The stuck client is eventually disconnected; B stays connected.
+    wait_for("flooding client dropped", || {
+        h.clients.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    flood.abort();
+    assert!(matches!(b.request(Request::List).await, Reply::Ok { .. }));
     h.stop().await;
 }

@@ -953,6 +953,8 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

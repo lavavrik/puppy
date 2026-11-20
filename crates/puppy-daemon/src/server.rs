@@ -6,7 +6,9 @@
 //!   gets an error reply and the connection is closed.
 //! - One reader loop parses requests leniently (unknown methods get `bad_request` with
 //!   the caller's `req_id`; unparsable lines get `bad_request` with `req_id` 0) and spawns
-//!   a task per manager request, so slow requests never hold up others.
+//!   a task per manager request, so slow requests never hold up others. At most
+//!   [`QUEUE_CAP`] requests are in flight per connection; beyond that the reader stops
+//!   reading, so a client that pipelines without reading is pushed back by the socket.
 //! - One writer task owns the write half. It is fed by a bounded queue (capacity
 //!   [`QUEUE_CAP`]) for responses and discrete events, and by a latest-value slot for
 //!   snapshots, so a slow client only ever gets the newest snapshot. Queued messages
@@ -29,13 +31,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
-/// Per-connection queue for responses and discrete events.
+/// Per-connection queue for responses and discrete events; also the per-connection
+/// limit on manager requests in flight.
 pub const QUEUE_CAP: usize = 64;
 /// How long a response may wait for room in a client's queue before the client is
 /// considered stuck and its connection closed. Also bounds how long a connection
@@ -55,6 +58,40 @@ pub struct Server {
     manager: Arc<Manager>,
     clients: Arc<AtomicUsize>,
     shutdown: CancellationToken,
+    in_flight: Arc<InFlightStats>,
+}
+
+/// Server-wide count of spawned manager-request tasks (for tests and diagnostics).
+#[derive(Debug, Default)]
+pub struct InFlightStats {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl InFlightStats {
+    /// Requests currently being handled.
+    pub fn current(&self) -> usize {
+        self.now.load(Ordering::SeqCst)
+    }
+
+    /// The most requests ever handled at once.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(n, Ordering::SeqCst);
+        InFlightGuard(self.clone())
+    }
+}
+
+struct InFlightGuard(Arc<InFlightStats>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Server {
@@ -66,7 +103,7 @@ impl Server {
             SocketName::Path(p) => p.as_path().to_fs_name::<GenericFilePath>()?,
             SocketName::Pipe(n) => n.as_str().to_ns_name::<GenericNamespaced>()?,
         };
-        let listener = ListenerOptions::new().name(sock_name).create_tokio()?;
+        let listener = restrict_pipe(ListenerOptions::new().name(sock_name))?.create_tokio()?;
         // On error the listener is dropped, which removes the socket file again.
         restrict_socket(name)?;
         Ok(Self {
@@ -74,12 +111,18 @@ impl Server {
             manager,
             clients: Arc::new(AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
+            in_flight: Arc::default(),
         })
     }
 
     /// Number of currently open connections (handshaken or not).
     pub fn client_count(&self) -> Arc<AtomicUsize> {
         self.clients.clone()
+    }
+
+    /// Manager-request tasks in flight across all connections.
+    pub fn in_flight_stats(&self) -> Arc<InFlightStats> {
+        self.in_flight.clone()
     }
 
     /// Cancelled when a client sends `Shutdown` (after its `Done` reply is queued).
@@ -95,7 +138,7 @@ impl Server {
         loop {
             tokio::select! {
                 _ = stop.cancelled() => break,
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                Some(r) = tasks.join_next(), if !tasks.is_empty() => log_join(r),
                 r = self.listener.accept() => match r {
                     Ok(stream) => {
                         let guard = ClientGuard::new(&self.clients);
@@ -103,6 +146,7 @@ impl Server {
                             stream,
                             self.manager.clone(),
                             self.shutdown.clone(),
+                            self.in_flight.clone(),
                             conns.child_token(),
                         );
                         tasks.spawn(async move {
@@ -119,11 +163,24 @@ impl Server {
             }
         }
         conns.cancel();
-        let all_done = async { while tasks.join_next().await.is_some() {} };
+        let all_done = async {
+            while let Some(r) = tasks.join_next().await {
+                log_join(r);
+            }
+        };
         if timeout(DRAIN_TIMEOUT * 2, all_done).await.is_err() {
             debug!("aborting connections that did not finish in time");
         }
         // Dropping `tasks` aborts any stragglers.
+    }
+}
+
+/// Reports a panicked connection (or writer) task; cancellations are expected.
+fn log_join(r: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = r
+        && e.is_panic()
+    {
+        error!("connection task panicked: {e}");
     }
 }
 
@@ -138,10 +195,59 @@ fn restrict_socket(name: &SocketName) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn restrict_socket(_name: &SocketName) -> io::Result<()> {
-    // Named pipes keep the default security descriptor: full control for the creator
-    // owner, SYSTEM and administrators; everyone else may only open the pipe for
-    // reading, which is not enough to send `hello`.
     Ok(())
+}
+
+/// Windows: a protected DACL granting access to the current user only (the default
+/// one lets everyone open the pipe for reading). It applies to every pipe instance.
+#[cfg(windows)]
+fn restrict_pipe(opts: ListenerOptions<'_>) -> io::Result<ListenerOptions<'_>> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    let sddl = format!("D:P(A;;GA;;;{})", current_user_sid()?);
+    let sddl = widestring::U16CString::from_str(&sddl).map_err(io::Error::other)?;
+    Ok(opts.security_descriptor(SecurityDescriptor::deserialize(&sddl)?))
+}
+
+#[cfg(not(windows))]
+fn restrict_pipe(opts: ListenerOptions<'_>) -> io::Result<ListenerOptions<'_>> {
+    Ok(opts)
+}
+
+/// The string SID (`S-1-5-21-...`) of the user this process runs as.
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: plain Win32 calls; the token handle is closed on every path, the
+    // TOKEN_USER buffer is u64-aligned and sized by the first call, and the string
+    // from ConvertSidToStringSidW is NUL-terminated and freed with LocalFree.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+        let token_err = io::Error::last_os_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(token_err);
+        }
+        let user = &*buf.as_ptr().cast::<TOKEN_USER>();
+        let mut wide: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut wide) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = (0..).take_while(|&i| *wide.add(i) != 0).count();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(wide, n));
+        LocalFree(wide.cast());
+        Ok(sid)
+    }
 }
 
 /// Counts a connection for as long as it lives (also if its task is aborted).
@@ -235,6 +341,7 @@ async fn serve(
     stream: Stream,
     manager: Arc<Manager>,
     shutdown: CancellationToken,
+    in_flight: Arc<InFlightStats>,
     cancel: CancellationToken,
 ) {
     let (rd, mut wr) = tokio::io::split(stream);
@@ -266,14 +373,16 @@ async fn serve(
     }
 
     let (tx, rx) = mpsc::channel(QUEUE_CAP);
-    let (snap_tx, snap_rx) = watch::channel(None);
-    let mut writer = tokio::spawn(writer_task(wr, rx, snap_rx, cancel.clone()));
+    let snaps = Arc::new(SnapshotSlot(watch::channel(None).0));
+    let mut writer = tokio::spawn(writer_task(wr, rx, snaps.clone(), cancel.clone()));
     let mut conn = Conn {
         manager,
         shutdown,
         cancel: cancel.clone(),
+        in_flight,
+        permits: Arc::new(Semaphore::new(QUEUE_CAP)),
         tx,
-        snaps: Arc::new(snap_tx),
+        snaps,
         sub: None,
     };
     loop {
@@ -303,10 +412,14 @@ async fn serve(
     conn.unsubscribe().await;
     drop(conn);
     // The writer ends once in-flight requests have replied and everything is written.
-    if timeout(RESPONSE_TIMEOUT, &mut writer).await.is_err() {
-        cancel.cancel();
-        let _ = writer.await;
-    }
+    let r = match timeout(RESPONSE_TIMEOUT, &mut writer).await {
+        Ok(r) => r,
+        Err(_) => {
+            cancel.cancel();
+            writer.await
+        }
+    };
+    log_join(r);
 }
 
 /// Per-connection state owned by the reader loop.
@@ -314,8 +427,13 @@ struct Conn {
     manager: Arc<Manager>,
     shutdown: CancellationToken,
     cancel: CancellationToken,
+    in_flight: Arc<InFlightStats>,
+    /// Bounds this connection's in-flight manager requests. When they are used up the
+    /// reader stops reading, so a client pipelining requests without reading its
+    /// replies is pushed back through the socket instead of costing memory.
+    permits: Arc<Semaphore>,
     tx: mpsc::Sender<ServerMsg>,
-    snaps: Arc<watch::Sender<Option<ServerMsg>>>,
+    snaps: Arc<SnapshotSlot>,
     sub: Option<JoinHandle<()>>,
 }
 
@@ -361,12 +479,18 @@ impl Conn {
                 self.shutdown.cancel();
             }
             body => {
+                let permit = tokio::select! {
+                    _ = self.cancel.cancelled() => return,
+                    p = self.permits.clone().acquire_owned() => p.expect("semaphore never closed"),
+                };
                 let manager = self.manager.clone();
                 let tx = self.tx.clone();
                 let cancel = self.cancel.clone();
+                let counted = self.in_flight.enter();
                 // Detached on purpose: aborting a manager command half-way is never
                 // wanted; if the client is gone the reply is simply discarded.
                 tokio::spawn(async move {
+                    let _held = (permit, counted);
                     let result = match dispatch(&manager, body).await {
                         Ok(data) => ok(data),
                         Err(e) => err(e.code(), e.to_string()),
@@ -382,9 +506,9 @@ impl Conn {
     async fn unsubscribe(&mut self) {
         if let Some(sub) = self.sub.take() {
             sub.abort();
-            let _ = sub.await;
+            log_join(sub.await);
         }
-        self.snaps.send_replace(None);
+        self.snaps.clear();
     }
 }
 
@@ -449,7 +573,7 @@ async fn subscription(
     manager: Arc<Manager>,
     every: Duration,
     tx: mpsc::Sender<ServerMsg>,
-    snaps: Arc<watch::Sender<Option<ServerMsg>>>,
+    snaps: Arc<SnapshotSlot>,
 ) {
     let mut events = manager.events();
     let mut tick = tokio::time::interval(every);
@@ -461,10 +585,14 @@ async fn subscription(
             // The writer is gone (connection closed).
             _ = tx.closed() => return,
             _ = tick.tick() => {
-                let (downloads, totals) = manager.snapshot();
-                snaps.send_replace(Some(ServerMsg::Event {
-                    event: Event::Snapshot { downloads, totals },
-                }));
+                // A stalled client still has the last one: building another is wasted
+                // work (and it would be just as stale by the time it is written).
+                if !snaps.is_pending() {
+                    let (downloads, totals) = manager.snapshot();
+                    snaps.put(ServerMsg::Event {
+                        event: Event::Snapshot { downloads, totals },
+                    });
+                }
             }
             ev = events.recv() => match ev {
                 Ok(event) => match tx.try_send(ServerMsg::Event { event }) {
@@ -488,16 +616,48 @@ async fn subscription(
     }
 }
 
+/// Latest-value slot for a connection's snapshots. The writer takes the value out, so
+/// "pending" means written by the subscription but not yet taken by the writer.
+struct SnapshotSlot(watch::Sender<Option<ServerMsg>>);
+
+impl SnapshotSlot {
+    /// Replaces any pending snapshot and wakes the writer.
+    fn put(&self, msg: ServerMsg) {
+        self.0.send_replace(Some(msg));
+    }
+
+    /// Drops a pending snapshot.
+    fn clear(&self) {
+        self.0.send_if_modified(|v| {
+            *v = None;
+            false
+        });
+    }
+
+    fn is_pending(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    fn take(&self) -> Option<ServerMsg> {
+        let mut out = None;
+        self.0.send_if_modified(|v| {
+            out = v.take();
+            false
+        });
+        out
+    }
+}
+
 /// Writes queued messages first, then the newest snapshot if it changed. Ends when
 /// every queue sender is gone, on a write error (cancelling the connection), or on
 /// `cancel` (then flushing what is queued for up to [`DRAIN_TIMEOUT`]).
 async fn writer_task<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: mpsc::Receiver<ServerMsg>,
-    mut snaps: watch::Receiver<Option<ServerMsg>>,
+    slot: Arc<SnapshotSlot>,
     cancel: CancellationToken,
 ) {
-    let mut snaps_open = true;
+    let mut snaps = slot.0.subscribe();
     loop {
         let msg = tokio::select! {
             biased;
@@ -506,12 +666,9 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 Some(m) => m,
                 None => return,
             },
-            r = snaps.changed(), if snaps_open => {
-                if r.is_err() {
-                    snaps_open = false;
-                    continue;
-                }
-                match snaps.borrow_and_update().clone() {
+            // Never fails: `slot` keeps the sender alive.
+            _ = snaps.changed() => {
+                match slot.take() {
                     Some(m) => m,
                     None => continue,
                 }
@@ -553,5 +710,42 @@ async fn write_one<W: AsyncWrite + Unpin>(wr: &mut W, msg: &ServerMsg) -> io::Re
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap() -> ServerMsg {
+        ServerMsg::Event {
+            event: Event::Snapshot {
+                downloads: Vec::new(),
+                totals: Default::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_slot_pending_until_taken() {
+        let slot = SnapshotSlot(watch::channel(None).0);
+        let mut rx = slot.0.subscribe();
+        assert!(!slot.is_pending());
+        slot.put(snap());
+        assert!(slot.is_pending());
+        rx.changed().await.unwrap();
+        assert_eq!(slot.take(), Some(snap()));
+        assert!(
+            !slot.is_pending(),
+            "taken snapshots no longer count as pending"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "taking does not wake the writer"
+        );
+        slot.put(snap());
+        slot.clear();
+        assert!(!slot.is_pending());
+        assert_eq!(slot.take(), None);
     }
 }
