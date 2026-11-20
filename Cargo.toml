@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon", "crates/puppy-client", "crates/puppy"]
+members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon", "crates/puppy-client", "crates/puppy-tui", "crates/puppy"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,3 +28,7 @@ interprocess = { version = "2.4", features = ["tokio"] }
 anyhow = "1"
 fs4 = "1.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
