@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use puppy_client::{Client, Paths};
 use puppy_daemon::Config;
-use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
+use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run_daemon};
 use puppy_proto::WireState;
 use puppy_tui::api::ClientApi;
 use puppy_tui::theme::{Theme, ThemeChoice};
@@ -96,8 +96,14 @@ fn main() -> ExitCode {
 }
 
 async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
+    // Undocumented, for puppy's own tests of the real binary: the torrent engine stays
+    // off the network (no DHT, trackers, LSD or UPnP; listening on 127.0.0.1).
+    let torrent_test = (std::env::var_os("PUPPY_TORRENT_TEST_MODE").as_deref()
+        == Some("1".as_ref()))
+    .then(TorrentTestOptions::default);
     let outcome = run_daemon(DaemonOptions {
         idle_exit: idle_exit.map(Duration::from_secs),
+        torrent_test,
         ..DaemonOptions::default()
     })
     .await?;

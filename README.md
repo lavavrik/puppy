@@ -166,6 +166,10 @@ there. Things to know about v1:
   i.e. while a magnet is still fetching its metadata (librqbit takes a
   torrent's limit only when it is added); later the dashboard says so. The
   global limits apply to torrents at any time.
+- **After a daemon restart** an unfinished torrent re-checks the data already
+  on disk before it goes on; its progress shows 0 until the check is done.
+- **Removing a torrent whose `.torrent` file is gone** (shown as "torrent file
+  missing") leaves its files on disk, even when asked to delete them.
 - **DHT is on by default, UPnP is off.** Trackers and local peer discovery are
   used too.
 

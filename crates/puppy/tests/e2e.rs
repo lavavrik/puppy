@@ -39,18 +39,10 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        let env = Env {
+        Env {
             home: tempfile::tempdir().unwrap(),
             socket: socket_name(),
-        };
-        // The real binary starts a torrent engine: keep it off the network (no DHT;
-        // trackers and LSD are only used for torrents, which these tests never add).
-        std::fs::write(
-            env.paths().config_file(),
-            "[torrent]\ndht = false\nupnp = false\nlisten_port = 0\n",
-        )
-        .unwrap();
-        env
+        }
     }
 
     fn paths(&self) -> Paths {
@@ -71,6 +63,8 @@ impl Env {
             ("PUPPY_HOME", self.home.path().to_str().unwrap().to_string()),
             ("PUPPY_SOCKET", socket),
             ("PUPPY_IDLE_EXIT", "1".to_string()),
+            // The daemon's torrent engine stays off the network.
+            ("PUPPY_TORRENT_TEST_MODE", "1".to_string()),
         ]
     }
 

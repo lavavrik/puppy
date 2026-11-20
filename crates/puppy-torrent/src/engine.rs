@@ -100,6 +100,9 @@ pub(crate) struct Entry {
     pub(crate) last_state: Option<DownloadState>,
     /// `Completed` was broadcast (and seeding stopped).
     pub(crate) completed_sent: bool,
+    /// The torrent should be running: set by a non-paused add and by `resume`, cleared
+    /// by `pause`. librqbit's own paused flag can disagree (see [`Shared::unstick`]).
+    run_wanted: bool,
 }
 
 /// How long a synthesised piece map is reused by `detail`.
@@ -173,6 +176,9 @@ pub(crate) struct Shared {
     pub(crate) events: broadcast::Sender<EngineEvent>,
     pub(crate) opts: TorrentEngineOptions,
     next_gen: AtomicU64,
+    /// Serializes `pause`, `resume`, `remove` and [`Shared::unstick`], so a pause and an
+    /// unstick never interleave between their check and their action.
+    ops: tokio::sync::Mutex<()>,
 }
 
 impl Shared {
@@ -210,6 +216,9 @@ impl Shared {
     }
 
     /// Pauses a torrent in librqbit; already paused (or failed: nothing runs) is fine.
+    /// A stuck torrent (librqbit state `Paused` with its paused flag cleared, see
+    /// [`Shared::unstick`]) cannot be paused again (librqbit refuses: "already paused");
+    /// the caller's cleared `Entry::run_wanted` keeps it stopped instead.
     pub(crate) async fn pause_managed(&self, h: &ManagedTorrentHandle) -> Result<(), EngineError> {
         let idle = h.is_paused()
             || h.with_state(|s| {
@@ -226,13 +235,32 @@ impl Shared {
 
     /// Restarts a torrent left stopped against our wishes: one resumed while librqbit
     /// was still checking its data after a paused add. librqbit then clears its paused
-    /// flag but its check task still ends in `Paused`, where it would stay.
-    pub(crate) async fn unstick(&self, h: &ManagedTorrentHandle) -> Result<(), EngineError> {
-        let stuck =
-            || !h.is_paused() && h.with_state(|s| matches!(s, ManagedTorrentState::Paused(_)));
+    /// flag but its check task still ends in `Paused`, where it would stay. Acts only
+    /// if the torrent should run (`run_wanted`: no `pause` since the `resume`), checked
+    /// and acted on under the ops lock.
+    pub(crate) async fn unstick(
+        &self,
+        id: DownloadId,
+        h: &ManagedTorrentHandle,
+    ) -> Result<(), EngineError> {
+        let stuck = || {
+            let wanted = self.lock().get(&id).is_some_and(|e| {
+                e.run_wanted && matches!(&e.slot, Slot::Managed(x) if Arc::ptr_eq(x, h))
+            });
+            wanted && h.with_state(|s| matches!(s, ManagedTorrentState::Paused(_)))
+        };
+        // Cheap check first: the ops lock is only taken for a stuck torrent.
+        if !stuck() {
+            return Ok(());
+        }
+        let _ops = self.ops.lock().await;
         if !stuck() || h.stats().finished {
             return Ok(());
         }
+        tracing::debug!(
+            id,
+            "restarting a torrent resumed while it was being checked"
+        );
         self.session.unpause(h).await.map_err(lib_error)
     }
 
@@ -544,6 +572,7 @@ impl TorrentEngine {
             events,
             opts,
             next_gen: AtomicU64::new(0),
+            ops: tokio::sync::Mutex::new(()),
         });
         tokio::spawn(poll::run(Arc::downgrade(&shared), cancel.clone()));
         Ok(Self { shared, cancel })
@@ -602,6 +631,7 @@ impl TorrentEngine {
                     slot: Slot::Adding,
                     last_state: None,
                     completed_sent: false,
+                    run_wanted: !opts.start_paused,
                 },
             );
         }
@@ -681,6 +711,7 @@ impl TorrentEngine {
                 slot,
                 last_state: None,
                 completed_sent: false,
+                run_wanted: !opts.start_paused,
             },
         );
         Ok(Added {
@@ -752,6 +783,7 @@ impl TorrentEngine {
                 }),
                 last_state: None,
                 completed_sent: false,
+                run_wanted: false,
             },
         );
         Ok(Added {
@@ -964,12 +996,16 @@ impl Engine for TorrentEngine {
     }
 
     async fn pause(&self, id: DownloadId) -> Result<(), EngineError> {
+        let _ops = self.shared.ops.lock().await;
         let taken = {
             let mut map = self.shared.lock();
             let e = map
                 .get_mut(&id)
                 .filter(|e| !matches!(e.slot, Slot::Adding))
                 .ok_or(EngineError::NotFound(id))?;
+            // Before acting: a stuck torrent (see `Shared::unstick`) is paused for
+            // librqbit already, and must not be restarted.
+            e.run_wanted = false;
             match std::mem::replace(&mut e.slot, Slot::Held) {
                 Slot::Managed(h) => {
                     e.slot = Slot::Managed(h.clone());
@@ -1013,12 +1049,16 @@ impl Engine for TorrentEngine {
     }
 
     async fn resume(&self, id: DownloadId) -> Result<(), EngineError> {
+        let _ops = self.shared.ops.lock().await;
         let h = {
             let mut map = self.shared.lock();
             let e = map
                 .get_mut(&id)
                 .filter(|e| !matches!(e.slot, Slot::Adding))
                 .ok_or(EngineError::NotFound(id))?;
+            if !matches!(e.slot, Slot::Attention(_)) {
+                e.run_wanted = true;
+            }
             match &e.slot {
                 Slot::Managed(h) => h.clone(),
                 Slot::Resolving { .. } => return Ok(()),
@@ -1051,6 +1091,7 @@ impl Engine for TorrentEngine {
     /// multi-file torrent's or magnet's folder, a single-file torrent's file) and its
     /// stored `.torrent` copy. A magnet still fetching its metadata is cancelled.
     async fn remove(&self, id: DownloadId, delete_files: bool) -> Result<(), EngineError> {
+        let _ops = self.shared.ops.lock().await;
         let e = {
             let mut map = self.shared.lock();
             match map.get(&id) {
@@ -1064,6 +1105,14 @@ impl Engine for TorrentEngine {
             Slot::Resolving { task, .. } => {
                 task.abort();
                 task.await.ok().flatten()
+            }
+            Slot::Attention(_) if delete_files => {
+                tracing::warn!(
+                    id,
+                    path = %e.layout.path.display(),
+                    "removed without its .torrent: its files are left on disk"
+                );
+                None
             }
             Slot::Held | Slot::PendingFailed { .. } | Slot::Attention(_) | Slot::Adding => None,
         };

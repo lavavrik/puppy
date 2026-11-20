@@ -26,8 +26,9 @@ use tracing::{info, warn};
 /// After a second shutdown signal, how long the state may take to be saved before the
 /// daemon exits anyway.
 const FORCED_FLUSH: Duration = Duration::from_secs(1);
-/// How long the torrent session may take to stop (it normally takes about 1 s).
-const TORRENT_SHUTDOWN: Duration = Duration::from_secs(3);
+/// How long the torrent session may take to stop (it normally takes about 1 s). Taken
+/// from the manager's pause phase, so shutdown stays within its overall bound.
+const TORRENT_SHUTDOWN: Duration = Duration::from_millis(1500);
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -92,8 +93,9 @@ pub enum RunOutcome {
 /// request, a signal (Ctrl-C/SIGINT, SIGTERM, SIGHUP on Unix; Ctrl-C, console close,
 /// logoff and system shutdown on Windows) or — with `idle_exit` — that long without
 /// work or clients. Then it stops the server (removing the socket file), shuts the
-/// manager down (pausing downloads, at most 10 s, then persisting state), stops the
-/// torrent session (about 1 s, at most 3 s) and releases the lock. Another signal during that shutdown makes it save the state for at most
+/// manager down (pausing downloads, then persisting state), stops the torrent session
+/// (about 1 s) and releases the lock. Pausing plus stopping the session take at most
+/// 10 s together: the session's 1.5 s are taken from the pause phase. Another signal during that shutdown makes it save the state for at most
 /// 1 s and return [`RunOutcome::Forced`] at once.
 ///
 /// Fails without touching it if the state file exists but cannot be read.
@@ -114,7 +116,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     // Only the lock holder may touch the socket.
     remove_stale_socket(&paths.socket).await?;
 
-    let cfg = Config::load(&paths.config_file())?;
+    let mut cfg = Config::load(&paths.config_file())?;
     let http = opts.http.unwrap_or_else(|| cfg.http_config());
     let download_dir = http.default_dir.clone();
     let engine: Arc<dyn Engine> = match opts.engine {
@@ -125,6 +127,8 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     let mut engines = vec![engine];
     if let Some(t) = &torrent {
         engines.push(t.clone());
+        // The session stops after the pause phase, within the same overall bound.
+        cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(TORRENT_SHUTDOWN);
     }
     let store = Store::new(paths.state_file.clone());
     let manager = match Manager::start(engines, store, cfg).await {

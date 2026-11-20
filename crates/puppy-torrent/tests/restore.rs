@@ -281,3 +281,35 @@ async fn restore_missing_torrent_copy_needs_attention() {
     third.remove(1, false).await.unwrap();
     assert!(third.status(1).is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_right_after_verification_sticks() {
+    let seeder = Seeder::start_with_limit(&[("one.iso", 900 * KIB)], SLOW).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let req = torrent_req(root, &seeder);
+    let (added, _) = download_part_then_stop(root, &seeder, 3, req.clone()).await;
+
+    // Restored paused, resumed while librqbit checks the data, then paused as soon as the
+    // check is over (the scheduler pausing it, e.g. max_active lowered).
+    let second = engine(root, vec![seeder.addr]).await;
+    let (mode, opts) = restore(&added.path, true);
+    second.add(3, req, mode, opts).await.unwrap();
+    second.resume(3).await.unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let st = second.status(3).unwrap();
+        if st.state != DownloadState::Starting && st.done_bytes > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "check never ended: {st:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    second.pause(3).await.unwrap();
+    let paused = second.status(3).unwrap();
+    assert_eq!(paused.state, DownloadState::Paused);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let later = second.status(3).unwrap();
+    assert_eq!(later.state, DownloadState::Paused, "the pause was undone");
+    assert_eq!(later.done_bytes, paused.done_bytes, "progress while paused");
+}

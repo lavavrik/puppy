@@ -44,7 +44,7 @@ pub(crate) async fn poll_once(shared: &Shared) {
         })
         .collect();
     for (id, h) in handles {
-        if let Err(e) = shared.unstick(&h).await {
+        if let Err(e) = shared.unstick(id, &h).await {
             tracing::warn!(id, "restarting a resumed torrent: {e}");
         }
     }
