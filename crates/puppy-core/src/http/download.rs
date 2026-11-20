@@ -410,10 +410,16 @@ impl HttpDownload {
             .iter()
             .map(|e| {
                 let active = e.shared.active.load(Ordering::Relaxed);
+                let done = e.done();
+                // An unknown-length stream has no real end (internally `u64::MAX`).
+                let end = match self.inner.remote.total {
+                    None if st.plan.single => e.start + done,
+                    _ => e.shared.end(),
+                };
                 SegmentView {
                     start: e.start,
-                    end: e.shared.end(),
-                    done: e.done(),
+                    end,
+                    done,
                     bps: if active {
                         e.shared.bps.load(Ordering::Relaxed)
                     } else {
@@ -445,7 +451,7 @@ impl Inner {
     /// Records a transition and emits `StateChanged` (repeated states are not re-emitted).
     fn set_state(&self, state: DownloadState) {
         let mut st = self.lock();
-        if std::mem::discriminant(&st.state) == std::mem::discriminant(&state) {
+        if st.state == state {
             return;
         }
         st.state = state.clone();
@@ -568,6 +574,36 @@ impl Inner {
         }
     }
 
+    #[cfg(test)]
+    fn for_test(events: broadcast::Sender<EngineEvent>) -> Arc<Inner> {
+        let url = url::Url::parse("http://127.0.0.1:9/f").expect("static URL");
+        let env = Env::new(
+            1,
+            AddOptions::default(),
+            reqwest::Client::new(),
+            HttpConfig::default(),
+            TokenBucket::new(None),
+            events,
+        );
+        let remote = RemoteInfo {
+            final_url: url.clone(),
+            total: None,
+            accepts_ranges: false,
+            etag: None,
+            etag_strong: false,
+            last_modified: None,
+            filename: "f".into(),
+        };
+        let req = AddRequest {
+            source: Source::Http { url },
+            output_dir: None,
+            filename: None,
+            context: Default::default(),
+        };
+        env.build(req, remote, PathBuf::from("f"), Plan::single(None, false))
+            .0
+    }
+
     fn resume_state(&self) -> HttpResumeState {
         let (segments, single_stream, final_url) = {
             let st = self.lock();
@@ -605,5 +641,26 @@ impl Inner {
         if let Err(e) = self.resume_state().flush(file).await {
             tracing::warn!(id = self.id, "resume sidecar flush failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_state_propagates_a_changed_failure_reason() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let inner = Inner::for_test(tx);
+        let failed = |r: &str| DownloadState::Failed { reason: r.into() };
+        inner.set_state(failed("a"));
+        inner.set_state(failed("b"));
+        inner.set_state(failed("b")); // unchanged: not re-emitted
+        let mut seen = Vec::new();
+        while let Ok(EngineEvent::StateChanged { state, .. }) = rx.try_recv() {
+            seen.push(state);
+        }
+        assert_eq!(seen, vec![failed("a"), failed("b")]);
+        assert_eq!(inner.lock().state, failed("b"));
     }
 }

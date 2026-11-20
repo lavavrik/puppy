@@ -30,7 +30,7 @@ pub struct AddRequest {
     pub context: RequestContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttentionReason {
     RemoteChanged,
@@ -38,7 +38,7 @@ pub enum AttentionReason {
     ValidationFailed { detail: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DownloadState {
     Queued,

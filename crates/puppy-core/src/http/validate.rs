@@ -5,7 +5,7 @@ use crate::config::HttpConfig;
 use crate::engine::EngineError;
 use crate::http::probe::{apply_context, timed};
 use crate::http::resume::HttpResumeState;
-use crate::http::worker::parse_content_range;
+use crate::http::worker::{compressed, parse_content_range};
 use crate::types::RequestContext;
 use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
@@ -152,6 +152,9 @@ async fn fetch(
     let resp = timed(read_timeout, apply_context(rb, net.ctx).send())
         .await?
         .map_err(|e| EngineError::Network(e.to_string()))?;
+    if let Some(why) = compressed(resp.headers()) {
+        return Err(EngineError::Invalid(why));
+    }
     let content_range = resp
         .headers()
         .get(header::CONTENT_RANGE)

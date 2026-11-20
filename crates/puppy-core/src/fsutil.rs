@@ -53,9 +53,18 @@ fn truncate_name(name: &str, max: usize) -> String {
     format!("{}{}", &stem[..end], ext)
 }
 
-/// Returns a path in `dir` for `name` that collides with neither `name` nor `name.part`.
+/// Returns a path in `dir` for `name` that collides with none of `name`, `name.part` and
+/// `name.part.puppy`.
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let taken = |n: &str| dir.join(n).exists() || dir.join(format!("{n}.part")).exists();
+    let taken = |n: &str| {
+        [
+            n.to_string(),
+            format!("{n}.part"),
+            format!("{n}.part.puppy"),
+        ]
+        .iter()
+        .any(|c| fs::symlink_metadata(dir.join(c)).is_ok())
+    };
     if !taken(name) {
         return dir.join(name);
     }
@@ -385,6 +394,9 @@ mod tests {
         assert_eq!(unique_path(d.path(), "a.iso"), d.path().join("a (1).iso"));
         fs::write(d.path().join("a (1).iso.part"), b"x").unwrap();
         assert_eq!(unique_path(d.path(), "a.iso"), d.path().join("a (2).iso"));
+        // A leftover sidecar also claims its name.
+        fs::write(d.path().join("a (2).iso.part.puppy"), b"x").unwrap();
+        assert_eq!(unique_path(d.path(), "a.iso"), d.path().join("a (3).iso"));
     }
 
     #[tokio::test]

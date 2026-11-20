@@ -171,6 +171,15 @@ pub(crate) fn backoff(cfg: &HttpConfig, attempt: u32) -> Duration {
     Duration::from_millis(exp + jitter)
 }
 
+/// A body with a `Content-Encoding` is not the file's bytes (we only accept `identity`):
+/// returns the failure reason.
+pub(crate) fn compressed(h: &header::HeaderMap) -> Option<String> {
+    let enc = h.get(header::CONTENT_ENCODING)?;
+    let enc = String::from_utf8_lossy(enc.as_bytes()).trim().to_string();
+    (!enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+        .then(|| format!("server sent compressed content ({enc})"))
+}
+
 /// True if the response's ETag or Last-Modified equals the `If-Range` validator.
 fn carries_validator(h: &header::HeaderMap, validator: &str) -> bool {
     [header::ETAG, header::LAST_MODIFIED]
@@ -265,12 +274,17 @@ async fn attempt_once(
                 why: format!("HTTP {}", s.as_u16()),
             };
         }
+        // The range lies beyond the end of the file: it shrank.
+        StatusCode::RANGE_NOT_SATISFIABLE => return Attempt::Exit(WorkerExit::RemoteChanged),
         s if is_url_rejected(s.as_u16()) => {
             return Attempt::Exit(WorkerExit::UrlRejected(s.as_u16()));
         }
         s => return Attempt::Exit(WorkerExit::Fatal(format!("HTTP {}", s.as_u16()))),
     }
 
+    if let Some(why) = compressed(resp.headers()) {
+        return Attempt::Exit(WorkerExit::Fatal(why));
+    }
     let mut stream = resp.bytes_stream();
     let mut progress = false;
     loop {

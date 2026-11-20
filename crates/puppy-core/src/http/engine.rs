@@ -59,7 +59,10 @@ struct Reservation<'a> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.map.lock().unwrap().remove(&self.id);
+            self.map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
         }
     }
 }

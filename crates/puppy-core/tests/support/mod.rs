@@ -34,6 +34,8 @@ pub struct ServerCfg {
     pub fail_after_bytes_once: Option<u64>,
     /// Accept requests but never answer them (checked when a request arrives).
     pub stall_headers: bool,
+    /// `Content-Encoding` sent with GET responses (the body stays uncompressed).
+    pub content_encoding: Option<String>,
 }
 
 impl Default for ServerCfg {
@@ -52,6 +54,7 @@ impl Default for ServerCfg {
             bytes_per_sec: None,
             fail_after_bytes_once: None,
             stall_headers: false,
+            content_encoding: None,
         }
     }
 }
@@ -305,6 +308,9 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
         return builder.body(body).unwrap();
     }
 
+    if let Some(enc) = &cfg.content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, enc.as_str());
+    }
     let fail_at = match cfg.fail_after_bytes_once {
         Some(n) if body_len > n && !sh.fail_used.swap(true, Ordering::SeqCst) => Some(n),
         _ => None,

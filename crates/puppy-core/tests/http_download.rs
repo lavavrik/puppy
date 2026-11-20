@@ -219,6 +219,9 @@ async fn unknown_length_single_stream() {
     assert_eq!(st.total_bytes, None);
     assert_eq!(st.eta_secs, None);
     wait_state(&dl, is_completed, TIMEOUT).await;
+    // No real end is known: the detail view ends the segment where its data ends.
+    let (segs, _) = segments(&dl);
+    assert_eq!((segs[0].start, segs[0].end, segs[0].done), (0, MIB, MIB));
     assert_file(&added.path, MIB, 0);
     assert_no_leftovers(&added.path);
 }
@@ -562,4 +565,25 @@ async fn finalize_does_not_overwrite_appeared_file() {
         changed |= matches!(ev, EngineEvent::StateChanged { id: 1, .. });
     }
     assert!(changed);
+}
+
+#[tokio::test]
+async fn compressed_response_fails_without_writing() {
+    for ranges in [true, false] {
+        let s = server(|c| {
+            c.len = 64 * KIB;
+            c.ranges = ranges;
+            c.content_encoding = Some("br".into());
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (dl, added) = start(&s, dir.path(), cfg(dir.path())).await;
+        let st = wait_state(&dl, |s| matches!(s, DownloadState::Failed { .. }), TIMEOUT).await;
+        assert!(
+            matches!(&st.state, DownloadState::Failed { reason } if reason == "server sent compressed content (br)"),
+            "{st:?}"
+        );
+        assert_eq!(st.done_bytes, 0);
+        assert!(!added.path.exists());
+    }
 }

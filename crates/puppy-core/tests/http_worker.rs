@@ -271,3 +271,29 @@ async fn worker_retries_after_read_timeout() {
         assert_eq!(*b, body_byte(i as u64, 0), "byte {i}");
     }
 }
+
+#[tokio::test]
+async fn worker_416_mid_download_is_remote_changed() {
+    // The file shrank below the segment: the server cannot satisfy the range.
+    let s = server(|c| c.len = 1000).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(&s, rw_file(&dir), Some("\"v0\""));
+    let exit = run_segment(&ctx, 2000, seg(2000, 5000)).await;
+    assert_eq!(exit, WorkerExit::RemoteChanged);
+}
+
+#[tokio::test]
+async fn worker_refuses_compressed_body() {
+    let s = server(|c| c.content_encoding = Some("gzip".into())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(&s, rw_file(&dir), Some("\"v0\""));
+    let exit = run_segment(&ctx, 0, seg(0, 5000)).await;
+    assert_eq!(
+        exit,
+        WorkerExit::Fatal("server sent compressed content (gzip)".into())
+    );
+    assert!(
+        read_all(&dir).iter().all(|b| *b == 0),
+        "compressed bytes written"
+    );
+}
