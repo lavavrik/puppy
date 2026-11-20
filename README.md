@@ -137,7 +137,8 @@ and the files in [packaging/](packaging/).
 State lives in the platform data directory (`~/.local/share/puppy`,
 `~/Library/Application Support/puppy` or `%APPDATA%\puppy`); the daemon's log
 is `logs/puppyd.log` there. `config.toml` lives in the config directory
-(`~/.config/puppy` on Linux, the data directory elsewhere).
+(`~/.config/puppy` on Linux, the data directory elsewhere). Setting
+`PUPPY_HOME=<dir>` relocates both (config in `<dir>/config`, data in `<dir>/data`).
 
 ## Project layout
 

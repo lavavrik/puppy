@@ -1792,6 +1792,7 @@ dependencies = [
  "puppy-daemon",
  "puppy-proto",
  "puppy-testserver",
+ "puppy-tui",
  "serde_json",
  "tempfile",
  "tokio",
