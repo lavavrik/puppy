@@ -30,19 +30,21 @@ impl Paths {
     /// the platform defaults, creating the directories (mode 0700 on Unix).
     ///
     /// `PUPPY_SOCKET` is a socket file path on Unix and a bare pipe name on
-    /// Windows (a leading `\\.\pipe\` is stripped). Its parent directory is
+    /// Windows (a leading `\\.\pipe\` is stripped). Without it, on Unix, the socket is
+    /// `$XDG_RUNTIME_DIR/puppy/puppy.sock`, or `<data_dir>/puppy.sock` when there is
+    /// no runtime dir or `PUPPY_HOME` is set (each home gets its own daemon). Its parent directory is
     /// created if missing but its permissions are never changed. Unix socket
     /// paths longer than 100 bytes are rejected (`sun_path` limit); tests on
     /// macOS should therefore use short paths, e.g. under `/tmp`.
     pub fn resolve() -> io::Result<Self> {
-        let (data_dir, config_dir) = match std::env::var_os("PUPPY_HOME").filter(|v| !v.is_empty())
-        {
-            Some(home) => home_dirs(Path::new(&home)),
+        let home = std::env::var_os("PUPPY_HOME").filter(|v| !v.is_empty());
+        let (data_dir, config_dir) = match &home {
+            Some(home) => home_dirs(Path::new(home)),
             None => default_dirs()?,
         };
         let socket_override = std::env::var("PUPPY_SOCKET").ok().filter(|v| !v.is_empty());
         let overridden = socket_override.is_some();
-        let socket = socket_name(socket_override, &data_dir);
+        let socket = socket_name(socket_override, &data_dir, home.is_some());
         Self::build(data_dir, config_dir, socket, overridden)
     }
 
@@ -111,19 +113,23 @@ fn default_dirs() -> io::Result<(PathBuf, PathBuf)> {
     Ok((data, config))
 }
 
+/// `custom_home`: `PUPPY_HOME` is set, so the shared runtime-dir socket is not used
+/// (a daemon of another home could be listening there).
 #[cfg(unix)]
-fn socket_name(over: Option<String>, data_dir: &Path) -> SocketName {
+fn socket_name(over: Option<String>, data_dir: &Path, custom_home: bool) -> SocketName {
     SocketName::Path(match over {
         Some(p) => PathBuf::from(p),
-        None => match dirs::runtime_dir() {
+        None => match dirs::runtime_dir().filter(|_| !custom_home) {
             Some(r) => r.join("puppy").join("puppy.sock"),
             None => data_dir.join("puppy.sock"),
         },
     })
 }
 
+/// Windows: the per-user pipe name (a second daemon of another home cannot create it
+/// while the first one listens: interprocess creates the first instance exclusively).
 #[cfg(windows)]
-fn socket_name(over: Option<String>, _data_dir: &Path) -> SocketName {
+fn socket_name(over: Option<String>, _data_dir: &Path, _custom_home: bool) -> SocketName {
     SocketName::Pipe(match over {
         Some(n) => normalize_pipe_name(&n).to_string(),
         None => format!(
@@ -279,9 +285,10 @@ mod tests {
         }
     }
 
+    /// With `PUPPY_HOME` the socket lives in that home, never in the shared runtime dir.
     #[cfg(unix)]
     #[test]
-    fn default_socket_in_runtime_dir_or_data_dir() {
+    fn puppy_home_gets_its_own_socket() {
         let d = tempfile::tempdir().unwrap();
         let rt = d.path().join("rt");
         std::fs::create_dir(&rt).unwrap();
@@ -293,9 +300,24 @@ mod tests {
             ],
             || Paths::resolve().unwrap(),
         );
+        assert_eq!(p.socket, SocketName::Path(d.path().join("data/puppy.sock")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_socket_in_runtime_dir() {
+        let rt = tempfile::tempdir().unwrap();
+        let data = Path::new("/nonexistent/data");
+        let name = with_env(&[("XDG_RUNTIME_DIR", Some(rt.path()))], || {
+            socket_name(None, data, false)
+        });
         if cfg!(target_os = "linux") {
-            assert_eq!(p.socket, SocketName::Path(rt.join("puppy/puppy.sock")));
+            assert_eq!(name, SocketName::Path(rt.path().join("puppy/puppy.sock")));
         }
+        let name = with_env(&[("XDG_RUNTIME_DIR", Some(rt.path()))], || {
+            socket_name(None, data, true)
+        });
+        assert_eq!(name, SocketName::Path(data.join("puppy.sock")));
     }
 
     #[cfg(unix)]

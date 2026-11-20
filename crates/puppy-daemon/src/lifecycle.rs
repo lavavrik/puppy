@@ -141,7 +141,6 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         warn!("the server task failed: {e}");
     }
     manager.shutdown().await;
-    remove_socket_file(&paths.socket);
     info!("daemon stopped");
     Ok(RunOutcome::Exited)
 }
@@ -248,20 +247,6 @@ async fn remove_stale_socket(name: &SocketName) -> anyhow::Result<()> {
 async fn remove_stale_socket(_name: &SocketName) -> anyhow::Result<()> {
     Ok(())
 }
-
-/// Makes sure the socket file is gone (the server normally removes it already).
-#[cfg(unix)]
-fn remove_socket_file(name: &SocketName) {
-    if let SocketName::Path(p) = name
-        && let Err(e) = std::fs::remove_file(p)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        warn!(path = %p.display(), "cannot remove the socket file: {e}");
-    }
-}
-
-#[cfg(not(unix))]
-fn remove_socket_file(_name: &SocketName) {}
 
 async fn ctrl_c() {
     if let Err(e) = tokio::signal::ctrl_c().await {
