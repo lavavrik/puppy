@@ -322,6 +322,19 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg, now: Instant) -> Vec<Cmd> {
+        let before = (self.selected, std::mem::discriminant(&self.mode));
+        // A left click manages the double-click memory itself (selecting a row is how
+        // a double click starts).
+        let click =
+            matches!(&msg, Msg::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left));
+        let cmds = self.update_inner(msg, now);
+        if !click && before != (self.selected, std::mem::discriminant(&self.mode)) {
+            self.last_click = None;
+        }
+        cmds
+    }
+
+    fn update_inner(&mut self, msg: Msg, now: Instant) -> Vec<Cmd> {
         match msg {
             Msg::Key(key) => self.on_key(key, now),
             Msg::Mouse(m) => self.on_mouse(m, now),
@@ -331,6 +344,8 @@ impl App {
             }
             Msg::Resize(w, h) => {
                 self.size = (w, h);
+                // The regions are stale until the next frame.
+                self.hits.clear();
                 Vec::new()
             }
             Msg::Tick => self.on_tick(now),
@@ -745,6 +760,15 @@ impl App {
         let Mode::Popup(popup) = &mut self.mode else {
             return Vec::new();
         };
+        // Popups without a text input take no Ctrl/Alt combinations (Ctrl+C quit
+        // before getting here).
+        if matches!(popup, Popup::ConfirmDelete { .. } | Popup::Help)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
         if key.code == KeyCode::Esc {
             self.mode = Mode::Normal;
             return Vec::new();

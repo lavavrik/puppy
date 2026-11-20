@@ -50,7 +50,11 @@ fn app(downloads: Vec<DownloadSnapshot>) -> App {
 }
 
 fn render(a: &mut App) {
-    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    render_at(a, 100, 30);
+}
+
+fn render_at(a: &mut App, w: u16, h: u16) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| draw(a, f)).unwrap();
 }
 
@@ -158,13 +162,116 @@ fn wheel_moves_selection() {
         now,
     );
     assert_eq!(a.selected, Some(4));
-    // Over the detail pane: nothing.
-    let detail_x = list.right() + 2;
+}
+
+#[test]
+fn wheel_over_detail_pane_does_nothing() {
+    let ds = (1..=8).map(|i| snap(i, WireState::Active)).collect();
+    let mut a = app(ds);
+    // Wide layout: the detail pane sits right of the list.
+    render_at(&mut a, 120, 30);
+    let list = rect_of(&a, HitTarget::List);
+    assert!(list.right() < 110, "{list:?}");
+    let (x, y) = (list.right() + 5, list.y + 3);
+    assert!(a.hits.iter().all(|(r, _)| !r.contains(Position::new(x, y))));
     a.update(
-        mouse(MouseEventKind::ScrollDown, detail_x, y, KeyModifiers::NONE),
-        now,
+        mouse(MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE),
+        Instant::now(),
     );
-    assert_eq!(a.selected, Some(4));
+    assert_eq!(a.selected, Some(1));
+    // The same notch over the list does scroll.
+    a.update(
+        mouse(
+            MouseEventKind::ScrollDown,
+            list.x + 2,
+            y,
+            KeyModifiers::NONE,
+        ),
+        Instant::now(),
+    );
+    assert_eq!(a.selected, Some(2));
+}
+
+#[test]
+fn resize_clears_stale_hits() {
+    let mut a = three();
+    render(&mut a);
+    assert!(!a.hits.is_empty());
+    a.update(Msg::Resize(60, 20), Instant::now());
+    assert!(a.hits.is_empty());
+    let r = Rect::new(0, 0, 100, 30);
+    // A click where a row used to be does nothing until the next frame.
+    for y in r.y..r.bottom() {
+        click(&mut a, 5, y, Instant::now());
+    }
+    assert_eq!(a.selected, Some(1));
+}
+
+#[test]
+fn double_click_memory_resets_on_selection_change() {
+    let mut a = three();
+    render(&mut a);
+    let now = Instant::now();
+    let r = rect_of(&a, HitTarget::ListRow(1));
+    click(&mut a, r.x + 3, r.y, now);
+    // j then k: back on row 1, but the click memory is gone.
+    a.update(Msg::Key(KeyEvent::from(KeyCode::Char('j'))), now);
+    a.update(Msg::Key(KeyEvent::from(KeyCode::Char('k'))), now);
+    let cmds = click(&mut a, r.x + 3, r.y, now + Duration::from_millis(100));
+    assert!(cmds.is_empty(), "{cmds:?}");
+}
+
+#[test]
+fn double_click_memory_resets_on_mode_change() {
+    let mut a = three();
+    render(&mut a);
+    let now = Instant::now();
+    let r = rect_of(&a, HitTarget::ListRow(1));
+    click(&mut a, r.x + 3, r.y, now);
+    a.update(Msg::Key(KeyEvent::from(KeyCode::Char('/'))), now);
+    a.update(Msg::Key(KeyEvent::from(KeyCode::Enter)), now);
+    assert_eq!(a.mode, Mode::Normal);
+    let cmds = click(&mut a, r.x + 3, r.y, now + Duration::from_millis(100));
+    assert!(cmds.is_empty(), "{cmds:?}");
+}
+
+#[test]
+fn ctrl_alt_keys_ignored_in_confirm_and_help() {
+    let now = Instant::now();
+    for m in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ] {
+        let mut a = three();
+        a.update(Msg::Key(KeyEvent::from(KeyCode::Char('d'))), now);
+        for c in ['f', ' ', 'n'] {
+            a.update(Msg::Key(KeyEvent::new(KeyCode::Char(c), m)), now);
+        }
+        let cmds = a.update(Msg::Key(KeyEvent::new(KeyCode::Enter, m)), now);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(matches!(
+            a.mode,
+            Mode::Popup(Popup::ConfirmDelete {
+                delete_files: false,
+                ..
+            })
+        ));
+
+        let mut a = three();
+        a.update(Msg::Key(KeyEvent::from(KeyCode::Char('?'))), now);
+        for c in ['q', '?', 'j', 'G'] {
+            a.update(Msg::Key(KeyEvent::new(KeyCode::Char(c), m)), now);
+        }
+        assert_eq!(a.mode, Mode::Popup(Popup::Help));
+        assert_eq!(a.help_scroll, 0);
+        // Ctrl+C still quits.
+        a.update(
+            Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            now,
+        );
+        assert!(a.should_quit);
+    }
 }
 
 #[test]
