@@ -1,6 +1,6 @@
 //! Snapshots of the download list for clients.
 
-use super::{Entry, Inner, Manager, ManagerError, is_active};
+use super::{Entry, Inner, Manager, ManagerError, is_active, is_finished, is_seeding};
 use puppy_core::engine::EngineKind;
 use puppy_core::types::{DownloadId, DownloadState, EngineDetail, Source};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Totals};
@@ -50,7 +50,8 @@ impl Inner {
     }
 
     /// One download's snapshot: live numbers from the engine if it holds the download,
-    /// otherwise the stored record. The state is always the manager's.
+    /// otherwise the stored record. The state is always the manager's (a seeding one's
+    /// counters are the engine's latest); a seeding download shows all its data done.
     ///
     /// The engine detail is fetched only if `with_detail` or for HTTP downloads (their
     /// connection count comes from it); a torrent's peer count comes from its status, so
@@ -81,9 +82,14 @@ impl Inner {
             .and_then(|s| s.total_bytes)
             .or(e.rec.total_bytes);
         let done_bytes = match (&status, &e.state) {
+            (_, DownloadState::Seeding { .. }) => total_bytes.unwrap_or(0),
             (Some(s), _) => s.done_bytes,
             (None, DownloadState::Completed) => total_bytes.unwrap_or(0),
             (None, _) => 0,
+        };
+        let state = match &status {
+            Some(s) if is_seeding(&e.state) && is_seeding(&s.state) => (&s.state).into(),
+            _ => (&e.state).into(),
         };
         let snap = DownloadSnapshot {
             id,
@@ -99,7 +105,7 @@ impl Inner {
                 .as_ref()
                 .map(|s| s.path.clone())
                 .or_else(|| e.rec.path.clone()),
-            state: (&e.state).into(),
+            state,
             total_bytes,
             done_bytes,
             down_bps: status.as_ref().map_or(0, |s| s.down_bps),
@@ -117,8 +123,9 @@ impl Inner {
 }
 
 impl Manager {
-    /// Every download in queue order, completed ones last (most recently finished
-    /// first), plus totals.
+    /// Every download in queue order, finished ones (completed or seeding) last (most
+    /// recently finished first), plus totals (seeding counts as completed, choosing
+    /// files as paused).
     pub fn snapshot(&self) -> (Vec<DownloadSnapshot>, Totals) {
         let inner = &self.inner;
         let st = inner.lock();
@@ -140,11 +147,11 @@ impl Manager {
             match &e.state {
                 s if is_active(s) => totals.active += 1,
                 DownloadState::Queued => totals.queued += 1,
-                DownloadState::Paused => totals.paused += 1,
-                DownloadState::Completed => totals.completed += 1,
+                DownloadState::Paused | DownloadState::ChoosingFiles => totals.paused += 1,
+                s if is_finished(s) => totals.completed += 1,
                 _ => totals.failed += 1,
             }
-            if e.state == DownloadState::Completed {
+            if is_finished(&e.state) {
                 done.push((e.rec.finished_unix, snap));
             } else {
                 list.push(snap);

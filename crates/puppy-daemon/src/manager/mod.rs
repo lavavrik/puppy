@@ -19,6 +19,10 @@
 //!   of trusting event payloads, and ignores events for downloads with a job in flight
 //!   (the job reads the status itself once the engine call returns). Events may thus
 //!   arrive before `add` returns, late, or be lost to lag without corrupting state.
+//! - Torrents: `ChoosingFiles` (waiting for `select_files`) and `Seeding` (data complete,
+//!   still uploading; the engine keeps holding it) never take a slot. `Completed` is
+//!   emitted when the data completes (entering `Seeding`), `SeedingFinished` when
+//!   seeding stops (the download is then `Completed` and dropped from its engine).
 
 mod commands;
 mod restore;
@@ -127,6 +131,9 @@ struct Entry {
     /// While `backoff` is set: the bytes done when the download was last seen without
     /// progress; once it is active with more than that, `backoff` is reset.
     progress_mark: Option<u64>,
+    /// `Event::SeedingFinished` was emitted since it last entered `Seeding` (the engine
+    /// event and the manager's own look may both report the end).
+    seeding_finished_sent: bool,
 }
 
 /// When a transiently failed download is requeued.
@@ -147,6 +154,7 @@ impl Entry {
             retry: None,
             backoff: None,
             progress_mark: None,
+            seeding_finished_sent: false,
         }
     }
 
@@ -224,8 +232,29 @@ fn normalize_limit(bps: Option<u64>) -> Option<u64> {
     bps.filter(|&b| b > 0)
 }
 
+/// Occupies a slot (`ChoosingFiles` and `Seeding` never do).
 fn is_active(s: &DownloadState) -> bool {
     matches!(s, DownloadState::Starting | DownloadState::Active)
+}
+
+fn is_seeding(s: &DownloadState) -> bool {
+    matches!(s, DownloadState::Seeding { .. })
+}
+
+/// The data is complete (completed or seeding): finished for queue order.
+fn is_finished(s: &DownloadState) -> bool {
+    matches!(s, DownloadState::Completed | DownloadState::Seeding { .. })
+}
+
+/// `Seeding` before the engine has reported its counters (restored, not held yet).
+fn seeding_placeholder() -> DownloadState {
+    DownloadState::Seeding {
+        uploaded: 0,
+        ratio: 0.0,
+        seeded_secs: 0,
+        ratio_target: None,
+        time_target_secs: None,
+    }
 }
 
 fn stored_state(s: &DownloadState) -> StoredState {
@@ -234,8 +263,10 @@ fn stored_state(s: &DownloadState) -> StoredState {
         // A download being started is persisted as active: after a restart it is
         // restored (if it got a path) and queued at the front.
         DownloadState::Starting | DownloadState::Active => StoredState::Active,
-        DownloadState::Paused | DownloadState::ChoosingFiles => StoredState::Paused,
-        DownloadState::Completed | DownloadState::Seeding { .. } => StoredState::Completed,
+        DownloadState::Paused => StoredState::Paused,
+        DownloadState::ChoosingFiles => StoredState::ChoosingFiles,
+        DownloadState::Seeding { .. } => StoredState::Seeding,
+        DownloadState::Completed => StoredState::Completed,
         DownloadState::Failed { reason, transient } => StoredState::Failed {
             reason: reason.clone(),
             transient: *transient,
@@ -339,13 +370,17 @@ impl Manager {
         self.inner.events.subscribe()
     }
 
-    /// No download is active, starting, queued or waiting for an automatic retry.
+    /// No download is active, starting, queued, seeding or waiting for an automatic
+    /// retry (a torrent choosing files waits for the user, not for the daemon).
     pub fn is_idle(&self) -> bool {
         self.inner.lock().entries.values().all(|e| {
             e.retry.is_none()
                 && !matches!(
                     e.state,
-                    DownloadState::Queued | DownloadState::Starting | DownloadState::Active
+                    DownloadState::Queued
+                        | DownloadState::Starting
+                        | DownloadState::Active
+                        | DownloadState::Seeding { .. }
                 )
         })
     }
@@ -386,7 +421,13 @@ impl Inner {
         let _ = self.events.send(ev);
     }
 
-    /// Moves `e` to `next`, emitting the matching event. Returns whether it changed.
+    /// Moves `e` to `next`, emitting the matching event. Returns whether it changed
+    /// (new seeding counters alone are taken without counting as a change: they are not
+    /// persisted).
+    ///
+    /// Data completing (entering `Seeding`, or `Completed` from any other state) emits
+    /// `Completed`; `Seeding` ⇒ `Completed` emits `SeedingFinished` instead. `Completed`
+    /// drops the download from its engine; a seeding one stays held.
     fn transition(
         &self,
         id: DownloadId,
@@ -397,15 +438,31 @@ impl Inner {
         if e.state == next {
             return false;
         }
+        if is_seeding(&e.state) && is_seeding(&next) {
+            e.state = next;
+            return false;
+        }
         match &next {
             DownloadState::Completed => {
-                e.rec.finished_unix = Some(now_unix());
+                if is_seeding(&e.state) {
+                    self.seeding_finished(id, e);
+                } else {
+                    e.rec.finished_unix = Some(now_unix());
+                    self.emit(Event::Completed {
+                        id,
+                        name: e.rec.name.clone().unwrap_or_default(),
+                    });
+                }
                 if e.held
                     && let Some(engine) = e.engine
                 {
                     fx.drop_completed.push((engine, id));
                 }
                 e.held = false;
+            }
+            DownloadState::Seeding { .. } => {
+                e.rec.finished_unix = Some(now_unix());
+                e.seeding_finished_sent = false;
                 self.emit(Event::Completed {
                     id,
                     name: e.rec.name.clone().unwrap_or_default(),
@@ -429,6 +486,26 @@ impl Inner {
             e.retry = None;
         }
         true
+    }
+
+    /// Emits `SeedingFinished` for `e`, once per seeding.
+    fn seeding_finished(&self, id: DownloadId, e: &mut Entry) {
+        if !e.seeding_finished_sent {
+            e.seeding_finished_sent = true;
+            self.emit(Event::SeedingFinished { id });
+        }
+    }
+
+    /// The engine says seeding stopped (after the manager has looked at its status): a
+    /// download that went from its data completing straight to `Completed` (seeding
+    /// started and ended between two looks) gets its `SeedingFinished` too.
+    fn on_seeding_finished(&self, id: DownloadId) {
+        let mut st = self.lock();
+        if let Some(e) = st.entries.get_mut(&id)
+            && e.state == DownloadState::Completed
+        {
+            self.seeding_finished(id, e);
+        }
     }
 
     /// Schedules the automatic retry of a transiently failed download: after the
@@ -495,9 +572,13 @@ impl Inner {
 
     /// Applies the engine's view to an engine-held download with no job in flight.
     /// Only transitions the engine makes on its own are taken over (`Completed`,
-    /// `Failed`, `NeedsAttention`); `Paused`/`Active` are only ever caused by the
-    /// manager, which records them itself (a `Paused` seen while the manager says
-    /// `Active` is the transient moment between `resume` and the transfer starting).
+    /// `Seeding` and its counters, `Failed`, `NeedsAttention`, a magnet's
+    /// `ChoosingFiles` once its metadata is known); `Paused`/`Active` are only ever
+    /// caused by the manager, which records them itself (a `Paused` seen while the
+    /// manager says `Active` is the transient moment between `resume` and the transfer
+    /// starting). A seeding torrent whose data failed its check, once resumed (queued or
+    /// paused again by the user), is not sent back to needing attention while the engine
+    /// still says so.
     fn reconcile(&self, id: DownloadId, e: &mut Entry, fx: &mut Effects) -> bool {
         let (Some(engine), true, None) = (e.engine, e.held, &e.job) else {
             return false;
@@ -507,16 +588,23 @@ impl Inner {
         };
         Self::record_status(e, &status);
         let next = match (&e.state, status.state) {
-            // Seeding is complete data. Interim, until the manager knows the state (plan
-            // Task 4): taken as Completed, which drops the torrent (stops seeding).
-            (_, DownloadState::Completed | DownloadState::Seeding { .. }) => {
-                DownloadState::Completed
-            }
-            (DownloadState::Active, s @ DownloadState::Failed { .. }) => s,
+            (_, s @ (DownloadState::Completed | DownloadState::Seeding { .. })) => s,
             (
-                DownloadState::Active | DownloadState::Paused | DownloadState::Queued,
+                DownloadState::Active | DownloadState::Seeding { .. },
+                s @ DownloadState::Failed { .. },
+            ) => s,
+            (
+                DownloadState::Paused | DownloadState::Queued,
+                DownloadState::NeedsAttention { reason },
+            ) if reason.is_resumable() => return false,
+            (
+                DownloadState::Active
+                | DownloadState::Paused
+                | DownloadState::Queued
+                | DownloadState::Seeding { .. },
                 s @ DownloadState::NeedsAttention { .. },
             ) => s,
+            (DownloadState::Active, s @ DownloadState::ChoosingFiles) => s,
             _ => return false,
         };
         self.transition(id, e, next, fx)
@@ -628,10 +716,13 @@ impl Inner {
         // paused; ones removed while starting are removed as their job would have.
         let (to_pause, to_remove) = {
             let mut st = self.lock();
+            // Seeding torrents are left seeding: pausing would stop it for good (the
+            // engine records their counters when it shuts down, and they go on seeding
+            // after a restart).
             let to_pause: Vec<(usize, DownloadId)> = st
                 .entries
                 .iter()
-                .filter(|(_, e)| e.held || e.job.is_some())
+                .filter(|(_, e)| (e.held || e.job.is_some()) && !is_seeding(&e.state))
                 .filter_map(|(id, e)| Some((e.engine?, *id)))
                 .collect();
             let to_remove: Vec<_> = st.orphans.drain().collect();
@@ -685,12 +776,12 @@ async fn event_task(
         };
         let Some(inner) = inner.upgrade() else { return };
         match ev {
-            Ok(
-                EngineEvent::StateChanged { id, .. }
-                | EngineEvent::Completed { id }
-                | EngineEvent::SeedingFinished { id },
-            ) => {
+            Ok(EngineEvent::StateChanged { id, .. } | EngineEvent::Completed { id }) => {
                 inner.on_engine_change(engine, Some(&[id]));
+            }
+            Ok(EngineEvent::SeedingFinished { id }) => {
+                inner.on_engine_change(engine, Some(&[id]));
+                inner.on_seeding_finished(id);
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::debug!(engine, "missed {n} engine events; resyncing");
@@ -812,6 +903,83 @@ mod tests {
             peers: None,
             note: None,
         }
+    }
+
+    fn seeding(uploaded: u64) -> DownloadState {
+        DownloadState::Seeding {
+            uploaded,
+            ratio: 0.0,
+            seeded_secs: 0,
+            ratio_target: None,
+            time_target_secs: None,
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Data completing emits `Completed` (once), seeding stopping `SeedingFinished`
+    /// (once, however it is learned); new counters alone are no change.
+    #[tokio::test]
+    async fn seeding_transitions_emit_completed_then_seeding_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("state.json"));
+        let m = Manager::start(Vec::new(), store, Config::default())
+            .await
+            .unwrap();
+        let mut rx = m.events();
+        let inner = &m.inner;
+        let mut fx = Effects::default();
+        let mut e = entry(DownloadState::Active);
+        e.held = true;
+        assert!(inner.transition(1, &mut e, seeding(0), &mut fx));
+        assert!(e.held, "a seeding torrent stays with its engine");
+        assert!(!inner.transition(1, &mut e, seeding(10), &mut fx));
+        assert_eq!(e.state, seeding(10));
+        assert!(inner.transition(1, &mut e, DownloadState::Completed, &mut fx));
+        assert!(!e.held);
+        assert_eq!(fx.drop_completed, vec![(0, 1)]);
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                Event::Completed {
+                    id: 1,
+                    name: String::new()
+                },
+                Event::SeedingFinished { id: 1 }
+            ]
+        );
+        // The engine's event afterwards adds nothing.
+        inner.lock().entries.insert(1, e);
+        inner.on_seeding_finished(1);
+        assert_eq!(drain(&mut rx), Vec::<Event>::new());
+        // Seeding started and stopped between two looks: the engine's event tells.
+        let mut e = entry(DownloadState::Active);
+        assert!(inner.transition(2, &mut e, DownloadState::Completed, &mut fx));
+        inner.lock().entries.insert(2, e);
+        inner.on_seeding_finished(2);
+        inner.on_seeding_finished(2);
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                Event::Completed {
+                    id: 2,
+                    name: String::new()
+                },
+                Event::SeedingFinished { id: 2 }
+            ]
+        );
+    }
+
+    #[test]
+    fn new_states_are_stored_as_themselves() {
+        assert_eq!(stored_state(&seeding(5)), StoredState::Seeding);
+        assert_eq!(
+            stored_state(&DownloadState::ChoosingFiles),
+            StoredState::ChoosingFiles
+        );
+        assert!(!is_active(&seeding(0)) && !is_active(&DownloadState::ChoosingFiles));
     }
 
     /// The backoff survives a retry that gets nowhere, but is reset once the retried

@@ -116,7 +116,7 @@ const TORRENT_MISSING: &str = "torrent file missing";
 /// The session could not be started (the details are logged).
 const UNAVAILABLE: &str = "torrent engine unavailable (see daemon log)";
 /// A restored seeding torrent's data failed librqbit's check.
-pub(crate) const RECHECK_FAILED: &str = "data changed on disk; resume to download again";
+pub(crate) use puppy_core::types::RECHECK_FAILED;
 /// A fresh add found a file of the torrent already there (librqbit does not overwrite).
 const EXISTS: &str = "refusing to overwrite: a file of this torrent already exists";
 

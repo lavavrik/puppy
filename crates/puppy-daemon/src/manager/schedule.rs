@@ -147,20 +147,28 @@ impl Inner {
         let Job { id, engine, kind } = job;
         let eng = self.engines[engine].clone();
         let outcome = match kind {
-            JobKind::Add { req, mode, opts } => match eng.add(id, *req, mode, opts).await {
-                Ok(added) => {
-                    self.record_added(id, &added);
-                    Outcome::Added
+            JobKind::Add { req, mode, opts } => {
+                let seed = req.seed.clone();
+                match eng.add(id, *req, mode, opts).await {
+                    Ok(added) => {
+                        self.record_added(id, &added);
+                        self.catch_up_seed_policy(id, &eng, seed).await;
+                        Outcome::Added
+                    }
+                    Err(e) => Outcome::AddFailed(e),
                 }
-                Err(e) => Outcome::AddFailed(e),
-            },
-            JobKind::Restore { req, mode, opts } => match eng.add(id, *req, mode, opts).await {
-                Ok(added) => {
-                    self.record_added(id, &added);
-                    Outcome::Restored
+            }
+            JobKind::Restore { req, mode, opts } => {
+                let seed = req.seed.clone();
+                match eng.add(id, *req, mode, opts).await {
+                    Ok(added) => {
+                        self.record_added(id, &added);
+                        self.catch_up_seed_policy(id, &eng, seed).await;
+                        Outcome::Restored
+                    }
+                    Err(e) => Outcome::RestoreFailed(e),
                 }
-                Err(e) => Outcome::RestoreFailed(e),
-            },
+            }
             JobKind::Resume => Outcome::Resumed(eng.resume(id).await),
             JobKind::Reset => {
                 if let Err(e) = eng.remove(id, true).await
@@ -244,6 +252,26 @@ impl Inner {
         }
     }
 
+    /// A seeding policy set while `add` ran (with `sent`) is handed to the engine now.
+    async fn catch_up_seed_policy(
+        &self,
+        id: DownloadId,
+        eng: &Arc<dyn puppy_core::engine::Engine>,
+        sent: Option<puppy_core::types::SeedPolicy>,
+    ) {
+        let now = self
+            .lock()
+            .entries
+            .get(&id)
+            .and_then(|e| e.rec.request.seed.clone());
+        if let Some(policy) = now.filter(|p| Some(p) != sent.as_ref())
+            && let Err(e) = eng.set_seed(id, policy).await
+            && !matches!(e, EngineError::NotFound(_))
+        {
+            tracing::warn!(id, "applying the seeding policy: {e}");
+        }
+    }
+
     /// Settles a finished job: the download leaves `Starting` for the state the engine
     /// (and any pause requested meanwhile) says.
     fn finish_job(
@@ -269,6 +297,7 @@ impl Inner {
                     }
                     Some(status) => {
                         Self::record_status(e, &status);
+                        let seeding = matches!(e.state, DownloadState::Seeding { .. });
                         match status.state {
                             s @ DownloadState::Completed => s,
                             // One already needing attention keeps its stored reason.
@@ -276,6 +305,15 @@ impl Inner {
                                 if !matches!(e.state, DownloadState::NeedsAttention { .. }) =>
                             {
                                 s
+                            }
+                            // Goes on seeding (its counters), or still choosing.
+                            s @ DownloadState::Seeding { .. } if seeding => s,
+                            // The engine no longer has it seeding (its counters were
+                            // lost): resumed through the queue, which completes it.
+                            DownloadState::Paused if seeding => DownloadState::Queued,
+                            // Its choice was lost: it downloads everything once resumed.
+                            DownloadState::Paused if e.state == DownloadState::ChoosingFiles => {
+                                DownloadState::Paused
                             }
                             _ => e.state.clone(),
                         }
@@ -328,6 +366,8 @@ impl Inner {
                         Self::record_status(e, &status);
                         match status.state {
                             s @ (DownloadState::Completed
+                            | DownloadState::Seeding { .. }
+                            | DownloadState::ChoosingFiles
                             | DownloadState::Failed { .. }
                             | DownloadState::NeedsAttention { .. }) => s,
                             DownloadState::Paused if want_pause => DownloadState::Paused,

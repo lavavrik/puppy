@@ -19,6 +19,10 @@ impl Inner {
     ///   and restored paused by a job; the scheduler then resumes them, which validates
     ///   the remote. While restoring they hold a slot, so later queued downloads do not
     ///   overtake them.
+    /// - Seeding (a torrent): restored into the engine by a job, which has it go on
+    ///   seeding (live, holding no slot) unless its targets are met already (then
+    ///   `Completed`) or its data fails the check (then `NeedsAttention`).
+    /// - ChoosingFiles (a torrent): restored by a job, still choosing.
     /// - Active without a path (never got past the probe): queued.
     /// - Paused/Failed/NeedsAttention without a path: kept as they are.
     /// - No engine accepts the source: failed.
@@ -61,6 +65,8 @@ impl Inner {
                 && !matches!(rec.state, StoredState::Completed | StoredState::Queued);
             let state = match (&rec.state, engine) {
                 (StoredState::Completed, _) => DownloadState::Completed,
+                // Nothing to seed from.
+                (StoredState::Seeding, _) if !restore => DownloadState::Completed,
                 (_, None) => DownloadState::Failed {
                     reason: "unsupported source".into(),
                     transient: false,
@@ -100,7 +106,7 @@ impl Inner {
     }
 }
 
-/// The live state for a stored paused/failed/needs-attention download.
+/// The live state for a stored download that is not completed.
 fn live_state(stored: &StoredState) -> DownloadState {
     match stored {
         StoredState::Failed { reason, transient } => DownloadState::Failed {
@@ -114,5 +120,7 @@ fn live_state(stored: &StoredState) -> DownloadState {
         StoredState::Queued | StoredState::Active => DownloadState::Queued,
         StoredState::Paused => DownloadState::Paused,
         StoredState::Completed => DownloadState::Completed,
+        StoredState::ChoosingFiles => DownloadState::ChoosingFiles,
+        StoredState::Seeding => super::seeding_placeholder(),
     }
 }

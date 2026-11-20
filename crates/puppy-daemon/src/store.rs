@@ -71,6 +71,11 @@ pub enum StoredState {
     NeedsAttention {
         reason: AttentionReason,
     },
+    /// A torrent waiting for its files to be chosen (restored still choosing).
+    ChoosingFiles,
+    /// A torrent whose data is complete, seeding (restored seeding: its counters are
+    /// the engine's).
+    Seeding,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -477,6 +482,17 @@ mod tests {
                 transient: false
             }
         );
+    }
+
+    #[test]
+    fn torrent_states_round_trip() {
+        for (state, json) in [
+            (StoredState::ChoosingFiles, r#"{"kind":"choosing_files"}"#),
+            (StoredState::Seeding, r#"{"kind":"seeding"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), json);
+            assert_eq!(serde_json::from_str::<StoredState>(json).unwrap(), state);
+        }
     }
 
     #[tokio::test(start_paused = true)]

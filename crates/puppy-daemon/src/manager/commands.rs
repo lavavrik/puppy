@@ -1,11 +1,16 @@
-//! User commands: add, pause, resume, remove, restart, reorder and limits.
+//! User commands: add, pause, resume, remove, restart, reorder, limits, and a torrent's
+//! files and seeding policy.
 
 use super::schedule::JobKind;
-use super::{Effects, Entry, Inner, Manager, ManagerError, State, normalize_limit, now_unix};
+use super::{
+    Effects, Entry, Inner, Manager, ManagerError, State, is_finished, normalize_limit, now_unix,
+};
 use crate::store::{StoredDownload, StoredState};
-use puppy_core::engine::EngineError;
+use puppy_core::engine::{EngineError, EngineKind};
 use puppy_core::http::resume::{part_path, sidecar_path};
-use puppy_core::types::{AddRequest, DownloadId, DownloadState, Source};
+use puppy_core::types::{
+    AddRequest, DownloadId, DownloadState, SeedPolicy, Selection, Source, TorrentFile,
+};
 use puppy_proto::{Event, Settings};
 
 type Result<T> = std::result::Result<T, ManagerError>;
@@ -36,6 +41,15 @@ fn check_restartable(e: &Entry) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The engine of a torrent (others have no files to choose and do not seed).
+fn torrent_engine(inner: &Inner, e: &Entry) -> Result<usize> {
+    e.engine
+        .filter(|&i| inner.engines[i].kind() == EngineKind::Torrent)
+        .ok_or(ManagerError::Engine(EngineError::Unsupported(
+            "only torrents have files to choose and seeding",
+        )))
 }
 
 /// Engine errors that only mean the engine no longer holds the download.
@@ -98,16 +112,25 @@ impl Manager {
 
     /// Queued ⇒ paused (daemon-level); transferring ⇒ paused in the engine; starting ⇒
     /// paused as soon as the engine call returns; failed with an automatic retry pending
-    /// ⇒ paused (the retry is cancelled). Completed ⇒ `InvalidState`.
+    /// ⇒ paused (the retry is cancelled); seeding ⇒ seeding stops (`Completed`);
+    /// choosing files ⇒ nothing changes. Completed ⇒ `InvalidState`.
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
         let (engine, was_active) = {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
             match e.state {
-                DownloadState::Completed | DownloadState::Seeding { .. } => {
+                DownloadState::Completed => {
                     return Err(ManagerError::InvalidState("download is completed".into()));
                 }
+                // Being restored: stopped once the engine call returns.
+                DownloadState::Seeding { .. } if e.job.is_some() => {
+                    if let Some(job) = &mut e.job {
+                        job.pause = true;
+                    }
+                    (None, false)
+                }
+                DownloadState::Seeding { .. } => (e.held.then_some(e.engine).flatten(), true),
                 DownloadState::Queued => {
                     e.state = DownloadState::Paused;
                     inner.persist(&st);
@@ -146,12 +169,20 @@ impl Manager {
 
     /// Paused/Failed ⇒ resumed in the engine now if it holds the download and a slot is
     /// free, else queued. Resets the automatic-retry backoff. NeedsAttention ⇒
-    /// `InvalidState` (restart it instead).
+    /// `InvalidState` (restart it instead), except a seeding torrent whose data failed
+    /// its check (resumed like a paused one). Completed/Seeding ⇒ `InvalidState`;
+    /// ChoosingFiles ⇒ `InvalidState` (choose files first).
     pub async fn resume(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
         let job = {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
+            // A seeding torrent's data that failed its check downloads again, through
+            // the queue like any download.
+            let resumable = matches!(
+                &e.state,
+                DownloadState::NeedsAttention { reason } if reason.is_resumable()
+            ) && e.job.is_none();
             match e.state {
                 DownloadState::Completed | DownloadState::Seeding { .. } => {
                     return Err(ManagerError::InvalidState("download is completed".into()));
@@ -161,7 +192,7 @@ impl Manager {
                         "choose files first: puppy select <id> ...".into(),
                     ));
                 }
-                DownloadState::NeedsAttention { .. } => {
+                DownloadState::NeedsAttention { .. } if !resumable => {
                     return Err(ManagerError::InvalidState(
                         "download needs attention; use restart".into(),
                     ));
@@ -173,7 +204,9 @@ impl Manager {
                     None
                 }
                 DownloadState::Queued | DownloadState::Active => None,
-                DownloadState::Paused | DownloadState::Failed { .. } => {
+                DownloadState::Paused
+                | DownloadState::Failed { .. }
+                | DownloadState::NeedsAttention { .. } => {
                     e.reset_retry();
                     let held = e.held;
                     let job = if held {
@@ -301,21 +334,17 @@ impl Manager {
     }
 
     /// Moves an unfinished download to `position` among the unfinished downloads
-    /// (clamped). Completed ⇒ `InvalidState`.
+    /// (clamped). Completed/Seeding ⇒ `InvalidState`.
     pub async fn move_to(&self, id: DownloadId, position: usize) -> Result<()> {
         let inner = &self.inner;
         {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
-            if e.state == DownloadState::Completed {
+            if is_finished(&e.state) {
                 return Err(ManagerError::InvalidState("download is completed".into()));
             }
             let st = &mut *st;
-            let finished = |x: &DownloadId| {
-                st.entries
-                    .get(x)
-                    .map(|e| e.state == DownloadState::Completed)
-            };
+            let finished = |x: &DownloadId| st.entries.get(x).map(|e| is_finished(&e.state));
             let (mut unfinished, done): (Vec<_>, Vec<_>) = st
                 .order
                 .iter()
@@ -385,6 +414,106 @@ impl Manager {
         Ok(())
     }
 
+    /// A torrent's files, once its contents are known (not for other downloads:
+    /// `Unsupported`). `InvalidState` while they are not known, or once its engine no
+    /// longer holds it (completed).
+    pub async fn list_files(&self, id: DownloadId) -> Result<Vec<TorrentFile>> {
+        let inner = &self.inner;
+        let engine = {
+            let mut st = inner.lock();
+            let e = entry_mut(&mut st, id)?;
+            torrent_engine(inner, e)?
+        };
+        match inner.engines[engine].list_files(id).await {
+            Err(EngineError::NotFound(_)) => Err(ManagerError::InvalidState(
+                "the torrent's files are not known now".into(),
+            )),
+            Err(EngineError::Invalid(m)) => Err(ManagerError::InvalidState(m)),
+            r => r.map_err(Into::into),
+        }
+    }
+
+    /// Makes the one-time file choice of a torrent choosing files (else `InvalidState`;
+    /// an empty or unusable selection ⇒ `BadRequest`). It is then queued at the front
+    /// and starts as soon as a slot is free.
+    pub async fn select_files(&self, id: DownloadId, selection: Selection) -> Result<()> {
+        let inner = &self.inner;
+        let engine = {
+            let mut st = inner.lock();
+            let e = entry_mut(&mut st, id)?;
+            let engine = torrent_engine(inner, e)?;
+            if e.state != DownloadState::ChoosingFiles {
+                return Err(ManagerError::InvalidState("not choosing files".into()));
+            }
+            if selection.indices.is_empty() && selection.globs.is_empty() {
+                return Err(ManagerError::BadRequest("no files selected".into()));
+            }
+            if !e.held || e.job.is_some() {
+                return Err(ManagerError::InvalidState(
+                    "the download is being restored; try again shortly".into(),
+                ));
+            }
+            engine
+        };
+        let eng = &inner.engines[engine];
+        match eng.select_files(id, selection).await {
+            Ok(()) => {}
+            Err(EngineError::Invalid(m)) => {
+                // Unusable here, unless it is no longer choosing (chosen meanwhile).
+                let choosing = eng
+                    .status(id)
+                    .is_some_and(|s| s.state == DownloadState::ChoosingFiles);
+                return Err(if choosing {
+                    ManagerError::BadRequest(m)
+                } else {
+                    ManagerError::InvalidState("not choosing files".into())
+                });
+            }
+            Err(EngineError::NotFound(_)) => return Err(ManagerError::NotFound(id)),
+            Err(e) => return Err(e.into()),
+        }
+        {
+            let mut st = inner.lock();
+            // Removed meanwhile: its engine removes it (calls on it are serialized).
+            if let Some(e) = st.entries.get_mut(&id)
+                && e.state == DownloadState::ChoosingFiles
+            {
+                e.state = DownloadState::Queued;
+                st.order.retain(|x| *x != id);
+                st.order.insert(0, id);
+                inner.persist(&st);
+            }
+        }
+        inner.schedule();
+        Ok(())
+    }
+
+    /// Sets a torrent's own seeding targets (`None` fields: the global ones), kept with
+    /// the download (restore uses them) and applied at once if its engine holds it. A
+    /// negative or non-finite ratio ⇒ `BadRequest`.
+    pub async fn set_seed(&self, id: DownloadId, policy: SeedPolicy) -> Result<()> {
+        if policy.ratio.is_some_and(|r| !r.is_finite() || r < 0.0) {
+            return Err(ManagerError::BadRequest(
+                "the seed ratio must be a number of at least 0".into(),
+            ));
+        }
+        let inner = &self.inner;
+        let engine = {
+            let mut st = inner.lock();
+            let e = entry_mut(&mut st, id)?;
+            let engine = torrent_engine(inner, e)?;
+            e.rec.request.seed = Some(policy.clone());
+            let held = e.held;
+            inner.persist(&st);
+            // Not held: used when it is added (an add in flight catches up).
+            held.then_some(engine)
+        };
+        if let Some(engine) = engine {
+            ignore_not_found(inner.engines[engine].set_seed(id, policy).await)?;
+        }
+        Ok(())
+    }
+
     pub fn settings(&self) -> Settings {
         let inner = &self.inner;
         let st = inner.lock();
@@ -400,7 +529,8 @@ impl Manager {
 }
 
 impl Inner {
-    /// After the engine paused a transferring download: record what it says now.
+    /// After the engine paused a transferring or seeding download: record what it says
+    /// now (a seeding one is `Completed`).
     fn settle_paused(&self, id: DownloadId) {
         let mut fx = Effects::default();
         {
@@ -408,7 +538,7 @@ impl Inner {
             let Some(e) = st.entries.get_mut(&id) else {
                 return;
             };
-            let (Some(engine), true, None, DownloadState::Active) =
+            let (Some(engine), true, None, DownloadState::Active | DownloadState::Seeding { .. }) =
                 (e.engine, e.held, &e.job, &e.state)
             else {
                 return;
@@ -417,7 +547,9 @@ impl Inner {
                 return;
             };
             Self::record_status(e, &status);
+            let seeding = matches!(e.state, DownloadState::Seeding { .. });
             let next = match status.state {
+                DownloadState::Paused if seeding => return,
                 s @ (DownloadState::Paused
                 | DownloadState::Completed
                 | DownloadState::Failed { .. }

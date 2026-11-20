@@ -84,6 +84,19 @@ pub enum AttentionReason {
     ValidationFailed { detail: String },
 }
 
+/// The `ValidationFailed` detail of a seeding torrent whose data failed its check after
+/// a restart: resuming it downloads the data again (unlike other reasons, which need a
+/// restart).
+pub const RECHECK_FAILED: &str = "data changed on disk; resume to download again";
+
+impl AttentionReason {
+    /// A seeding torrent's data failed its check (see [`RECHECK_FAILED`]): it can be
+    /// resumed as is.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, AttentionReason::ValidationFailed { detail } if detail == RECHECK_FAILED)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DownloadState {
