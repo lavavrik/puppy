@@ -35,6 +35,23 @@ pub enum Conn {
     Reconnecting { attempt: u32 },
 }
 
+/// A connection problem shown in a band under the title bar until the next connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Banner {
+    /// The daemon speaks another protocol version (the detail, for logs); `U` restarts it.
+    Incompatible(String),
+    /// No daemon could be started; the text says where its log is.
+    NoDaemon(String),
+    /// Any other reason connecting failed.
+    Error(String),
+    /// `U` was pressed: the old daemon is being stopped and a new one started.
+    Restarting,
+}
+
+impl Banner {
+    pub const INCOMPATIBLE: &str = "daemon is a different puppy version — press U to restart it";
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Popup {
     Add(AddForm),
@@ -105,6 +122,12 @@ pub enum Msg {
         downloads: Vec<DownloadSnapshot>,
     },
     Disconnected,
+    /// Connecting found a daemon speaking another protocol version.
+    Incompatible(String),
+    /// No daemon answered, even after starting one (a hint naming its log).
+    NoDaemon(String),
+    /// Connecting failed for another reason.
+    ConnectError(String),
     CmdResult(CmdOutcome),
     Detail(DownloadId, Option<EngineDetail>),
 }
@@ -138,6 +161,9 @@ pub enum Cmd {
     },
     SetMaxActive(u16),
     FetchDetail(DownloadId),
+    /// Stop the incompatible daemon (`U`); the runtime then reconnects, which starts
+    /// this version's daemon.
+    RestartDaemon,
     Quit,
 }
 
@@ -211,6 +237,8 @@ pub struct App {
     pub ticks: u64,
     /// First visible row of the help popup (clamped by drawing).
     pub help_scroll: u16,
+    /// A connection problem to show (cleared on connect).
+    pub banner: Option<Banner>,
     /// The last left click on a list row, for double-click detection.
     last_click: Option<(DownloadId, Instant)>,
 }
@@ -237,6 +265,7 @@ impl App {
             now_unix: 0,
             ticks: 0,
             help_scroll: 0,
+            banner: None,
             last_click: None,
         }
     }
@@ -359,6 +388,7 @@ impl App {
                 downloads,
             } => {
                 self.conn = Conn::Connected;
+                self.banner = None;
                 self.daemon_version = Some(version);
                 self.settings = Some(settings);
                 self.totals = totals_of(&downloads, self.totals.down_bps, self.totals.up_bps);
@@ -373,6 +403,18 @@ impl App {
                     },
                     _ => Conn::Reconnecting { attempt: 1 },
                 };
+                Vec::new()
+            }
+            Msg::Incompatible(detail) => {
+                self.banner = Some(Banner::Incompatible(detail));
+                Vec::new()
+            }
+            Msg::NoDaemon(hint) => {
+                self.banner = Some(Banner::NoDaemon(hint));
+                Vec::new()
+            }
+            Msg::ConnectError(e) => {
+                self.banner = Some(Banner::Error(e));
                 Vec::new()
             }
             Msg::CmdResult(outcome) => {
@@ -511,6 +553,16 @@ impl App {
             return self.quit();
         }
         match self.mode {
+            Mode::Normal
+                if matches!(self.banner, Some(Banner::Incompatible(_)))
+                    && key.code == KeyCode::Char('U')
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.banner = Some(Banner::Restarting);
+                vec![Cmd::RestartDaemon]
+            }
             Mode::Normal => match keys::normal_key(&key) {
                 Some(action) => self.on_action(action, now),
                 None => Vec::new(),

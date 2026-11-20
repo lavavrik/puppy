@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use puppy_proto::WireState;
 
-use crate::app::{App, Conn, HitTarget, Mode};
+use crate::app::{App, Banner, Conn, HitTarget, Mode};
 use crate::format;
 use crate::theme::{Theme, Token};
 
@@ -52,24 +52,29 @@ pub fn draw(app: &mut App, f: &mut Frame) {
 /// The screen regions for a terminal of `area`.
 struct Layout {
     title: Rect,
+    /// The connection-problem band under the title bar, when there is one.
+    banner: Option<Rect>,
     list: Rect,
     detail: Option<Rect>,
     footer: Rect,
 }
 
-fn layout(area: Rect) -> Layout {
+fn layout(area: Rect, banner: bool) -> Layout {
     let title = Rect::new(area.x, area.y, area.width, 1);
+    let top = 1 + u16::from(banner);
+    let banner = banner.then(|| Rect::new(area.x, area.y + 1, area.width, 1));
     let footer = Rect::new(area.x, area.bottom() - FOOTER_ROWS, area.width, FOOTER_ROWS);
     let body = Rect::new(
         area.x,
-        area.y + 1,
+        area.y + top,
         area.width,
-        area.height - 1 - FOOTER_ROWS,
+        area.height - top - FOOTER_ROWS,
     );
     if area.width >= WIDE_WIDTH {
         let lw = body.width * LIST_PERCENT / 100;
         return Layout {
             title,
+            banner,
             list: Rect { width: lw, ..body },
             detail: Some(Rect {
                 x: body.x + lw,
@@ -86,6 +91,7 @@ fn layout(area: Rect) -> Layout {
     if dh < DETAIL_MIN {
         return Layout {
             title,
+            banner,
             list: body,
             detail: None,
             footer,
@@ -94,6 +100,7 @@ fn layout(area: Rect) -> Layout {
     let lh = body.height - dh;
     Layout {
         title,
+        banner,
         list: Rect { height: lh, ..body },
         detail: Some(Rect {
             y: body.y + lh,
@@ -111,7 +118,10 @@ fn draw_into(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
         too_small(&app.theme, buf, area);
         return None;
     }
-    let l = layout(area);
+    let l = layout(area, app.banner.is_some());
+    if let Some(b) = l.banner {
+        banner(app, buf, b);
+    }
     list::draw(app, buf, l.list);
     if let Some(d) = l.detail {
         detail::draw(app, buf, d);
@@ -130,12 +140,41 @@ fn draw_into(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
         .find(|(_, t)| *t == HitTarget::PopupInside)
         .map(|(r, _)| *r);
     let body = Rect {
-        y: area.y + 1,
-        height: area.height - 1 - FOOTER_ROWS,
+        y: l.list.y,
+        height: l.footer.y - l.list.y,
         ..area
     };
     toast::draw(app, buf, body, popup);
     cursor
+}
+
+/// The connection problem, one row under the title bar.
+fn banner(app: &App, buf: &mut Buffer, area: Rect) {
+    let t = &app.theme;
+    let Some(banner) = &app.banner else {
+        return;
+    };
+    let warn = t.style(Token::Warn);
+    let err = t.style(Token::Err);
+    let parts: Vec<(&str, Style)> = match banner {
+        Banner::Incompatible(_) => vec![
+            (" ! ", warn),
+            ("daemon is a different puppy version — press ", warn),
+            ("U", t.style(Token::Key)),
+            (" to restart it", warn),
+        ],
+        Banner::NoDaemon(hint) => vec![(" ✗ ", err), (hint, err)],
+        Banner::Error(e) => vec![
+            (" ✗ ", err),
+            ("cannot connect to the daemon: ", err),
+            (e, err),
+        ],
+        Banner::Restarting => vec![
+            (" ◌ ", t.style(Token::Info)),
+            ("restarting the daemon…", t.style(Token::Info)),
+        ],
+    };
+    spans(buf, area.x, area.y, area.width, &parts);
 }
 
 fn too_small(theme: &Theme, buf: &mut Buffer, area: Rect) {

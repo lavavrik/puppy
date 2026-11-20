@@ -1895,11 +1895,19 @@ dependencies = [
 name = "puppy-tui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "crossterm",
  "dirs",
+ "futures-util",
+ "puppy-client",
  "puppy-core",
+ "puppy-daemon",
  "puppy-proto",
+ "puppy-testserver",
  "ratatui",
+ "tempfile",
+ "tokio",
  "unicode-segmentation",
  "unicode-width",
  "url",
