@@ -36,3 +36,4 @@ unicode-segmentation = "1"
 librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
 bytes = "1"
 humantime = "2.4.0"
+globset = "0.4"

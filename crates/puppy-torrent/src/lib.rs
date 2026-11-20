@@ -4,6 +4,8 @@
 mod engine;
 mod map;
 mod poll;
+mod selection;
 mod source;
 
 pub use engine::{TorrentEngine, TorrentEngineOptions};
+pub use selection::resolve;

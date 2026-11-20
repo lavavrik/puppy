@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use librqbit::{Magnet, ValidatedTorrentMetaV1Info, torrent_from_bytes};
 use puppy_core::engine::EngineError;
 use puppy_core::fsutil::{is_reserved_windows_name, sanitize_filename, unique_dir_path};
+use puppy_core::types::TorrentFile;
 
 /// Largest `.torrent` file accepted (real ones are well under 1 MiB).
 pub(crate) const MAX_TORRENT_FILE: u64 = 16 * 1024 * 1024;
@@ -67,8 +68,42 @@ pub(crate) struct TorrentInfo {
     /// torrent.
     pub single_file: Option<PathBuf>,
     /// Every (non-padding) file's path relative to the folder librqbit writes the
-    /// torrent into (its output folder).
+    /// torrent into (its output folder). Its position is the file's puppy index (0-based,
+    /// as on the wire).
     pub files: Vec<PathBuf>,
+    /// The length of each of `files`.
+    pub sizes: Vec<u64>,
+    /// Each of `files`' index in librqbit's file list (which also counts padding files):
+    /// what `only_files` takes.
+    pub lib_index: Vec<usize>,
+}
+
+impl TorrentInfo {
+    /// The files as listed to users: index, `/`-separated relative path, size.
+    pub fn torrent_files(&self) -> Vec<TorrentFile> {
+        self.files
+            .iter()
+            .zip(&self.sizes)
+            .enumerate()
+            .map(|(index, (path, &size))| TorrentFile {
+                index,
+                path: path
+                    .iter()
+                    .map(|c| c.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                size,
+            })
+            .collect()
+    }
+
+    /// librqbit's indices of the files at puppy indices `indices`.
+    pub fn lib_indices(&self, indices: &[usize]) -> Vec<usize> {
+        indices
+            .iter()
+            .filter_map(|&i| self.lib_index.get(i).copied())
+            .collect()
+    }
 }
 
 /// Parses and validates `.torrent` bytes (as librqbit will when adding them).
@@ -87,11 +122,17 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
                 .map(|f| f.filename.to_pathbuf())
         })
         .flatten();
-    let files = info
-        .iter_file_details()
-        .filter(|f| !f.attrs().padding)
-        .map(|f| f.filename.to_pathbuf())
-        .collect();
+    let mut files = Vec::new();
+    let mut sizes = Vec::new();
+    let mut lib_index = Vec::new();
+    for (i, f) in info.iter_file_details().enumerate() {
+        if f.attrs().padding {
+            continue;
+        }
+        files.push(f.filename.to_pathbuf());
+        sizes.push(f.len);
+        lib_index.push(i);
+    }
     let name = info
         .name()
         .map(|n| n.into_owned())
@@ -102,6 +143,8 @@ pub(crate) fn parse_torrent(bytes: &[u8]) -> Result<TorrentInfo, EngineError> {
         total_bytes: info.lengths().total_length(),
         single_file,
         files,
+        sizes,
+        lib_index,
     })
 }
 
@@ -577,6 +620,8 @@ mod tests {
             } else {
                 vec![PathBuf::from("a.bin"), PathBuf::from("sub/b.bin")]
             },
+            sizes: if single { vec![1] } else { vec![1, 0] },
+            lib_index: if single { vec![0] } else { vec![0, 1] },
         }
     }
 

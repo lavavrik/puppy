@@ -30,6 +30,30 @@ pub(crate) struct Stats {
     pub up_bps: u64,
     /// Connected peers (live torrents only).
     pub peers: u32,
+    /// Bytes had per file (librqbit's file indices; empty while initializing).
+    pub file_progress: Vec<u64>,
+}
+
+impl Stats {
+    /// Counts only the selected files (`(librqbit file index, length)`) in the sizes:
+    /// librqbit's own totals are whole pieces, including the parts of pieces that lie
+    /// in unselected files.
+    pub fn restrict(&mut self, selected: &[(usize, u64)]) {
+        let total: u64 = selected.iter().map(|&(_, len)| len).sum();
+        let done: u64 = if self.finished {
+            total
+        } else {
+            selected
+                .iter()
+                .map(|&(i, len)| self.file_progress.get(i).copied().unwrap_or(0).min(len))
+                .sum()
+        };
+        self.total_bytes = total;
+        // While initializing, progress is bytes checked (shown as 0 by `status`).
+        if !matches!(self.phase, Phase::Initializing { .. }) {
+            self.progress_bytes = done;
+        }
+    }
 }
 
 impl From<&TorrentStats> for Stats {
@@ -57,6 +81,7 @@ impl From<&TorrentStats> for Stats {
             down_bps,
             up_bps,
             peers,
+            file_progress: s.file_progress.clone(),
         }
     }
 }
@@ -319,7 +344,30 @@ mod tests {
             down_bps: 100,
             up_bps: 7,
             peers: 3,
+            file_progress: Vec::new(),
         }
+    }
+
+    #[test]
+    fn restricted_sizes_count_selected_files_only() {
+        let mut s = Stats {
+            file_progress: vec![100, 50, 400],
+            ..stats(Phase::Live)
+        };
+        // Files 0 (len 100) and 2 (len 500) selected.
+        s.restrict(&[(0, 100), (2, 500)]);
+        assert_eq!((s.total_bytes, s.progress_bytes), (600, 500));
+        let st = status(&s, "a".into(), PathBuf::from("/a"));
+        assert_eq!((st.total_bytes, st.done_bytes), (Some(600), 500));
+        let mut done = Stats {
+            finished: true,
+            ..stats(Phase::Paused)
+        };
+        done.restrict(&[(1, 10)]);
+        assert_eq!((done.total_bytes, done.progress_bytes), (10, 10));
+        let mut init = stats(Phase::Initializing { paused: false });
+        init.restrict(&[(0, 100)]);
+        assert_eq!(init.total_bytes, 100);
     }
 
     #[test]

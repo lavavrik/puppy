@@ -12,12 +12,15 @@ tokio-util.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+globset.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
 # Same version librqbit 9.1 uses: its bind errors are this crate's `Error::Bind`.
 librqbit-dualstack-sockets = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true
-bytes.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # tests/error_resume.rs: RLIMIT_FSIZE forces librqbit write errors.
