@@ -1,7 +1,7 @@
 mod support;
 
 use puppy_core::config::HttpConfig;
-use puppy_core::engine::{Added, EngineEvent};
+use puppy_core::engine::{AddOptions, Added, EngineEvent};
 use puppy_core::http::download::HttpDownload;
 use puppy_core::http::probe::build_client;
 use puppy_core::http::resume::{HttpResumeState, part_path, sidecar_path};
@@ -54,33 +54,63 @@ async fn server(f: impl FnOnce(&mut ServerCfg)) -> TestServer {
 async fn start(req: AddRequest, cfg: HttpConfig) -> (HttpDownload, Added) {
     let (tx, _) = broadcast::channel(256);
     let client = build_client(&cfg).unwrap();
-    HttpDownload::start_fresh(1, req, client, cfg, TokenBucket::new(None), tx)
-        .await
-        .unwrap()
+    HttpDownload::start_fresh(
+        1,
+        req,
+        AddOptions::default(),
+        client,
+        cfg,
+        TokenBucket::new(None),
+        tx,
+    )
+    .await
+    .unwrap()
 }
 
-async fn restore(final_path: &Path, dir: &Path) -> (HttpDownload, Added) {
+async fn restore(s: &TestServer, final_path: &Path, dir: &Path) -> (HttpDownload, Added) {
     let (tx, _) = broadcast::channel(256);
-    restore_with_events(final_path, dir, tx).await
+    restore_with_events(s, final_path, dir, tx).await
 }
 
 async fn restore_with_events(
+    s: &TestServer,
     final_path: &Path,
     dir: &Path,
     tx: broadcast::Sender<EngineEvent>,
 ) -> (HttpDownload, Added) {
-    restore_with(final_path, cfg(dir), tx).await
+    restore_with(s, final_path, cfg(dir), tx).await
 }
 
 async fn restore_with(
+    s: &TestServer,
     final_path: &Path,
     c: HttpConfig,
     tx: broadcast::Sender<EngineEvent>,
 ) -> (HttpDownload, Added) {
+    let dir = final_path.parent().unwrap();
+    restore_req(request(s, dir), final_path, c, AddOptions::default(), tx).await
+}
+
+async fn restore_req(
+    req: AddRequest,
+    final_path: &Path,
+    c: HttpConfig,
+    opts: AddOptions,
+    tx: broadcast::Sender<EngineEvent>,
+) -> (HttpDownload, Added) {
     let client = build_client(&c).unwrap();
-    HttpDownload::restore(2, final_path, client, c, TokenBucket::new(None), tx)
-        .await
-        .unwrap()
+    HttpDownload::restore(
+        2,
+        req,
+        final_path,
+        opts,
+        client,
+        c,
+        TokenBucket::new(None),
+        tx,
+    )
+    .await
+    .unwrap()
 }
 
 /// Polls `status()` until `pred` holds; panics with the last status on timeout.
@@ -170,7 +200,7 @@ async fn restore_after_kill_completes_correctly() {
     s.set_cfg(|c| c.bytes_per_sec = None);
 
     let (tx, mut rx) = broadcast::channel(256);
-    let (dl, added) = restore_with_events(&final_path, dir.path(), tx).await;
+    let (dl, added) = restore_with_events(&s, &final_path, dir.path(), tx).await;
     assert_eq!(added.path, final_path);
     assert_eq!(added.name, "file.bin");
     assert_eq!(added.total_bytes, Some(LEN));
@@ -190,7 +220,7 @@ async fn restore_strong_etag_ok_completes() {
     let s = server(|_| {}).await;
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     wait_completed(&dl).await;
     assert_file(&final_path, LEN, 0);
     assert_no_leftovers(&final_path);
@@ -208,7 +238,7 @@ async fn restore_strong_etag_changed() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     s.set_version(1);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
     assert!(!final_path.exists());
     assert!(part_path(&final_path).exists());
@@ -223,7 +253,7 @@ async fn restore_no_validator_spot_check_ok() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     wait_completed(&dl).await;
     assert_file(&final_path, LEN, 0);
     assert_no_leftovers(&final_path);
@@ -239,7 +269,7 @@ async fn restore_no_validator_spot_check_detects_change() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     s.set_version(1);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
     assert!(part_path(&final_path).exists());
 }
@@ -262,7 +292,7 @@ async fn restore_weak_etag_uses_spot_check() {
     .unwrap();
     s.set_version(1);
     let before = s.requests_seen().len();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
     assert!(
         s.requests_seen()[before..]
@@ -277,7 +307,7 @@ async fn restore_last_modified_only() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     let before = s.requests_seen().len();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     // Last-Modified goes into If-Range, and the spot check still runs.
     let seen = &s.requests_seen()[before..];
     let spot = format!("bytes=0-{}", 64 * KIB - 1);
@@ -293,7 +323,7 @@ async fn restore_last_modified_only() {
     s.set_cfg(|c| c.bytes_per_sec = Some(256 * KIB));
     let final_path = paused_download(&s, dir.path()).await;
     s.set_version(1);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
 }
 
@@ -305,7 +335,7 @@ async fn restore_last_modified_same_but_body_changed() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     s.set_version(3600); // same Last-Modified as version 0, different body
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
 }
 
@@ -319,7 +349,7 @@ async fn restore_no_validator_length_changed() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     s.set_cfg(|c| c.len = 5 * MIB);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::RemoteChanged));
 }
 
@@ -333,7 +363,7 @@ async fn restore_unknown_length_not_resumable() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     let before = s.requests_seen().len();
-    let (dl, added) = restore(&final_path, dir.path()).await;
+    let (dl, added) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::NotResumable));
     assert_eq!(added.total_bytes, None);
     assert_eq!(s.requests_seen().len(), before, "no network validation");
@@ -346,7 +376,7 @@ async fn restore_single_stream_not_resumable() {
     let s = server(|c| c.ranges = false).await;
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
-    let (dl, added) = restore(&final_path, dir.path()).await;
+    let (dl, added) = restore(&s, &final_path, dir.path()).await;
     assert!(matches!(attention(&dl), AttentionReason::NotResumable));
     assert_eq!(added.total_bytes, Some(LEN));
     assert!(part_path(&final_path).exists(), ".part must be kept");
@@ -366,7 +396,7 @@ async fn restore_missing_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     std::fs::remove_file(sidecar_path(&final_path)).unwrap();
-    let (dl, added) = restore(&final_path, dir.path()).await;
+    let (dl, added) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
     assert_eq!(added.path, final_path);
     assert!(part_path(&final_path).exists());
@@ -378,7 +408,7 @@ async fn restore_corrupt_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     std::fs::write(sidecar_path(&final_path), b"{ not json").unwrap();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
 }
 
@@ -388,7 +418,7 @@ async fn restore_missing_part() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     std::fs::remove_file(part_path(&final_path)).unwrap();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
 }
 
@@ -403,7 +433,7 @@ async fn restore_part_length_mismatch() {
         .unwrap();
     f.set_len(LEN - 1).unwrap();
     drop(f);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
 }
 
@@ -420,7 +450,7 @@ async fn restore_segments_not_covering_total() {
     )
     .await
     .unwrap();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
 }
 
@@ -432,14 +462,14 @@ async fn restore_after_rename_before_sidecar_delete_is_completed() {
     let sidecar = std::fs::read(sidecar_path(&final_path)).unwrap();
     // Finish the download, then put back the sidecar as if the process died between
     // renaming `.part` and deleting the sidecar.
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     wait_completed(&dl).await;
     drop(dl);
     std::fs::write(sidecar_path(&final_path), sidecar).unwrap();
     let before = s.requests_seen().len();
 
     let (tx, mut rx) = broadcast::channel(256);
-    let (dl, added) = restore_with_events(&final_path, dir.path(), tx).await;
+    let (dl, added) = restore_with_events(&s, &final_path, dir.path(), tx).await;
     let st = dl.status();
     assert!(matches!(st.state, DownloadState::Completed), "{st:?}");
     assert_eq!(st.done_bytes, LEN);
@@ -460,7 +490,7 @@ async fn restore_network_error_fails_then_resume_completes() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     s.set_cfg(|c| c.get_503_once = true);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     let st = dl.status();
     assert!(matches!(st.state, DownloadState::Failed { .. }), "{st:?}");
     assert!(part_path(&final_path).exists());
@@ -507,7 +537,7 @@ async fn restore_final_length_mismatch_keeps_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let final_path = paused_download(&s, dir.path()).await;
     let sidecar = std::fs::read(sidecar_path(&final_path)).unwrap();
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     wait_completed(&dl).await;
     drop(dl);
     std::fs::write(sidecar_path(&final_path), sidecar).unwrap();
@@ -517,7 +547,7 @@ async fn restore_final_length_mismatch_keeps_sidecar() {
         .unwrap();
     f.set_len(LEN - 1).unwrap();
     drop(f);
-    let (dl, _) = restore(&final_path, dir.path()).await;
+    let (dl, _) = restore(&s, &final_path, dir.path()).await;
     assert_validation_failed(&dl);
     assert!(sidecar_path(&final_path).exists(), "sidecar must be kept");
 }
@@ -532,7 +562,7 @@ async fn restore_stalled_server_times_out_failed() {
     c.validate_timeout_ms = 300;
     let (tx, _) = broadcast::channel(256);
     let t = Instant::now();
-    let (dl, _) = restore_with(&final_path, c, tx).await;
+    let (dl, _) = restore_with(&s, &final_path, c, tx).await;
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     let st = dl.status();
     match &st.state {
@@ -620,4 +650,67 @@ async fn cancel_during_validation_is_prompt() {
         .unwrap();
     assert_no_leftovers(&added.path);
     assert!(dl.resume().await.is_err(), "cancelled download resumed");
+}
+
+#[tokio::test]
+async fn sidecar_never_stores_request_context() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&s, dir.path());
+    req.context = RequestContext {
+        cookies: Some("session=topsecret".into()),
+        basic_auth: Some(("user".into(), Some("hunter2".into()))),
+        headers: vec![("X-Token".into(), "tok-secret".into())],
+        ..RequestContext::default()
+    };
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    let raw = String::from_utf8(std::fs::read(sidecar_path(&added.path)).unwrap()).unwrap();
+    for secret in ["topsecret", "hunter2", "tok-secret", "X-Token"] {
+        assert!(!raw.contains(secret), "{secret} persisted: {raw}");
+    }
+    let state = HttpResumeState::load(&added.path).await.unwrap();
+    assert_eq!(state.request.context, RequestContext::default());
+
+    // The restore gets the context from the caller and uses it for validation.
+    s.set_cfg(|c| c.bytes_per_sec = None);
+    let before = s.requests_seen().len();
+    let (tx, _) = broadcast::channel(256);
+    let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
+    wait_completed(&dl).await;
+    let later = &s.requests_seen()[before..];
+    assert!(!later.is_empty());
+    for h in later {
+        assert_eq!(h.get("cookie").unwrap(), "session=topsecret");
+        assert_eq!(h.get("x-token").unwrap(), "tok-secret");
+    }
+    assert_file(&added.path, LEN, 0);
+}
+
+#[tokio::test]
+async fn restore_source_mismatch_needs_attention() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let final_path = paused_download(&s, dir.path()).await;
+    let mut other = request(&s, dir.path());
+    other.source = Source::Http {
+        url: s.url("/other.bin"),
+    };
+    let before = s.requests_seen().len();
+    let (tx, _) = broadcast::channel(256);
+    let (dl, added) = restore_req(
+        other,
+        &final_path,
+        cfg(dir.path()),
+        AddOptions::default(),
+        tx,
+    )
+    .await;
+    assert_validation_failed(&dl);
+    assert_eq!(added.path, final_path);
+    assert_eq!(s.requests_seen().len(), before);
+    assert!(part_path(&final_path).exists());
+    assert!(sidecar_path(&final_path).exists());
 }

@@ -1,7 +1,7 @@
 mod support;
 
 use puppy_core::config::HttpConfig;
-use puppy_core::engine::EngineEvent;
+use puppy_core::engine::{AddOptions, EngineEvent};
 use puppy_core::http::download::HttpDownload;
 use puppy_core::http::probe::build_client;
 use puppy_core::http::resume::{HttpResumeState, part_path, sidecar_path};
@@ -62,9 +62,17 @@ async fn start_with_events(
     tx: broadcast::Sender<EngineEvent>,
 ) -> (HttpDownload, puppy_core::engine::Added) {
     let client = build_client(&cfg).unwrap();
-    HttpDownload::start_fresh(1, request(s, dir), client, cfg, TokenBucket::new(None), tx)
-        .await
-        .unwrap()
+    HttpDownload::start_fresh(
+        1,
+        request(s, dir),
+        AddOptions::default(),
+        client,
+        cfg,
+        TokenBucket::new(None),
+        tx,
+    )
+    .await
+    .unwrap()
 }
 
 /// Polls `status()` until `pred` holds; panics with the last status on timeout.
@@ -456,6 +464,7 @@ async fn low_limit_does_not_reconnect() {
     let (dl, added) = HttpDownload::start_fresh(
         1,
         request(&s, dir.path()),
+        AddOptions::default(),
         client,
         c,
         TokenBucket::new(Some(8 * KIB)),

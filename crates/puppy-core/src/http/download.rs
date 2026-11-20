@@ -8,9 +8,11 @@
 //! deletion run strictly after `transfer` has returned, so no handle can be open then.
 
 use crate::config::HttpConfig;
-use crate::engine::{Added, EngineError, EngineEvent};
+use crate::engine::{AddOptions, Added, EngineError, EngineEvent};
 use crate::http::probe::RemoteInfo;
-use crate::http::resume::{HttpResumeState, VERSION, part_path, sidecar_path};
+use crate::http::resume::{
+    HttpResumeState, VERSION, context_hash, part_path, sidecar_path, without_context,
+};
 use crate::http::segments::{Segment, plan_segments};
 use crate::http::validate::{Validation, validate_remote};
 use crate::http::worker::SegmentShared;
@@ -19,7 +21,7 @@ use crate::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
     SegmentView, Source,
 };
-use files::prepare;
+use files::{blocking, open_part, prepare};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,7 @@ pub struct HttpDownload {
 
 struct Inner {
     id: DownloadId,
+    /// The caller's request, including its context (which is never persisted).
     request: AddRequest,
     client: reqwest::Client,
     cfg: HttpConfig,
@@ -162,11 +165,13 @@ struct Env {
     cfg: HttpConfig,
     global: TokenBucket,
     events: broadcast::Sender<EngineEvent>,
+    opts: AddOptions,
 }
 
 impl Env {
     fn new(
         id: DownloadId,
+        opts: AddOptions,
         client: reqwest::Client,
         mut cfg: HttpConfig,
         global: TokenBucket,
@@ -180,6 +185,7 @@ impl Env {
             cfg,
             global,
             events,
+            opts,
         }
     }
 
@@ -209,7 +215,8 @@ impl Env {
             client: self.client,
             cfg: self.cfg,
             global: self.global,
-            limit: TokenBucket::new(None),
+            // In force before anything is transferred.
+            limit: TokenBucket::new(self.opts.limit),
             events: self.events,
             remote,
             final_path,
@@ -235,9 +242,12 @@ fn file_name(path: &Path) -> String {
 impl HttpDownload {
     /// Probes, creates `<final>.part` (preallocated when the size is known) and starts
     /// transferring in the background. Returns once the name and path are known.
+    ///
+    /// With `opts.start_paused` it writes the sidecar instead and stays `Paused`.
     pub async fn start_fresh(
         id: DownloadId,
         req: AddRequest,
+        opts: AddOptions,
         client: reqwest::Client,
         cfg: HttpConfig,
         global: TokenBucket,
@@ -247,7 +257,8 @@ impl HttpDownload {
             return Err(EngineError::Unsupported("not an HTTP source"));
         };
         let url = url.clone();
-        let env = Env::new(id, client, cfg, global, events);
+        let start_paused = opts.start_paused;
+        let env = Env::new(id, opts, client, cfg, global, events);
         env.emit(DownloadState::Starting);
         let (remote, final_path) = match prepare(&env.client, &url, &req, &env.cfg).await {
             Ok(v) => v,
@@ -260,7 +271,22 @@ impl HttpDownload {
         };
         let plan = Plan::new(remote.total, remote.accepts_ranges, &env.cfg);
         let (inner, added) = env.build(req, remote, final_path, plan);
-        inner.control.lock().await.run = Some(spawn_run(&inner));
+        if start_paused {
+            // Recorded so a restart can restore it, although nothing was transferred.
+            if let Err(e) = inner.write_initial_sidecar().await {
+                inner.set_state(DownloadState::Failed {
+                    reason: e.to_string(),
+                });
+                let part = part_path(&inner.final_path);
+                if let Err(e) = tokio::fs::remove_file(&part).await {
+                    tracing::warn!(path = %part.display(), "cannot delete: {e}");
+                }
+                return Err(e);
+            }
+            inner.set_state(DownloadState::Paused);
+        } else {
+            inner.control.lock().await.run = Some(spawn_run(&inner));
+        }
         Ok((HttpDownload { inner }, added))
     }
 
@@ -425,7 +451,7 @@ impl Inner {
         let state = self.resume_state();
         let part = part_path(&self.final_path);
         let result = tokio::select! {
-            r = validate_remote(&self.client, &state, &part, &self.cfg) => r,
+            r = validate_remote(&self.client, &self.request.context, &state, &part, &self.cfg) => r,
             Ok(()) = interrupt.changed() => {
                 self.set_state(DownloadState::Paused);
                 return Ok(false);
@@ -476,7 +502,8 @@ impl Inner {
         let r = &self.remote;
         HttpResumeState {
             version: VERSION,
-            request: self.request.clone(),
+            request: without_context(&self.request),
+            context_hash: context_hash(&self.request.context),
             final_url: r.final_url.clone(),
             total: r.total,
             etag: r.etag.clone(),
@@ -486,6 +513,15 @@ impl Inner {
             segments,
             single_stream,
         }
+    }
+
+    /// Writes the first sidecar of a download that has not transferred anything.
+    async fn write_initial_sidecar(&self) -> Result<(), EngineError> {
+        let final_path = self.final_path.clone();
+        let file = blocking(move || open_part(&final_path)).await?;
+        let result = self.resume_state().flush(&file).await;
+        drop(file);
+        result
     }
 
     /// Writes the sidecar (data fsync first). Failure is logged: an older sidecar only

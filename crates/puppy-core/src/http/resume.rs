@@ -8,15 +8,20 @@ use serde::{Deserialize, Serialize};
 use crate::engine::EngineError;
 use crate::fsutil::atomic_write;
 use crate::http::segments::Segment;
-use crate::types::AddRequest;
+use crate::types::{AddRequest, RequestContext};
 
-/// Current sidecar format version.
-pub const VERSION: u32 = 1;
+/// Current sidecar format version. 2: request context no longer stored.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpResumeState {
     pub version: u32,
+    /// The request with an empty `context`: cookies and credentials are never written
+    /// next to the download (it may sit on a shared or unprotected volume).
     pub request: AddRequest,
+    /// Fingerprint of the original request context ([`context_hash`]); only used to
+    /// notice that a restore was given a different context.
+    pub context_hash: u64,
     pub final_url: url::Url,
     pub total: Option<u64>,
     pub etag: Option<String>,
@@ -28,6 +33,22 @@ pub struct HttpResumeState {
     /// server ignored ranges): cannot be continued, only restarted.
     #[serde(default)]
     pub single_stream: bool,
+}
+
+/// The request as recorded in a sidecar: everything but its context.
+pub fn without_context(req: &AddRequest) -> AddRequest {
+    AddRequest {
+        context: RequestContext::default(),
+        ..req.clone()
+    }
+}
+
+/// Stable, non-cryptographic fingerprint (FNV-1a 64 of the JSON) of a request context.
+pub fn context_hash(ctx: &RequestContext) -> u64 {
+    let json = serde_json::to_vec(ctx).unwrap_or_default();
+    json.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn append_ext(final_path: &Path, ext: &str) -> PathBuf {
@@ -120,13 +141,14 @@ mod tests {
     fn state(final_path: &Path, segments: Vec<Segment>) -> HttpResumeState {
         let url = url::Url::parse("https://example.com/a.iso").unwrap();
         HttpResumeState {
-            version: 1,
+            version: VERSION,
             request: AddRequest {
                 source: Source::Http { url: url.clone() },
                 output_dir: None,
                 filename: None,
                 context: RequestContext::default(),
             },
+            context_hash: context_hash(&RequestContext::default()),
             final_url: url,
             total: Some(100),
             etag: Some("\"abc\"".into()),
@@ -202,6 +224,50 @@ mod tests {
             HttpResumeState::load(&final_path).await,
             Err(EngineError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_version_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("a.iso");
+        let mut s = state(&final_path, vec![seg(0, 100, 0)]);
+        s.version = 1;
+        write_raw(&final_path, &s).await;
+        assert!(matches!(
+            HttpResumeState::load(&final_path).await,
+            Err(EngineError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn context_hash_distinguishes_contexts() {
+        let a = RequestContext::default();
+        let b = RequestContext {
+            cookies: Some("session=1".into()),
+            ..RequestContext::default()
+        };
+        assert_eq!(context_hash(&a), context_hash(&a.clone()));
+        assert_ne!(context_hash(&a), context_hash(&b));
+    }
+
+    #[test]
+    fn without_context_clears_secrets() {
+        let req = AddRequest {
+            source: Source::Http {
+                url: url::Url::parse("https://example.com/a").unwrap(),
+            },
+            output_dir: None,
+            filename: Some("a".into()),
+            context: RequestContext {
+                cookies: Some("session=secret".into()),
+                basic_auth: Some(("u".into(), Some("p".into()))),
+                ..RequestContext::default()
+            },
+        };
+        let s = without_context(&req);
+        assert_eq!(s.context, RequestContext::default());
+        assert_eq!(s.source, req.source);
+        assert_eq!(s.filename, req.filename);
     }
 
     #[tokio::test]

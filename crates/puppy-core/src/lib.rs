@@ -6,6 +6,6 @@ pub mod limiter;
 pub mod meter;
 pub mod types;
 
-pub use engine::{Added, Engine, EngineError, EngineEvent, EngineKind, StartMode};
+pub use engine::{AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode};
 pub use http::engine::HttpEngine;
 pub use types::{AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source};

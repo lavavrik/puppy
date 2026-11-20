@@ -1,6 +1,7 @@
 //! The engine abstraction implemented by the HTTP (and later torrent) engines.
 
 use crate::types::{AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,17 @@ pub enum EngineKind {
 pub enum StartMode {
     Fresh,
     Restore { path: PathBuf },
+}
+
+/// Options for [`Engine::add`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddOptions {
+    /// Prepare the download (fresh: probe and create its files; restore: check the local
+    /// files only, no network) but leave it `Paused` instead of transferring. `resume`
+    /// starts it (validating the remote file as usual).
+    pub start_paused: bool,
+    /// Per-download rate limit in bytes/s, in force before the first byte is transferred.
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,16 +61,34 @@ pub enum EngineError {
     Invalid(String),
 }
 
+/// A download engine managing many downloads by caller-chosen id.
+///
+/// - A download in `NeedsAttention` is not resumable as is. To restart it from scratch,
+///   `remove(id, true)` it and `add` it again (`StartMode::Fresh`) with the request the
+///   caller stored.
+/// - Dropping an engine does not stop its downloads (their tasks are detached): `pause`
+///   or `remove` them first.
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
     fn kind(&self) -> EngineKind;
     fn accepts(&self, source: &Source) -> bool;
-    /// Probes/prepares, starts transferring in the background, returns once name/path are known.
+    /// Registers download `id` and returns once its name and path are known.
+    ///
+    /// - Blocks for the remote probe (`Fresh`) or local checks and remote validation
+    ///   (`Restore`), so it can take as long as the network does. Dropping the future
+    ///   cancels the add: the id is released and no transfer is started.
+    /// - Unless `opts.start_paused`, transferring then continues in the background.
+    /// - `opts.limit` is applied before any transfer begins.
+    /// - `Restore` continues from the files at `path`; `req` must be the request the
+    ///   download was originally added with (it supplies the request context, which is
+    ///   never persisted next to the download).
+    /// - Events for `id` (e.g. `StateChanged`) may be broadcast before `add` returns.
     async fn add(
         &self,
         id: DownloadId,
         req: AddRequest,
         mode: StartMode,
+        opts: AddOptions,
     ) -> Result<Added, EngineError>;
     async fn pause(&self, id: DownloadId) -> Result<(), EngineError>;
     async fn resume(&self, id: DownloadId) -> Result<(), EngineError>;

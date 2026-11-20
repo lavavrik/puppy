@@ -6,6 +6,7 @@ use crate::engine::EngineError;
 use crate::http::probe::{apply_context, timed};
 use crate::http::resume::HttpResumeState;
 use crate::http::worker::parse_content_range;
+use crate::types::RequestContext;
 use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use std::io::{Read, Seek, SeekFrom};
@@ -30,18 +31,33 @@ pub enum Validation {
 /// `Changed`; so is exceeding `cfg.validate_timeout_ms`.
 pub async fn validate_remote(
     client: &reqwest::Client,
+    ctx: &RequestContext,
     state: &HttpResumeState,
     part: &Path,
     cfg: &HttpConfig,
 ) -> Result<Validation, EngineError> {
     let limit = Duration::from_millis(cfg.validate_timeout_ms);
-    tokio::time::timeout(limit, validate(client, state, part, cfg))
+    let net = Net {
+        client,
+        ctx,
+        url: &state.final_url,
+        read_timeout: Duration::from_millis(cfg.read_timeout_ms),
+    };
+    tokio::time::timeout(limit, validate(&net, state, part, cfg))
         .await
         .unwrap_or_else(|_| Err(EngineError::Network("validation timed out".into())))
 }
 
+/// Where and how validation requests are sent.
+struct Net<'a> {
+    client: &'a reqwest::Client,
+    ctx: &'a RequestContext,
+    url: &'a url::Url,
+    read_timeout: Duration,
+}
+
 async fn validate(
-    client: &reqwest::Client,
+    net: &Net<'_>,
     state: &HttpResumeState,
     part: &Path,
     cfg: &HttpConfig,
@@ -55,7 +71,6 @@ async fn validate(
         Some(_) => (None, true),
         None => (state.last_modified.as_deref(), true),
     };
-    let read_timeout = Duration::from_millis(cfg.read_timeout_ms);
     let completed: Vec<(u64, u64)> = state
         .segments
         .iter()
@@ -73,10 +88,10 @@ async fn validate(
             .unwrap_or_default()
     };
     if windows.is_empty() {
-        return probe_only(client, state, if_range, total, read_timeout).await;
+        return probe_only(net, if_range, total).await;
     }
     for (start, end) in windows {
-        let got = match fetch(client, state, if_range, (start, end), read_timeout).await? {
+        let got = match fetch(net, if_range, start, end).await? {
             Fetched::Range { total: t, .. } if t != Some(total) => return Ok(Validation::Changed),
             Fetched::Range { data, .. } => data,
             // Completed bytes lie inside the recorded total: the file shrank.
@@ -96,22 +111,18 @@ async fn validate(
 
 /// Nothing completed yet: confirms the validator and total with `bytes=0-0`.
 async fn probe_only(
-    client: &reqwest::Client,
-    state: &HttpResumeState,
+    net: &Net<'_>,
     if_range: Option<&str>,
     total: u64,
-    read_timeout: Duration,
 ) -> Result<Validation, EngineError> {
-    Ok(
-        match fetch(client, state, if_range, (0, 1), read_timeout).await? {
-            Fetched::Range { total: t, .. } if t == Some(total) => Validation::Ok,
-            Fetched::Range { .. } => Validation::Changed,
-            // An empty file cannot satisfy any range; `bytes */0` confirms it is still empty.
-            Fetched::Unsatisfiable { total: Some(0) } if total == 0 => Validation::Ok,
-            Fetched::Unsatisfiable { .. } => Validation::Changed,
-            Fetched::Other(v) => v,
-        },
-    )
+    Ok(match fetch(net, if_range, 0, 1).await? {
+        Fetched::Range { total: t, .. } if t == Some(total) => Validation::Ok,
+        Fetched::Range { .. } => Validation::Changed,
+        // An empty file cannot satisfy any range; `bytes */0` confirms it is still empty.
+        Fetched::Unsatisfiable { total: Some(0) } if total == 0 => Validation::Ok,
+        Fetched::Unsatisfiable { .. } => Validation::Changed,
+        Fetched::Other(v) => v,
+    })
 }
 
 enum Fetched {
@@ -123,26 +134,24 @@ enum Fetched {
     Other(Validation),
 }
 
-/// GETs `[start, end)` (with `If-Range` when given); `read_timeout` bounds each wait.
+/// GETs `[start, end)` (with `If-Range` when given).
 async fn fetch(
-    client: &reqwest::Client,
-    state: &HttpResumeState,
+    net: &Net<'_>,
     if_range: Option<&str>,
-    (start, end): (u64, u64),
-    read_timeout: Duration,
+    start: u64,
+    end: u64,
 ) -> Result<Fetched, EngineError> {
-    let mut rb = client
-        .get(state.final_url.clone())
+    let read_timeout = net.read_timeout;
+    let mut rb = net
+        .client
+        .get(net.url.clone())
         .header(header::RANGE, format!("bytes={}-{}", start, end - 1));
     if let Some(v) = if_range {
         rb = rb.header(header::IF_RANGE, v);
     }
-    let resp = timed(
-        read_timeout,
-        apply_context(rb, &state.request.context).send(),
-    )
-    .await?
-    .map_err(|e| EngineError::Network(e.to_string()))?;
+    let resp = timed(read_timeout, apply_context(rb, net.ctx).send())
+        .await?
+        .map_err(|e| EngineError::Network(e.to_string()))?;
     let content_range = resp
         .headers()
         .get(header::CONTENT_RANGE)

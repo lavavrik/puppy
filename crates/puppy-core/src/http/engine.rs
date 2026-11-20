@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::config::HttpConfig;
-use crate::engine::{Added, Engine, EngineError, EngineEvent, EngineKind, StartMode};
+use crate::engine::{AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode};
 use crate::http::download::HttpDownload;
 use crate::http::probe::build_client;
 use crate::limiter::TokenBucket;
@@ -79,6 +79,7 @@ impl Engine for HttpEngine {
         id: DownloadId,
         req: AddRequest,
         mode: StartMode,
+        opts: AddOptions,
     ) -> Result<Added, EngineError> {
         if !self.accepts(&req.source) {
             return Err(EngineError::Unsupported("not an HTTP(S) source"));
@@ -103,10 +104,10 @@ impl Engine for HttpEngine {
         };
         let result = match mode {
             StartMode::Fresh => {
-                HttpDownload::start_fresh(id, req, client, cfg, global, events).await
+                HttpDownload::start_fresh(id, req, opts, client, cfg, global, events).await
             }
             StartMode::Restore { path } => {
-                HttpDownload::restore(id, &path, client, cfg, global, events).await
+                HttpDownload::restore(id, req, &path, opts, client, cfg, global, events).await
             }
         };
         let (dl, added) = result?; // the guard releases the id on error
