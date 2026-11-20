@@ -99,6 +99,9 @@ pub enum EngineDetail {
         leechers: u32,
         ratio: f32,
     },
+    /// A kind this build does not know (sent by a newer daemon): no detail to show.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -122,5 +125,23 @@ mod tests {
                 reason: AttentionReason::RemoteChanged
             }
         ));
+    }
+
+    /// A detail kind from a newer daemon decodes as `Unknown` instead of failing.
+    #[test]
+    fn unknown_engine_detail_kind_decodes() {
+        let d: EngineDetail =
+            serde_json::from_str(r#"{"kind":"ftp","sessions":3,"extra":[1,2]}"#).unwrap();
+        assert_eq!(d, EngineDetail::Unknown);
+        let back: EngineDetail = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back, EngineDetail::Unknown);
+        let http = EngineDetail::Http {
+            segments: Vec::new(),
+            connections: 2,
+            resumable: true,
+        };
+        let back: EngineDetail =
+            serde_json::from_str(&serde_json::to_string(&http).unwrap()).unwrap();
+        assert_eq!(back, http);
     }
 }

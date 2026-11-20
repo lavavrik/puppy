@@ -42,7 +42,8 @@ pub struct Config {
     pub theme: String,
     pub proxy: Option<url::Url>,
     /// First delay before a transiently failed download is retried automatically;
-    /// doubles per failure up to [`MAX_RETRY_DELAY`]. Not read from the file.
+    /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
+    /// the file.
     #[serde(skip)]
     pub retry_base: Duration,
     /// How long shutdown waits for downloads to pause (flushing their sidecars) before

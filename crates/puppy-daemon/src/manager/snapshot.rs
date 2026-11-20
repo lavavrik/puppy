@@ -66,7 +66,7 @@ impl Inner {
                 (Some(u16::try_from(active).unwrap_or(u16::MAX)), None)
             }
             Some(EngineDetail::Torrent { peers, .. }) => (None, Some(*peers)),
-            None => (None, None),
+            Some(EngineDetail::Unknown) | None => (None, None),
         };
         let total_bytes = status
             .as_ref()

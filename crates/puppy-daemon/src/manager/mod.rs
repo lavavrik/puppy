@@ -11,8 +11,10 @@
 //!   (remove), and the job settles them when the engine call returns.
 //! - Transient failures (`Failed { transient: true }`: network trouble, timeouts, HTTP
 //!   5xx/429/408) are retried automatically: requeued after `Config::retry_base`,
-//!   doubling per failure up to [`MAX_RETRY_DELAY`], for as long as the daemon runs.
-//!   Pausing cancels a pending retry; resuming (or restarting) resets the delay.
+//!   doubling per failure up to [`MAX_RETRY_DELAY`] (never less than
+//!   [`MIN_RETRY_DELAY`]), for as long as the daemon runs. Pausing cancels a pending
+//!   retry; resuming (or restarting) resets the delay, and so does a retried download
+//!   that is active and transferring again.
 //! - Engine events only mean "look again": the manager re-reads `engine.status()` instead
 //!   of trusting event payloads, and ignores events for downloads with a job in flight
 //!   (the job reads the status itself once the engine call returns). Events may thus
@@ -40,6 +42,8 @@ use tokio_util::sync::CancellationToken;
 
 const EVENT_CAPACITY: usize = 256;
 const TICK: Duration = Duration::from_secs(1);
+/// The shortest delay before an automatic retry, whatever `Config::retry_base` says.
+const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManagerError {
@@ -119,6 +123,9 @@ struct Entry {
     retry: Option<Retry>,
     /// The delay before the next automatic retry; `None`: `Config::retry_base`.
     backoff: Option<Duration>,
+    /// While `backoff` is set: the bytes done when the download was last seen without
+    /// progress; once it is active with more than that, `backoff` is reset.
+    progress_mark: Option<u64>,
 }
 
 /// When a transiently failed download is requeued.
@@ -138,6 +145,7 @@ impl Entry {
             job: None,
             retry: None,
             backoff: None,
+            progress_mark: None,
         }
     }
 
@@ -145,6 +153,7 @@ impl Entry {
     fn reset_retry(&mut self) {
         self.retry = None;
         self.backoff = None;
+        self.progress_mark = None;
     }
 }
 
@@ -173,6 +182,16 @@ struct JobCtl {
 struct Effects {
     /// Completed downloads the engine should drop (`remove(id, false)`).
     drop_completed: Vec<(usize, DownloadId)>,
+}
+
+/// The delay before the next automatic retry (the current backoff, or `base` for the
+/// first one) and the backoff after it (doubled); both between [`MIN_RETRY_DELAY`] and
+/// [`MAX_RETRY_DELAY`].
+fn retry_delay(backoff: Option<Duration>, base: Duration) -> (Duration, Duration) {
+    let delay = backoff
+        .unwrap_or(base)
+        .clamp(MIN_RETRY_DELAY, MAX_RETRY_DELAY);
+    (delay, (delay * 2).min(MAX_RETRY_DELAY))
 }
 
 fn now_unix() -> u64 {
@@ -396,11 +415,9 @@ impl Inner {
     /// Schedules the automatic retry of a transiently failed download: after the
     /// current backoff, which then doubles (up to [`MAX_RETRY_DELAY`]).
     fn arm_retry(&self, id: DownloadId, e: &mut Entry) {
-        let delay = e
-            .backoff
-            .unwrap_or(self.cfg.retry_base)
-            .min(MAX_RETRY_DELAY);
-        e.backoff = Some((delay * 2).min(MAX_RETRY_DELAY));
+        let (delay, next) = retry_delay(e.backoff, self.cfg.retry_base);
+        e.backoff = Some(next);
+        e.progress_mark = None;
         let unix = now_unix() + delay.as_secs_f64().ceil() as u64;
         e.retry = Some(Retry {
             at: tokio::time::Instant::now() + delay,
@@ -434,12 +451,26 @@ impl Inner {
         }
     }
 
-    /// Copies what the engine knows about name, path and size into the record.
+    /// Copies what the engine knows about name, path and size into the record, and
+    /// resets the retry backoff once a retried download is active and making progress.
     fn record_status(e: &mut Entry, status: &puppy_core::types::DownloadStatus) {
         e.rec.name = Some(status.name.clone());
         e.rec.path = Some(status.path.clone());
         if status.total_bytes.is_some() {
             e.rec.total_bytes = status.total_bytes;
+        }
+        if e.backoff.is_some() {
+            let transferring =
+                e.state == DownloadState::Active && status.state == DownloadState::Active;
+            match e.progress_mark {
+                Some(mark) if transferring && status.done_bytes > mark => {
+                    tracing::debug!(id = e.rec.id, "transferring again; retry backoff reset");
+                    e.backoff = None;
+                    e.progress_mark = None;
+                }
+                Some(_) => {}
+                None => e.progress_mark = Some(status.done_bytes),
+            }
         }
     }
 
@@ -677,5 +708,97 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!ran.load(Ordering::SeqCst), "a job ran after shutdown");
+    }
+
+    #[test]
+    fn retry_delays_are_floored_and_capped() {
+        let base = Duration::from_millis(200);
+        let (d, next) = retry_delay(None, base);
+        assert_eq!(d, MIN_RETRY_DELAY);
+        assert_eq!(next, MIN_RETRY_DELAY * 2);
+        assert_eq!(retry_delay(None, Duration::ZERO).0, MIN_RETRY_DELAY);
+        // A zero backoff never turns into a tight loop.
+        assert_eq!(
+            retry_delay(Some(Duration::ZERO), Duration::ZERO),
+            (MIN_RETRY_DELAY, MIN_RETRY_DELAY * 2)
+        );
+        let (d, next) = retry_delay(None, Duration::from_secs(30));
+        assert_eq!(
+            (d, next),
+            (Duration::from_secs(30), Duration::from_secs(60))
+        );
+        let (d, next) = retry_delay(Some(MAX_RETRY_DELAY * 2), Duration::from_secs(30));
+        assert_eq!((d, next), (MAX_RETRY_DELAY, MAX_RETRY_DELAY));
+    }
+
+    fn entry(state: DownloadState) -> Entry {
+        let rec = StoredDownload {
+            id: 1,
+            request: puppy_core::types::AddRequest {
+                source: puppy_core::types::Source::Http {
+                    url: "http://example.invalid/a".parse().unwrap(),
+                },
+                output_dir: None,
+                filename: None,
+                context: Default::default(),
+            },
+            limit: None,
+            state: crate::store::StoredState::Queued,
+            name: None,
+            path: None,
+            total_bytes: None,
+            created_unix: 1,
+            finished_unix: None,
+        };
+        Entry::new(rec, state, Some(0))
+    }
+
+    fn status(state: DownloadState, done: u64) -> puppy_core::types::DownloadStatus {
+        puppy_core::types::DownloadStatus {
+            state,
+            name: "a".into(),
+            path: "/tmp/a".into(),
+            total_bytes: Some(1000),
+            done_bytes: done,
+            down_bps: 0,
+            up_bps: 0,
+            eta_secs: None,
+        }
+    }
+
+    /// The backoff survives a retry that gets nowhere, but is reset once the retried
+    /// download is active and actually transfers.
+    #[test]
+    fn progress_after_a_retry_resets_the_backoff() {
+        let mut e = entry(DownloadState::Failed {
+            reason: "x".into(),
+            transient: true,
+        });
+        e.backoff = Some(Duration::from_secs(8));
+        // Seen while failed, then active without progress: kept.
+        let seen = status(e.state.clone(), 100);
+        Inner::record_status(&mut e, &seen);
+        e.state = DownloadState::Active;
+        Inner::record_status(&mut e, &status(DownloadState::Active, 100));
+        assert_eq!(e.backoff, Some(Duration::from_secs(8)));
+        // Progress while not active (the engine's view) does not count.
+        e.state = DownloadState::Starting;
+        Inner::record_status(&mut e, &status(DownloadState::Active, 150));
+        assert_eq!(e.backoff, Some(Duration::from_secs(8)));
+        // Active and transferring: reset.
+        e.state = DownloadState::Active;
+        Inner::record_status(&mut e, &status(DownloadState::Active, 200));
+        assert_eq!(e.backoff, None);
+    }
+
+    /// A download first seen active (e.g. after a restore) gets its mark then.
+    #[test]
+    fn backoff_reset_needs_progress_beyond_the_first_sighting() {
+        let mut e = entry(DownloadState::Active);
+        e.backoff = Some(Duration::from_secs(2));
+        Inner::record_status(&mut e, &status(DownloadState::Active, 500));
+        assert_eq!(e.backoff, Some(Duration::from_secs(2)));
+        Inner::record_status(&mut e, &status(DownloadState::Active, 501));
+        assert_eq!(e.backoff, None);
     }
 }

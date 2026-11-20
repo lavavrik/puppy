@@ -32,7 +32,8 @@ impl Paths {
     /// `PUPPY_SOCKET` is a socket file path on Unix and a bare pipe name on
     /// Windows (a leading `\\.\pipe\` is stripped). Without it, on Unix, the socket is
     /// `$XDG_RUNTIME_DIR/puppy/puppy.sock`, or `<data_dir>/puppy.sock` when there is
-    /// no runtime dir or `PUPPY_HOME` is set (each home gets its own daemon). Its parent directory is
+    /// no runtime dir or `PUPPY_HOME` is set (each home gets its own daemon); on Windows
+    /// the pipe is `puppy-<user>`, or `puppy-<user>-<hash of PUPPY_HOME>`. Its parent directory is
     /// created if missing but its permissions are never changed. Unix socket
     /// paths longer than 100 bytes are rejected (`sun_path` limit); tests on
     /// macOS should therefore use short paths, e.g. under `/tmp`.
@@ -44,7 +45,7 @@ impl Paths {
         };
         let socket_override = std::env::var("PUPPY_SOCKET").ok().filter(|v| !v.is_empty());
         let overridden = socket_override.is_some();
-        let socket = socket_name(socket_override, &data_dir, home.is_some());
+        let socket = socket_name(socket_override, &data_dir, home.as_deref().map(Path::new));
         Self::build(data_dir, config_dir, socket, overridden)
     }
 
@@ -113,29 +114,50 @@ fn default_dirs() -> io::Result<(PathBuf, PathBuf)> {
     Ok((data, config))
 }
 
-/// `custom_home`: `PUPPY_HOME` is set, so the shared runtime-dir socket is not used
+/// `home`: `PUPPY_HOME`, if set; then the shared runtime-dir socket is not used
 /// (a daemon of another home could be listening there).
 #[cfg(unix)]
-fn socket_name(over: Option<String>, data_dir: &Path, custom_home: bool) -> SocketName {
+fn socket_name(over: Option<String>, data_dir: &Path, home: Option<&Path>) -> SocketName {
     SocketName::Path(match over {
         Some(p) => PathBuf::from(p),
-        None => match dirs::runtime_dir().filter(|_| !custom_home) {
+        None => match dirs::runtime_dir().filter(|_| home.is_none()) {
             Some(r) => r.join("puppy").join("puppy.sock"),
             None => data_dir.join("puppy.sock"),
         },
     })
 }
 
-/// Windows: the per-user pipe name (a second daemon of another home cannot create it
-/// while the first one listens: interprocess creates the first instance exclusively).
+/// Windows: the per-user pipe name, per home when `PUPPY_HOME` is set (see
+/// [`default_pipe_name`]).
 #[cfg(windows)]
-fn socket_name(over: Option<String>, _data_dir: &Path, _custom_home: bool) -> SocketName {
+fn socket_name(over: Option<String>, _data_dir: &Path, home: Option<&Path>) -> SocketName {
     SocketName::Pipe(match over {
         Some(n) => normalize_pipe_name(&n).to_string(),
-        None => format!(
-            "puppy-{}",
-            sanitize_username(std::env::var("USERNAME").ok().as_deref())
-        ),
+        None => default_pipe_name(std::env::var("USERNAME").ok().as_deref(), home),
+    })
+}
+
+/// `puppy-<user>`, or `puppy-<user>-<8 hex digits>` for a custom home (`PUPPY_HOME`):
+/// the digits are a stable hash of the home path, so daemons of different homes never
+/// share a pipe (pipe names are global; a second daemon could not create the pipe while
+/// the first one listens, as interprocess creates the first instance exclusively).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn default_pipe_name(user: Option<&str>, home: Option<&Path>) -> String {
+    let user = sanitize_username(user);
+    match home {
+        None => format!("puppy-{user}"),
+        Some(home) => {
+            let hash = fnv1a32(home.to_string_lossy().as_bytes());
+            format!("puppy-{user}-{hash:08x}")
+        }
+    }
+}
+
+/// 32-bit FNV-1a: stable across Rust versions and platforms, unlike `DefaultHasher`.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
     })
 }
 
@@ -307,13 +329,13 @@ mod tests {
         let rt = tempfile::tempdir().unwrap();
         let data = Path::new("/nonexistent/data");
         let name = with_env(&[("XDG_RUNTIME_DIR", Some(rt.path()))], || {
-            socket_name(None, data, false)
+            socket_name(None, data, None)
         });
         if cfg!(target_os = "linux") {
             assert_eq!(name, SocketName::Path(rt.path().join("puppy/puppy.sock")));
         }
         let name = with_env(&[("XDG_RUNTIME_DIR", Some(rt.path()))], || {
-            socket_name(None, data, true)
+            socket_name(None, data, Some(Path::new("/home/x")))
         });
         assert_eq!(name, SocketName::Path(data.join("puppy.sock")));
     }
@@ -368,5 +390,31 @@ mod tests {
         assert_eq!(sanitize_username(Some("a_b-c1")), "a_b-c1");
         assert_eq!(sanitize_username(Some("!!!")), "user");
         assert_eq!(sanitize_username(None), "user");
+    }
+
+    #[test]
+    fn default_pipe_name_per_home() {
+        assert_eq!(default_pipe_name(Some("jo"), None), "puppy-jo");
+        let a = default_pipe_name(Some("jo"), Some(Path::new(r"C:\puppy\a")));
+        let b = default_pipe_name(Some("jo"), Some(Path::new(r"C:\puppy\b")));
+        assert_ne!(a, b, "homes must not share a pipe");
+        let (prefix, hash) = a.rsplit_once('-').unwrap();
+        assert_eq!(prefix, "puppy-jo");
+        assert_eq!(hash.len(), 8);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // Stable: the same home always maps to the same pipe (across builds too).
+        assert_eq!(
+            a,
+            default_pipe_name(Some("jo"), Some(Path::new(r"C:\puppy\a")))
+        );
+        assert_eq!(fnv1a32(b""), 0x811c_9dc5);
+        assert_eq!(fnv1a32(b"a"), 0xe40c_292c);
+        assert_eq!(
+            default_pipe_name(None, Some(Path::new("h"))),
+            format!("puppy-user-{:08x}", fnv1a32(b"h"))
+        );
     }
 }

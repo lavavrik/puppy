@@ -235,17 +235,23 @@ impl Manager {
     /// probe), through the queue.
     ///
     /// A download the engine does not hold (e.g. its restore failed) but whose files
-    /// are known has its partial files (`.part`, `.part.puppy`) deleted first.
+    /// are known has its partial files (`.part`, `.part.puppy`) deleted first, unless
+    /// another download currently has the same path (then they are that one's).
     pub async fn restart(&self, id: DownloadId) -> Result<()> {
         let inner = &self.inner;
         let stale = {
             let mut st = inner.lock();
             let e = entry_mut(&mut st, id)?;
             check_restartable(e)?;
-            match (&e.rec.request.source, &e.rec.path) {
+            let stale = match (&e.rec.request.source, &e.rec.path) {
                 (Source::Http { .. }, Some(path)) if !e.held => Some(path.clone()),
                 _ => None,
-            }
+            };
+            stale.filter(|path| {
+                !st.entries
+                    .iter()
+                    .any(|(other, o)| *other != id && o.rec.path.as_ref() == Some(path))
+            })
         };
         if let Some(final_path) = stale {
             for p in [part_path(&final_path), sidecar_path(&final_path)] {

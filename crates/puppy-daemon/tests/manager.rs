@@ -1292,3 +1292,53 @@ async fn restart_of_unheld_download_deletes_its_partial_files() {
     assert_file(&final_path, 64 * KIB, 0);
     m.shutdown().await;
 }
+
+/// Restarting an unheld download leaves the partial files alone when another download
+/// currently owns the same path (they are that one's, not stale).
+#[tokio::test]
+async fn restart_keeps_partial_files_another_download_owns() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    std::fs::create_dir_all(env.dl_dir()).unwrap();
+    let final_path = env.dl_dir().join("a.bin");
+    let part = env.dl_dir().join("a.bin.part");
+    let sidecar = env.dl_dir().join("a.bin.part.puppy");
+    std::fs::write(&part, b"partial").unwrap();
+    std::fs::write(&sidecar, b"{}").unwrap();
+    let rec = |id| puppy_daemon::StoredDownload {
+        id,
+        request: env.req(&s, "a.bin"),
+        limit: None,
+        state: puppy_daemon::StoredState::Paused,
+        name: Some("a.bin".into()),
+        path: Some(final_path.clone()),
+        total_bytes: Some(64 * KIB),
+        created_unix: 1,
+        finished_unix: None,
+    };
+    let st = puppy_daemon::PersistedState {
+        next_id: 3,
+        order: vec![1, 2],
+        downloads: vec![rec(1), rec(2)],
+        ..Default::default()
+    };
+    Store::new(env.state_path()).save_now(&st).await.unwrap();
+    let (m, _gated) = env.gated_manager_full(|_| {}, true).await;
+    // One restore fails (`fail_add` fires once); the other waits at the gate, still
+    // owning the path.
+    let failed = |l: &[DownloadSnapshot]| {
+        l.iter()
+            .find(|d| matches!(d.state, WireState::Failed { .. }))
+            .map(|d| d.id)
+    };
+    wait_until(&m, "a failed restore", |l| failed(l).is_some()).await;
+    let id = failed(&m.snapshot().0).unwrap();
+    m.restart(id).await.unwrap();
+    assert!(
+        part.exists(),
+        "deleted the partial file of another download"
+    );
+    assert!(sidecar.exists(), "deleted the sidecar of another download");
+    assert_eq!(snap(&m, id).path, None);
+    m.shutdown().await;
+}
