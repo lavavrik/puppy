@@ -961,6 +961,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "puppy-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "interprocess",
+ "libc",
+ "puppy-core",
+ "puppy-daemon",
+ "puppy-proto",
+ "puppy-testserver",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "puppy-core"
 version = "0.1.0"
 dependencies = [

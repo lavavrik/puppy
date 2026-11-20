@@ -1,0 +1,82 @@
+//! Starting the daemon in the background, detached from the client's terminal.
+
+use std::io;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+/// Idle timeout (seconds) for a daemon started by a client, unless `PUPPY_IDLE_EXIT`
+/// says otherwise.
+const DEFAULT_IDLE_EXIT_SECS: u64 = 30;
+
+/// Starts `exe daemon --idle-exit <PUPPY_IDLE_EXIT or 30>` detached from this process
+/// (its own session on Unix; no console and its own process group on Windows), with
+/// stdin/stdout/stderr null. `PUPPY_HOME` and `PUPPY_SOCKET` are forwarded when set,
+/// then `extra_env` is applied. Returns once the process is started; whether it
+/// becomes the daemon (or finds one already running) is up to it.
+pub fn spawn_daemon_detached(exe: &Path, extra_env: &[(&str, &str)]) -> io::Result<()> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon")
+        .arg("--idle-exit")
+        .arg(idle_exit_secs().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for key in ["PUPPY_HOME", "PUPPY_SOCKET"] {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    detach(&mut cmd);
+    let child = cmd.spawn()?;
+    reap(child);
+    Ok(())
+}
+
+fn idle_exit_secs() -> u64 {
+    std::env::var("PUPPY_IDLE_EXIT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_IDLE_EXIT_SECS)
+}
+
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child before exec and only calls setsid
+    // and reads errno, both async-signal-safe; it allocates nothing and takes no locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// Unix: wait for the child in the background so it does not linger as a zombie of a
+/// long-running client after it exits.
+#[cfg(unix)]
+fn reap(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("puppy-daemon-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+/// Windows has no zombies: dropping the handle is enough.
+#[cfg(not(unix))]
+fn reap(_child: std::process::Child) {}
