@@ -85,11 +85,12 @@ impl Widget for ConnectionBars<'_> {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Numbered 1..N among the active segments.
         let rows: Vec<(usize, &SegmentView)> = self
             .segments
             .iter()
+            .filter(|g| g.active)
             .enumerate()
-            .filter(|(_, g)| g.active)
             .take(self.max_rows.min(usize::from(area.height)))
             .collect();
         let speeds: Vec<String> = rows.iter().map(|(_, g)| format::speed(g.bps)).collect();
@@ -267,10 +268,10 @@ mod tests {
         .render(area, &mut buf);
         let line =
             |y: u16| -> String { (0..30).map(|x| buf[(x, y)].symbol().to_string()).collect() };
-        assert!(line(0).starts_with("conn 2 "), "{:?}", line(0));
+        assert!(line(0).starts_with("conn 1 "), "{:?}", line(0));
         assert!(line(0).trim_end().ends_with("1.6 MiB/s"), "{:?}", line(0));
         assert!(line(0).contains('█'));
-        assert!(line(1).starts_with("conn 3 "));
+        assert!(line(1).starts_with("conn 2 "));
         assert!(line(1).trim_end().ends_with("1.0 KiB/s"));
         assert_eq!(line(2).trim(), "");
         // max_rows limits.

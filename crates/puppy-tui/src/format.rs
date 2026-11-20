@@ -79,6 +79,42 @@ pub fn truncate(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Like [`truncate`] but cuts out the middle (`https://exa…/file.iso`), keeping the
+/// tail with the file name: about a third of the room for the head, the rest for the
+/// tail.
+pub fn truncate_middle(s: &str, max_width: usize) -> String {
+    if s.width() <= max_width {
+        return s.to_string();
+    }
+    if max_width < 2 {
+        return truncate(s, max_width);
+    }
+    let budget = max_width - 1;
+    let head_w = budget / 3;
+    let gs: Vec<&str> = s.graphemes(true).collect();
+    let mut head = String::new();
+    let mut used = 0;
+    for g in &gs {
+        if used + g.width() > head_w {
+            break;
+        }
+        used += g.width();
+        head.push_str(g);
+    }
+    let mut tail: Vec<&str> = Vec::new();
+    let mut tail_w = 0;
+    for g in gs.iter().rev() {
+        if used + tail_w + g.width() > budget {
+            break;
+        }
+        tail_w += g.width();
+        tail.push(g);
+    }
+    head.push(ELLIPSIS);
+    head.extend(tail.into_iter().rev());
+    head
+}
+
 /// Makes untrusted text (names, sources, paths from the daemon) safe to draw: control
 /// characters (`\t`, `\n`, `\r`, ESC, DEL, C1) and bidi overrides/isolates become a
 /// space, so they can neither break the layout nor reach the terminal. Borrows when the
@@ -235,6 +271,22 @@ mod tests {
         assert_eq!(truncate("abc", 1), "…");
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_tail() {
+        let url = "https://example.com/some/long/path/ubuntu-24.04.iso";
+        let t = truncate_middle(url, 30);
+        assert_eq!(t.width(), 30);
+        assert!(t.starts_with("https://e"), "{t}");
+        assert!(t.ends_with("ubuntu-24.04.iso"), "{t}");
+        assert!(t.contains('…'));
+        assert_eq!(truncate_middle("short", 10), "short");
+        assert_eq!(truncate_middle("abcdef", 1), "…");
+        assert_eq!(truncate_middle("abcdef", 0), "");
+        for w in 0..20 {
+            assert!(truncate_middle("日本語のファイル名.iso", w).width() <= w);
+        }
     }
 
     #[test]

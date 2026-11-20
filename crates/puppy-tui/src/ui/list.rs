@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Widget;
 
-use super::{centered, panel, spans, state_icon, text, width};
+use super::{centered, groups, panel, spans, state_icon, text, width};
 use crate::app::{App, Conn, HitTarget};
 use crate::format;
 use crate::theme::{Theme, Token};
@@ -20,6 +20,8 @@ const BAR_PERCENT: u16 = 30;
 const BAR_MIN: u16 = 10;
 /// Columns the name keeps before the bar shrinks.
 const NAME_MIN: u16 = 12;
+/// The right-aligned percent slot after the bar (`100%`).
+const PCT_W: u16 = 4;
 
 pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
     let t = app.theme;
@@ -96,14 +98,13 @@ pub(super) fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
         now_unix: app.now_unix,
         ticks: app.ticks,
     };
-    let mut hits = Vec::with_capacity(cap);
-    for (k, d) in app.visible_iter().skip(offset).take(cap).enumerate() {
-        let rect = Rect::new(
-            inner.x,
-            inner.y + k as u16 * ROW_LINES,
-            inner.width,
-            ROW_LINES,
-        );
+    // An odd height leaves one row: the next item's first line peeks in.
+    let partial = inner.height % ROW_LINES == 1 && offset + cap < count;
+    let shown = cap + usize::from(partial);
+    let mut hits = Vec::with_capacity(shown);
+    for (k, d) in app.visible_iter().skip(offset).take(shown).enumerate() {
+        let lines = if k == cap { 1 } else { ROW_LINES };
+        let rect = Rect::new(inner.x, inner.y + k as u16 * ROW_LINES, inner.width, lines);
         ctx.row(buf, rect, d, Some(offset + k) == sel_index);
         hits.push((rect, HitTarget::ListRow(d.id)));
     }
@@ -221,30 +222,48 @@ impl RowCtx<'_> {
         let t = self.theme;
         if selected {
             buf.set_style(rect, t.style(Token::Selected));
+            // Accent edge marking the selection on every line.
+            for y in rect.y..rect.bottom() {
+                text(buf, rect.x, y, 1, "▌", self.style(Token::BorderFocus, true));
+            }
         }
         let st = |tok| self.style(tok, selected);
-        let (y1, y2) = (rect.y, rect.y + 1);
+        let y1 = rect.y;
         let right = rect.right();
 
-        // Line 1: icon, id, name, [T] … progress bar.
+        // Line 1: icon, id, name, [T] … progress bar, percent.
         let (icon, icon_tok) = state_icon(&d.state);
-        let mut x = rect.x + 1;
+        let mut x = rect.x + 2;
         text(buf, x, y1, 1, icon, st(icon_tok));
         x += 2;
         let id = format!("{:>w$}", d.id, w = usize::from(self.id_w));
         x += text(buf, x, y1, right.saturating_sub(x), &id, st(Token::Dim)) + 1;
         let name_x = x;
 
+        // Right end: [bar] [pct] and one column of padding.
+        let slot_x = right.saturating_sub(PCT_W + 1);
         let w = rect.width;
         let mut bar_w = (w * BAR_PERCENT / 100).max(BAR_MIN);
-        let fixed = name_x - rect.x + NAME_MIN + 3;
+        let fixed = (name_x - rect.x) + NAME_MIN + 2 + 1 + PCT_W + 1;
         if bar_w + fixed > w {
             bar_w = w.saturating_sub(fixed);
         }
-        let name_end = if bar_w >= 6 {
-            let bar_x = right - 1 - bar_w;
-            self.bar(buf, Rect::new(bar_x, y1, bar_w, 1), d, selected);
-            bar_x - 2
+        let (ratio, pct) = progress(d);
+        let pct_tok = if is_moving(&d.state) {
+            Token::Text
+        } else {
+            Token::Dim
+        };
+        let name_end = if slot_x > name_x + NAME_MIN {
+            let pw = width(&pct);
+            text(buf, slot_x + PCT_W - pw, y1, pw, &pct, st(pct_tok));
+            if bar_w >= 6 {
+                let bar_x = slot_x - 1 - bar_w;
+                self.bar(buf, Rect::new(bar_x, y1, bar_w, 1), d, ratio, selected);
+                bar_x - 2
+            } else {
+                slot_x - 1
+            }
         } else {
             right - 1
         };
@@ -268,58 +287,88 @@ impl RowCtx<'_> {
             &[(badge, st(Token::Info))],
         );
 
-        // Line 2: what is going on, dim, under the name.
-        let parts = self.second_line(d);
-        let parts: Vec<(&str, Style)> = parts
+        // Line 2: what is going on, dim, under the name; low-priority parts drop first.
+        if rect.height < ROW_LINES {
+            return;
+        }
+        let items = self.second_line(d);
+        let items: Vec<Vec<(&str, Style)>> = items
             .iter()
-            .map(|(s, tok)| (s.as_str(), st(*tok)))
+            .map(|(s, tok)| vec![(s.as_str(), st(*tok))])
             .collect();
-        spans(buf, name_x, y2, right.saturating_sub(name_x + 1), &parts);
+        groups(
+            buf,
+            name_x,
+            y1 + 1,
+            right.saturating_sub(name_x + 1),
+            &items,
+            (" · ", st(Token::Dim)),
+        );
     }
 
-    fn bar(&self, buf: &mut Buffer, area: Rect, d: &DownloadSnapshot, selected: bool) {
-        let ratio = match d.state {
-            WireState::Completed => Some(1.0),
-            _ => format::percent(d.done_bytes, d.total_bytes),
-        };
-        let label = match ratio {
-            // Floor: never "100%" before the end.
-            Some(r) => format!("{}%", (r * 100.0).floor() as u32),
-            None => format::bytes(d.done_bytes),
-        };
-        let moving = matches!(d.state, WireState::Active | WireState::Starting);
-        let theme = if selected {
-            self.theme.for_selection()
+    /// The bar, tinted by state; on the selected row its track is the selection.
+    fn bar(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        d: &DownloadSnapshot,
+        ratio: Option<f64>,
+        selected: bool,
+    ) {
+        let mut theme = *self.theme;
+        let p = self.theme.p;
+        // A muted fill must still stand out from the track (ANSI: both DarkGray).
+        let muted = if p.dim == p.bar_todo {
+            Theme::contrast(p.dim)
         } else {
-            *self.theme
+            p.dim
         };
+        theme.p.bar_done = match d.state {
+            WireState::Active | WireState::Starting => p.bar_done,
+            WireState::Failed { .. } => p.err,
+            WireState::NeedsAttention { .. } => p.warn,
+            WireState::Paused | WireState::Queued | WireState::Completed | WireState::Unknown => {
+                muted
+            }
+        };
+        if selected {
+            theme.p.bar_todo = p.selection_bg;
+        }
         ProgressBar {
-            ratio: if moving { ratio } else { ratio.or(Some(0.0)) },
-            label: Some(&label),
+            ratio: if is_moving(&d.state) {
+                ratio
+            } else {
+                ratio.or(Some(0.0))
+            },
+            label: None,
             theme: &theme,
             tick: self.ticks,
         }
         .render(area, buf);
     }
 
+    /// Parts of the second line, most important first.
     fn second_line(&self, d: &DownloadSnapshot) -> Vec<(String, Token)> {
-        const SEP: (&str, Token) = (" · ", Token::Dim);
         let size = size_text(d);
         let mut parts: Vec<(String, Token)> = Vec::new();
-        let mut push = |s: String, tok: Token| {
-            if !parts.is_empty() {
-                parts.push((SEP.0.to_string(), SEP.1));
-            }
-            parts.push((s, tok));
-        };
+        let mut push = |s: String, tok: Token| parts.push((s, tok));
+        let torrent = d.kind == EngineKindTag::Torrent;
         match &d.state {
             WireState::Active => {
-                push(format::speed(d.down_bps), Token::Dim);
+                if torrent {
+                    push(
+                        format!(
+                            "↓ {}  ↑ {}",
+                            format::speed(d.down_bps),
+                            format::speed(d.up_bps)
+                        ),
+                        Token::Dim,
+                    );
+                } else {
+                    push(format::speed(d.down_bps), Token::Dim);
+                }
                 push(format::eta(d.eta_secs), Token::Dim);
                 push(size, Token::Dim);
-                if d.kind == EngineKindTag::Torrent {
-                    push(format!("↑ {}", format::speed(d.up_bps)), Token::Dim);
-                }
             }
             WireState::Starting => {
                 push("starting…".into(), Token::Dim);
@@ -361,8 +410,8 @@ impl RowCtx<'_> {
             }
             WireState::Unknown => push("unknown state (newer daemon?)".into(), Token::Dim),
         }
-        if d.kind == EngineKindTag::Torrent
-            && matches!(d.state, WireState::Active | WireState::Starting)
+        if torrent
+            && is_moving(&d.state)
             && let Some(p) = d.peers
         {
             push(format!("{p} peers"), Token::Dim);
@@ -374,6 +423,24 @@ impl RowCtx<'_> {
         }
         parts
     }
+}
+
+fn is_moving(state: &WireState) -> bool {
+    matches!(state, WireState::Active | WireState::Starting)
+}
+
+/// Fraction done (complete ⇒ 1) and the percent slot text (floored: never `100%`
+/// before the end; `—` when the total is unknown).
+fn progress(d: &DownloadSnapshot) -> (Option<f64>, String) {
+    let ratio = match d.state {
+        WireState::Completed => Some(1.0),
+        _ => format::percent(d.done_bytes, d.total_bytes),
+    };
+    let pct = match ratio {
+        Some(r) => format!("{}%", (r * 100.0).floor() as u32),
+        None => format::NONE.to_string(),
+    };
+    (ratio, pct)
 }
 
 /// `460.8 MiB / 1.0 GiB`; just the total once complete; just the bytes when the total

@@ -269,6 +269,13 @@ impl Theme {
     }
 }
 
+impl Theme {
+    /// A gray readable on the ANSI gray `bg` (`Reset` for anything else).
+    pub fn contrast(bg: Color) -> Color {
+        contrast(bg)
+    }
+}
+
 /// A gray readable on the ANSI gray `bg`.
 fn contrast(bg: Color) -> Color {
     match bg {

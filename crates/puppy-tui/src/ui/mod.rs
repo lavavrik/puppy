@@ -179,7 +179,14 @@ fn title_bar(app: &App, buf: &mut Buffer, area: Rect) -> Option<Position> {
         .take(app.filter.cursor)
         .map(UnicodeWidthStr::width)
         .sum();
-    let cx = x + (before as u16).min(shown).min(room);
+    let before = u16::try_from(before).unwrap_or(u16::MAX);
+    // A cut value ends in `…`: the cursor goes past it, never onto it.
+    let cut = width(&value) > shown;
+    let cx = if cut && before >= shown.saturating_sub(1) {
+        x + shown
+    } else {
+        x + before.min(shown)
+    };
     (cx < area.right()).then_some(Position::new(cx, area.y))
 }
 
@@ -221,16 +228,49 @@ pub(crate) fn spans(buf: &mut Buffer, x: u16, y: u16, max_w: u16, parts: &[(&str
         }
         let w = text(buf, x + used, y, room, s, *style);
         used += w;
-        if (s.width() as u16) > w {
+        if width(s) > w {
             break;
         }
     }
     used
 }
 
-/// Display width of `s`, saturating at `u16::MAX`.
+/// Writes groups of spans separated by `sep`, by priority: the first group always
+/// shows (truncated if need be); later groups that do not fit whole are dropped, with
+/// everything after them. Returns the columns used.
+pub(crate) fn groups(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    max_w: u16,
+    items: &[Vec<(&str, Style)>],
+    sep: (&str, Style),
+) -> u16 {
+    let mut used = 0u16;
+    for (i, item) in items.iter().enumerate() {
+        let w: u16 = item
+            .iter()
+            .map(|(s, _)| width(s))
+            .fold(0, u16::saturating_add);
+        if i == 0 {
+            used = spans(buf, x, y, max_w, item);
+            if used < w {
+                break;
+            }
+            continue;
+        }
+        if used.saturating_add(width(sep.0)).saturating_add(w) > max_w {
+            break;
+        }
+        used += spans(buf, x + used, y, max_w - used, &[sep]);
+        used += spans(buf, x + used, y, max_w - used, item);
+    }
+    used
+}
+
+/// Display width of `s` as drawn (sanitized), saturating at `u16::MAX`.
 pub(crate) fn width(s: &str) -> u16 {
-    u16::try_from(s.width()).unwrap_or(u16::MAX)
+    u16::try_from(format::display_safe(s).width()).unwrap_or(u16::MAX)
 }
 
 /// Writes `s` centered horizontally in `area` on row `y`.

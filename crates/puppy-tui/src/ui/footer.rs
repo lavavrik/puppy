@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Sparkline, Widget};
 
-use super::{spans, width};
+use super::{groups, spans, width};
 use crate::app::{Action, App, HitTarget, Mode};
 use crate::format;
 use crate::theme::Token;
@@ -63,31 +63,37 @@ fn stats(app: &App, buf: &mut Buffer, r: Rect) {
         .as_ref()
         .map(|s| format!("max {}", s.max_active));
 
-    let sep = (" · ", dim);
-    let mut parts: Vec<(&str, Style)> = vec![
-        (" ", Style::new()),
-        ("↓ ", accent),
-        (&down, text),
-        ("  ", Style::new()),
-        ("↑ ", accent),
-        (&up, text),
-        sep,
-        (&active, text),
-        sep,
-        (&queued, text),
+    // Whole parts drop from the right when the line is short.
+    let mut items: Vec<Vec<(&str, Style)>> = vec![
+        vec![
+            ("↓ ", accent),
+            (&down, text),
+            ("  ", Style::new()),
+            ("↑ ", accent),
+            (&up, text),
+        ],
+        vec![(&active, text)],
+        vec![(&queued, text)],
     ];
     if tot.paused > 0 {
-        parts.extend([sep, (&paused, text)]);
+        items.push(vec![(&paused, text)]);
     }
-    parts.extend([sep, (&done, text)]);
+    items.push(vec![(&done, text)]);
     if tot.failed > 0 {
-        parts.extend([sep, (&failed, t.style(Token::Err))]);
+        items.push(vec![(&failed, t.style(Token::Err))]);
     }
-    parts.extend([sep, (&limit, dim)]);
+    items.push(vec![(&limit, dim)]);
     if let Some(m) = &max {
-        parts.extend([sep, (m, dim)]);
+        items.push(vec![(m, dim)]);
     }
-    let used = spans(buf, r.x, r.y, r.width, &parts);
+    let used = 1 + groups(
+        buf,
+        r.x + 1,
+        r.y,
+        r.width.saturating_sub(2),
+        &items,
+        (" · ", dim),
+    );
 
     // Global throughput sparkline on the right when there is room for it.
     let global = app.history.global();
