@@ -421,6 +421,9 @@ async fn undecodable_reply_fails_call_promptly() {
     server.await.unwrap();
 }
 
+/// Unix only: on Windows the named pipe (mio) copies every write into its own buffer
+/// and completes it at once, so a write cannot be abandoned half-way there.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn torn_write_closes_connection() {
     let env = Env::new();
