@@ -614,6 +614,31 @@ async fn shutdown_request_cancels_token() {
     c.expect_closed().await;
 }
 
+/// The daemon stops the server as soon as a shutdown is requested; the `Done` reply
+/// must still reach the client (also when the writer is mid-write at that moment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_reply_survives_an_immediate_stop() {
+    let mut runs = tokio::task::JoinSet::new();
+    for _ in 0..40 {
+        runs.spawn(async {
+            let h = Harness::new().await;
+            let mut c = h.greeted().await;
+            let shutdown = h.shutdown.clone();
+            let stop = h.stop.clone();
+            let stopper = tokio::spawn(async move {
+                shutdown.cancelled().await;
+                stop.cancel();
+            });
+            assert_eq!(c.request(Request::Shutdown).await, done());
+            stopper.await.unwrap();
+            h.stop().await;
+        });
+    }
+    while let Some(r) = runs.join_next().await {
+        r.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bind_fails_if_name_in_use() {
     let h = Harness::new().await;

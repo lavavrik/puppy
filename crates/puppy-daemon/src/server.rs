@@ -674,13 +674,21 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
             }
         };
-        tokio::select! {
-            // Cancelled mid-write: the frame may be torn, so write nothing more.
-            _ = cancel.cancelled() => return,
-            r = write_one(&mut wr, &msg) => if r.is_err() {
-                cancel.cancel();
-                return;
-            }
+        let write = write_one(&mut wr, &msg);
+        tokio::pin!(write);
+        let r = tokio::select! {
+            r = &mut write => r,
+            // Cancelled mid-write (e.g. the server is stopping right after queueing a
+            // `Shutdown` reply): finish this message like the queued ones below.
+            _ = cancel.cancelled() => match timeout(DRAIN_TIMEOUT, &mut write).await {
+                Ok(r) => r,
+                // Still stuck: the frame may be torn, so write nothing more.
+                Err(_) => return,
+            },
+        };
+        if r.is_err() {
+            cancel.cancel();
+            return;
         }
     }
     let drain = async {
