@@ -858,7 +858,7 @@ async fn set_limit_is_stored_even_if_the_engine_rejects_it() {
     let (m, gated, id) = gated_active(&env, &s).await;
     gated.fail_limit.store(true, Ordering::SeqCst);
     let err = m.set_limit(id, Some(100 * KIB)).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::Engine);
+    assert_eq!(err.code(), ErrorCode::Unsupported);
     assert_eq!(snap(&m, id).limit, Some(100 * KIB));
     // Persisted by `set_limit` itself (nothing else changes while it transfers, so
     // nothing else would persist it within the store's debounce).
