@@ -1145,6 +1145,7 @@ dependencies = [
  "dirs",
  "fs4",
  "interprocess",
+ "libc",
  "puppy-core",
  "puppy-proto",
  "puppy-testserver",

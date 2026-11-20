@@ -1,6 +1,12 @@
 //! The daemon's local-socket server: a Unix domain socket (Linux/macOS) or a Windows
 //! named pipe, speaking the newline-delimited JSON protocol of `puppy-proto`.
 //!
+//! Access control: on Unix the socket file is created mode 0600 (before `bind` on
+//! Linux; elsewhere it is chmodded right after `bind`, which is why the default socket
+//! lives in a 0700 directory) and every accepted connection's peer must run as this
+//! process's effective user, otherwise it is closed at once. On Windows the pipe's DACL
+//! admits the current user only.
+//!
 //! Per connection:
 //! - The first message must be `hello` with protocol [`PROTOCOL_VERSION`]; anything else
 //!   gets an error reply and the connection is closed.
@@ -99,14 +105,16 @@ impl Drop for InFlightGuard {
 
 impl Server {
     /// Binds the local socket. Fails if the name is in use (stale sockets are the
-    /// caller's business). On Unix the socket file is made mode 0600 and removed again
-    /// when the server is dropped (i.e. when [`run`](Self::run) returns).
+    /// caller's business). On Unix the socket file is mode 0600 (see the module docs)
+    /// and removed again when the server is dropped (i.e. when [`run`](Self::run)
+    /// returns).
     pub async fn bind(name: &SocketName, manager: Arc<Manager>) -> io::Result<Self> {
         let sock_name = match name {
             SocketName::Path(p) => p.as_path().to_fs_name::<GenericFilePath>()?,
             SocketName::Pipe(n) => n.as_str().to_ns_name::<GenericNamespaced>()?,
         };
-        let listener = restrict_pipe(ListenerOptions::new().name(sock_name))?.create_tokio()?;
+        let opts = restrict_pipe(socket_mode(ListenerOptions::new().name(sock_name)))?;
+        let listener = opts.create_tokio()?;
         // On error the listener is dropped, which removes the socket file again.
         restrict_socket(name)?;
         Ok(Self {
@@ -185,6 +193,42 @@ fn log_join(r: Result<(), tokio::task::JoinError>) {
     {
         error!("connection task panicked: {e}");
     }
+}
+
+/// Linux: the socket file is created 0600 (an `fchmod` before `bind`), so it is never
+/// reachable by others, even briefly. Other systems do not support this (interprocess
+/// returns `Unsupported`) and rely on [`restrict_socket`] after `bind`.
+#[cfg(target_os = "linux")]
+fn socket_mode(opts: ListenerOptions<'_>) -> ListenerOptions<'_> {
+    use interprocess::os::unix::local_socket::ListenerOptionsExt;
+    opts.mode(0o600)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_mode(opts: ListenerOptions<'_>) -> ListenerOptions<'_> {
+    opts
+}
+
+/// Whether a peer with effective user id `peer` (if known) may talk to a daemon
+/// running as `me`. Unknown credentials are never trusted.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn same_user(peer: Option<u32>, me: u32) -> bool {
+    peer == Some(me)
+}
+
+/// Whether the process at the other end runs as this process's effective user.
+#[cfg(unix)]
+fn peer_allowed(stream: &Stream) -> io::Result<bool> {
+    let peer = stream.peer_creds()?.euid();
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    Ok(same_user(peer, me))
+}
+
+/// Windows: the pipe's DACL already admits the current user only.
+#[cfg(not(unix))]
+fn peer_allowed(_stream: &Stream) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -358,6 +402,17 @@ async fn serve(
     in_flight: Arc<InFlightStats>,
     cancel: CancellationToken,
 ) {
+    match peer_allowed(&stream) {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!("refusing a connection from a process running as another user");
+            return;
+        }
+        Err(e) => {
+            warn!("refusing a connection whose user cannot be checked: {e}");
+            return;
+        }
+    }
     let (rd, mut wr) = tokio::io::split(stream);
     let mut reader = MsgReader::new(BufReader::new(rd));
 
@@ -785,6 +840,15 @@ mod tests {
                 totals: Default::default(),
             },
         }
+    }
+
+    #[test]
+    fn only_the_same_user_is_served() {
+        assert!(same_user(Some(1000), 1000));
+        assert!(!same_user(Some(0), 1000));
+        assert!(!same_user(Some(1001), 1000));
+        // Unknown credentials are never trusted.
+        assert!(!same_user(None, 1000));
     }
 
     #[tokio::test]
