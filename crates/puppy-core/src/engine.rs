@@ -2,7 +2,7 @@
 
 use crate::types::{AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, Source};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineKind {
@@ -59,6 +59,10 @@ pub enum EngineError {
     Http { status: u16 },
     #[error("invalid: {0}")]
     Invalid(String),
+    /// The engine cannot work right now (e.g. its session failed to start); the message
+    /// is shown as is. Transient: a later attempt may find it working.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl EngineError {
@@ -66,7 +70,7 @@ impl EngineError {
     /// status saying "try again later": 5xx, 429, 408), so retrying later can succeed.
     pub fn is_transient(&self) -> bool {
         match self {
-            EngineError::Network(_) => true,
+            EngineError::Network(_) | EngineError::Unavailable(_) => true,
             EngineError::Http { status } => is_transient_status(*status),
             _ => false,
         }
@@ -119,6 +123,35 @@ pub trait Engine: Send + Sync + 'static {
     /// Engines that do not upload ignore it.
     fn set_global_upload_budget(&self, _bps: Option<u64>) {}
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent>;
+
+    /// Drops a completed download from the engine (it no longer holds it afterwards),
+    /// keeping its files and whatever the engine needs for [`Engine::delete_completed`].
+    /// Default: `remove(id, false)`.
+    async fn drop_completed(&self, id: DownloadId) -> Result<(), EngineError> {
+        self.remove(id, false).await
+    }
+
+    /// Deletes the files of completed download `id` (no longer held by the engine), which
+    /// were recorded at `path`. Default: removes `path` if it is a regular file (a symlink
+    /// or directory there is left alone); nothing there is fine.
+    async fn delete_completed(&self, _id: DownloadId, path: &Path) -> Result<(), EngineError> {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(m) if m.is_file() => match tokio::fs::remove_file(path).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "not deleting: not a regular file");
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Forgets anything the engine still keeps for download `id` once it has been
+    /// removed for good (not held by the engine anymore). Default: nothing.
+    async fn forget(&self, _id: DownloadId) {}
 }
 
 #[cfg(test)]
@@ -137,5 +170,68 @@ mod tests {
         assert!(!EngineError::Io(std::io::Error::other("disk full")).is_transient());
         assert!(!EngineError::Invalid("x".into()).is_transient());
         assert!(!EngineError::NotFound(1).is_transient());
+        let e = EngineError::Unavailable("torrent engine unavailable (see daemon log)".into());
+        assert!(e.is_transient());
+        assert_eq!(e.to_string(), "torrent engine unavailable (see daemon log)");
+    }
+
+    struct Nop;
+
+    #[async_trait::async_trait]
+    impl Engine for Nop {
+        fn kind(&self) -> EngineKind {
+            EngineKind::Http
+        }
+        fn accepts(&self, _: &Source) -> bool {
+            true
+        }
+        async fn add(
+            &self,
+            _: DownloadId,
+            _: AddRequest,
+            _: StartMode,
+            _: AddOptions,
+        ) -> Result<Added, EngineError> {
+            unimplemented!()
+        }
+        async fn pause(&self, _: DownloadId) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _: DownloadId) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn remove(&self, _: DownloadId, _: bool) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn status(&self, _: DownloadId) -> Option<DownloadStatus> {
+            None
+        }
+        fn detail(&self, _: DownloadId) -> Option<EngineDetail> {
+            None
+        }
+        fn set_download_limit(&self, _: DownloadId, _: Option<u64>) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn set_global_download_budget(&self, _: Option<u64>) {}
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+
+    #[tokio::test]
+    async fn default_delete_completed_removes_only_a_regular_file() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        Nop.delete_completed(1, &file).await.unwrap();
+        assert!(!file.exists());
+        Nop.delete_completed(1, &file)
+            .await
+            .expect("already gone is fine");
+        let dir = d.path().join("folder");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep"), b"x").unwrap();
+        Nop.delete_completed(1, &dir).await.unwrap();
+        assert!(dir.join("keep").exists(), "a directory is left alone");
     }
 }

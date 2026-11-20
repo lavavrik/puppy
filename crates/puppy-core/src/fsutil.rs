@@ -27,15 +27,25 @@ pub fn sanitize_filename(raw: &str) -> String {
     truncate_name(&name, MAX_NAME_BYTES)
 }
 
-/// Whether `name` is a Windows device name (CON, NUL, COM1..9, ...), reserved with or
-/// without an extension.
+/// Whether `name` is a Windows device name (CON, NUL, CONIN$, COM1..9, COM¹²³, ...),
+/// reserved with or without an extension.
 pub fn is_reserved_windows_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end();
     let up = stem.to_ascii_uppercase();
-    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((up.starts_with("COM") || up.starts_with("LPT"))
-            && up.len() == 4
-            && matches!(up.as_bytes()[3], b'1'..=b'9'))
+    if matches!(
+        up.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let Some(rest) = up.strip_prefix("COM").or_else(|| up.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 /// Truncates to `max` bytes on a char boundary, preserving a short extension.
@@ -77,6 +87,21 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
         .map(|n| format!("{stem} ({n}){ext}"))
         .find(|c| !taken(c))
         .map(|c| dir.join(c))
+        .expect("counter exhausted")
+}
+
+/// Returns a path in `dir` for a new folder `name` that is free: `name`, else
+/// `name (1)`, `name (2)`... (no extension handling: the whole name is the stem). A
+/// candidate is taken if anything exists there or `also_taken` says so.
+pub fn unique_dir_path(dir: &Path, name: &str, also_taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let taken = |p: &Path| fs::symlink_metadata(p).is_ok() || also_taken(p);
+    let plain = dir.join(name);
+    if !taken(&plain) {
+        return plain;
+    }
+    (1u32..)
+        .map(|n| dir.join(format!("{name} ({n})")))
+        .find(|p| !taken(p))
         .expect("counter exhausted")
 }
 
@@ -400,6 +425,61 @@ mod tests {
         assert_eq!(sanitize_filename("aux."), "_aux");
         assert_eq!(sanitize_filename("console.txt"), "console.txt");
         assert_eq!(sanitize_filename("com10"), "com10");
+        assert_eq!(sanitize_filename("CONIN$"), "_CONIN$");
+        assert_eq!(sanitize_filename("conout$.txt"), "_conout$.txt");
+        assert_eq!(sanitize_filename("COM\u{b9}"), "_COM\u{b9}");
+        assert_eq!(sanitize_filename("lpt\u{b3}.log"), "_lpt\u{b3}.log");
+    }
+
+    #[test]
+    fn reserved_windows_names() {
+        for bad in [
+            "CON",
+            "nul.txt",
+            "CONIN$",
+            "conout$",
+            "COM1",
+            "lpt9.x",
+            "COM\u{b9}",
+            "COM\u{b2}",
+            "LPT\u{b3}.txt",
+            "aux ",
+        ] {
+            assert!(is_reserved_windows_name(bad), "{bad:?}");
+        }
+        for ok in [
+            "console",
+            "COM10",
+            "COM0",
+            "LPT",
+            "COM\u{b4}",
+            "CONIN",
+            "conin$x",
+        ] {
+            assert!(!is_reserved_windows_name(ok), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn unique_dir_path_counts_without_extension_split() {
+        let d = tempfile::tempdir().unwrap();
+        let none = |_: &Path| false;
+        assert_eq!(
+            unique_dir_path(d.path(), "My.Show", none),
+            d.path().join("My.Show")
+        );
+        fs::create_dir(d.path().join("My.Show")).unwrap();
+        assert_eq!(
+            unique_dir_path(d.path(), "My.Show", none),
+            d.path().join("My.Show (1)")
+        );
+        // A file takes the name too, and so does whatever `also_taken` says.
+        fs::write(d.path().join("My.Show (1)"), b"x").unwrap();
+        let claimed = d.path().join("My.Show (2)");
+        assert_eq!(
+            unique_dir_path(d.path(), "My.Show", |p| p == claimed),
+            d.path().join("My.Show (3)")
+        );
     }
 
     #[test]
