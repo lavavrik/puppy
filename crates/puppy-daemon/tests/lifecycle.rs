@@ -262,7 +262,6 @@ async fn second_daemon_exits_when_locked() {
     shutdown(&env, d).await;
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pid_file_written_while_running() {
     let env = Env::new();
@@ -279,6 +278,7 @@ async fn pid_file_written_while_running() {
     assert!(!pid_file.exists(), "pid file removed on exit");
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn regular_file_at_socket_path_is_not_removed() {
     let env = Env::new();
