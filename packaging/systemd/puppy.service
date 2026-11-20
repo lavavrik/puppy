@@ -1,0 +1,18 @@
+# systemd user unit for the puppy daemon.
+# Install: see docs/service.md
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/puppy.service ~/.config/systemd/user/
+#   systemctl --user enable --now puppy
+
+[Unit]
+Description=puppy download manager daemon
+Documentation=https://github.com/lavavrik/puppy/blob/main/docs/service.md
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/puppy daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

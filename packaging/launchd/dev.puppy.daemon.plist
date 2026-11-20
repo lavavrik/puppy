@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent for the puppy daemon. Install: see docs/service.md
+    cp packaging/launchd/dev.puppy.daemon.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.puppy.daemon.plist
+  Adjust the program path if puppy is not installed at /usr/local/bin/puppy.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.puppy.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/puppy</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

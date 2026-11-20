@@ -264,6 +264,22 @@ async fn second_daemon_exits_when_locked() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pid_file_written_while_running() {
+    let env = Env::new();
+    let pid_file = env.paths().pid_file;
+    assert_eq!(pid_file, env.paths().data_dir.join("puppyd.pid"));
+    let d = env.start(None).await;
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert_eq!(pid.trim(), std::process::id().to_string());
+    // A second daemon (lock taken) leaves it alone.
+    let second = run_daemon(env.opts(None)).await.unwrap();
+    assert_eq!(second, RunOutcome::AlreadyRunning);
+    assert!(pid_file.exists());
+    shutdown(&env, d).await;
+    assert!(!pid_file.exists(), "pid file removed on exit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn regular_file_at_socket_path_is_not_removed() {
     let env = Env::new();
     std::fs::write(env.socket_path(), b"user data").unwrap();

@@ -17,6 +17,8 @@ pub struct Paths {
     pub config_dir: PathBuf,
     pub socket: SocketName,
     pub lock_file: PathBuf,
+    /// Holds the running daemon's process id (for tests and tooling).
+    pub pid_file: PathBuf,
     pub state_file: PathBuf,
     pub log_dir: PathBuf,
 }
@@ -75,6 +77,7 @@ impl Paths {
 
         Ok(Self {
             lock_file: data_dir.join("puppy.lock"),
+            pid_file: data_dir.join("puppyd.pid"),
             state_file: data_dir.join("state.json"),
             log_dir,
             data_dir,

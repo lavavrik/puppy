@@ -13,7 +13,7 @@ use puppy_core::engine::Engine;
 use puppy_core::http::engine::HttpEngine;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,7 +49,8 @@ pub enum RunOutcome {
 
 /// Resolves the paths (unless given), sets up logging to `log_dir/puppyd.log` (plus
 /// stderr when it is a terminal), takes an exclusive non-blocking lock on `lock_file`
-/// (held by another daemon ⇒ `AlreadyRunning`), removes a dead Unix socket file (failing
+/// (held by another daemon ⇒ `AlreadyRunning`), writes its pid to `pid_file` (removed
+/// on exit), removes a dead Unix socket file (failing
 /// instead if something listens on it or it is not a socket), loads config and state, builds the engine, manager and server, and runs until a `Shutdown`
 /// request, Ctrl-C, SIGTERM (Unix) or — with `idle_exit` — that long without work or
 /// clients. Then it stops the server (removing the socket file), shuts the manager
@@ -68,6 +69,8 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         info!(lock = %paths.lock_file.display(), "another daemon is running");
         return Ok(RunOutcome::AlreadyRunning);
     };
+    // Dropped (removing the file) before the lock is released.
+    let _pid_file = PidFile::write(&paths.pid_file);
     // Only the lock holder may touch the socket.
     remove_stale_socket(&paths.socket).await?;
 
@@ -130,6 +133,33 @@ fn socket_display(s: &SocketName) -> String {
     match s {
         SocketName::Path(p) => p.display().to_string(),
         SocketName::Pipe(n) => format!(r"\\.\pipe\{n}"),
+    }
+}
+
+/// The daemon's pid in `<data_dir>/puppyd.pid` while it holds the lock; removed on
+/// drop. Failing to write it is logged, not fatal.
+struct PidFile(Option<PathBuf>);
+
+impl PidFile {
+    fn write(path: &Path) -> Self {
+        match std::fs::write(path, format!("{}\n", std::process::id())) {
+            Ok(()) => PidFile(Some(path.to_path_buf())),
+            Err(e) => {
+                warn!(path = %path.display(), "cannot write the pid file: {e}");
+                PidFile(None)
+            }
+        }
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0
+            && let Err(e) = std::fs::remove_file(p)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!(path = %p.display(), "cannot remove the pid file: {e}");
+        }
     }
 }
 
