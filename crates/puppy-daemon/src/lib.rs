@@ -3,6 +3,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod lifecycle;
 pub mod manager;
 pub mod paths;
 pub mod server;

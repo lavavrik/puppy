@@ -33,24 +33,37 @@ impl Paths {
     pub fn resolve() -> io::Result<Self> {
         let (data_dir, config_dir) = match std::env::var_os("PUPPY_HOME").filter(|v| !v.is_empty())
         {
-            Some(home) => {
-                let home = PathBuf::from(home);
-                (home.join("data"), home.join("config"))
-            }
+            Some(home) => home_dirs(Path::new(&home)),
             None => default_dirs()?,
         };
         let socket_override = std::env::var("PUPPY_SOCKET").ok().filter(|v| !v.is_empty());
         let overridden = socket_override.is_some();
         let socket = socket_name(socket_override, &data_dir);
-        check_socket_len(&socket)?;
+        Self::build(data_dir, config_dir, socket, overridden)
+    }
 
+    /// Like [`resolve`](Self::resolve) with `PUPPY_HOME=home` and the given socket
+    /// (treated as an override), without reading the environment. For tests and
+    /// embedders running several daemons in one process.
+    pub fn with_home(home: &Path, socket: SocketName) -> io::Result<Self> {
+        let (data_dir, config_dir) = home_dirs(home);
+        Self::build(data_dir, config_dir, socket, true)
+    }
+
+    fn build(
+        data_dir: PathBuf,
+        config_dir: PathBuf,
+        socket: SocketName,
+        socket_overridden: bool,
+    ) -> io::Result<Self> {
+        check_socket_len(&socket)?;
         create_private_dir(&data_dir)?;
         create_private_dir(&config_dir)?;
         if let SocketName::Path(p) = &socket
             && let Some(parent) = p.parent()
             && !parent.as_os_str().is_empty()
         {
-            if overridden {
+            if socket_overridden {
                 // User-chosen location: create if missing, never chmod.
                 std::fs::create_dir_all(parent)?;
             } else {
@@ -78,6 +91,10 @@ impl Paths {
 
 fn no_home() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "cannot determine data directory")
+}
+
+fn home_dirs(home: &Path) -> (PathBuf, PathBuf) {
+    (home.join("data"), home.join("config"))
 }
 
 fn default_dirs() -> io::Result<(PathBuf, PathBuf)> {
