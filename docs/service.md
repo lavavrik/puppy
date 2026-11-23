@@ -21,14 +21,16 @@ the data directory:
 | macOS   | `~/Library/Application Support/puppy`   |
 | Windows | `%APPDATA%\puppy`                       |
 
-The examples assume puppy was installed with `cargo install --path crates/puppy`
-(to `~/.cargo/bin`) or, on macOS, copied to `/usr/local/bin`. Adjust the paths
-if yours differ.
+The examples assume the install locations from the README's
+[Install](../README.md#install) section: `~/.local/bin/puppy` on Linux,
+`/usr/local/bin/puppy` on macOS and `%LOCALAPPDATA%\Programs\puppy\puppy.exe` on
+Windows. If you installed with `cargo install`, the binary is in `~/.cargo/bin`
+instead; adjust the paths.
 
 ## Linux (systemd user unit)
 
 The unit is [`packaging/systemd/puppy.service`](../packaging/systemd/puppy.service).
-It runs `%h/.cargo/bin/puppy daemon` (`%h` is your home directory) and restarts
+It runs `%h/.local/bin/puppy daemon` (`%h` is your home directory) and restarts
 it if it fails.
 
 ```sh
@@ -79,10 +81,10 @@ Create a task that starts the daemon when you log on, with normal (not
 elevated) rights. In `cmd.exe`:
 
 ```bat
-schtasks /Create /SC ONLOGON /TN puppy /TR "\"%USERPROFILE%\.cargo\bin\puppy.exe\" daemon" /RL LIMITED
+schtasks /Create /SC ONLOGON /TN puppy /TR "\"%LOCALAPPDATA%\Programs\puppy\puppy.exe\" daemon" /RL LIMITED
 ```
 
-`%USERPROFILE%` is expanded when the task is created. Windows may only allow
+`%LOCALAPPDATA%` is expanded when the task is created. Windows may only allow
 creating log-on tasks from an elevated prompt ("Run as administrator"); the
 task still runs as you, with limited rights. To start it now without logging
 off: `schtasks /Run /TN puppy`.
@@ -94,7 +96,7 @@ the task's Settings and Conditions tabs (`taskschd.msc`), or create the task wit
 PowerShell instead, which lets you turn them off up front:
 
 ```powershell
-$action   = New-ScheduledTaskAction -Execute "$env:USERPROFILE\.cargo\bin\puppy.exe" -Argument "daemon"
+$action   = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\puppy\puppy.exe" -Argument "daemon"
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName puppy -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited
@@ -106,7 +108,7 @@ Register-ScheduledTask -TaskName puppy -Action $action -Trigger $trigger -Settin
 
 Without administrator rights, use the Startup folder instead: press Win+R, open
 `shell:startup`, and create a shortcut there with the target
-`"%USERPROFILE%\.cargo\bin\puppy.exe" daemon` and Run set to "Minimized" (the
+`"%LOCALAPPDATA%\Programs\puppy\puppy.exe" daemon` and Run set to "Minimized" (the
 daemon is a console program and keeps its window open while it runs).
 
 To remove it:

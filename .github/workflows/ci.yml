@@ -2,8 +2,10 @@ name: CI
 
 # Manual only: builds and tests run locally. Start this from the Actions tab
 # (or `gh workflow run CI --ref <branch>`) when a cross-platform check is wanted.
+# The release workflow also runs it before publishing.
 on:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

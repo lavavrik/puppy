@@ -10,7 +10,7 @@ Documentation=https://github.com/lavavrik/puppy/blob/main/docs/service.md
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/puppy daemon
+ExecStart=%h/.local/bin/puppy daemon
 Restart=on-failure
 RestartSec=5
 

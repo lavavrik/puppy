@@ -7,7 +7,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lavavrik/puppy"
-homepage = "https://github.com/lavavrik/puppy"
 # Distributed as prebuilt binaries from GitHub releases, not through crates.io.
 publish = false
 
@@ -42,3 +41,11 @@ librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] 
 bytes = "1"
 humantime = "2.4.0"
 globset = "0.4"
+
+# Release binaries (GitHub releases): `cargo build --profile dist`. Kept separate so
+# everyday `--release` builds stay quick.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = true

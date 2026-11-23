@@ -9,30 +9,31 @@ and Windows, on x86_64 and aarch64.
 
 ## Status
 
-Early development, but the first four milestones are done:
+Early development (v0.1.0). What works today:
 
 - **HTTP(S) engine**: segmented multi-connection downloads (8 connections by
   default) with robust resume. A resumed file is revalidated against the
   server (ETag / Last-Modified, or a byte comparison when the server offers
   neither) and is never silently continued if the remote file changed.
-  Retries with backoff, per-download and global speed limits, proxies from
-  the environment.
-- **Daemon**: a single instance per user with a download queue (3 active at a
-  time by default), atomically persisted state, a versioned newline-delimited
-  JSON protocol, graceful shutdown, and an idle exit when started on demand.
-
+  Retries with backoff, per-download and global speed limits, proxies.
+- **Daemon**: a single instance per user owns the queue (3 active at a time by
+  default), with atomically persisted state, a versioned JSON protocol,
+  graceful shutdown, and an idle exit when started on demand.
 - **Dashboard**: a full-screen terminal UI (`puppy`) to add, pause, resume,
   reorder, limit and delete downloads, with a live detail pane, dark and light
   themes, and monochrome / 16-color fallbacks.
 - **BitTorrent**: magnet links and `.torrent` files (via
   [librqbit](https://github.com/ikatson/rqbit)), queued alongside HTTP
-  downloads, with peers, ratio and a piece map in the detail pane, and resume
-  across daemon restarts (existing data is re-checked). See
-  [Torrents](#torrents) for what v1 does and does not do.
+  downloads, with file selection, seeding limits, peers and a piece map. See
+  [Torrents](#torrents).
+- **Command line**: scriptable subcommands (`puppy add`, `ls`, `wait`, …) with
+  `--json` output. See [Command line](#command-line).
+- **Desktop notifications** when downloads finish or fail.
+- **Browser extension** for Chrome-family browsers that hands their downloads
+  to puppy. See [Browser downloads](#browser-downloads).
 
-Tested locally on Linux; CI for Windows and macOS is pending. Scriptable
-subcommands (`puppy add`, `puppy ls`, …) come later; browser integration is
-described in [Browser downloads](#browser-downloads).
+puppy is developed and tested on Linux. Release builds exist for macOS and
+Windows, but they have seen little real use yet: reports are welcome.
 
 ## Demo
 
@@ -77,7 +78,45 @@ Animated demo: run `vhs docs/demo.tape` (needs [vhs](https://github.com/charmbra
 `python3` and `puppy` on your `PATH`). It runs in throwaway directories and writes
 `docs/demo.gif`.
 
-## Build
+## Install
+
+Download the archive for your platform from the
+[latest release](https://github.com/lavavrik/puppy/releases/latest):
+
+| Platform              | Archive                                    |
+|-----------------------|--------------------------------------------|
+| Linux x86_64          | `puppy-<version>-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux ARM64           | `puppy-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon   | `puppy-<version>-aarch64-apple-darwin.tar.gz`      |
+| macOS Intel           | `puppy-<version>-x86_64-apple-darwin.tar.gz`       |
+| Windows x86_64        | `puppy-<version>-x86_64-pc-windows-msvc.zip`       |
+| Windows ARM64         | `puppy-<version>-aarch64-pc-windows-msvc.zip`      |
+
+Each archive holds the `puppy` binary, the browser extension (`extension/`),
+the service files (`packaging/`), this README and the licenses. The Linux
+builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later)
+and the system's CA certificates (the `ca-certificates` package, present on
+any desktop; minimal containers may lack it).
+`SHA256SUMS` in the release lists every archive's checksum.
+
+**Linux and macOS:** put the binary on your `PATH`, e.g.
+
+```sh
+tar xzf puppy-*.tar.gz
+install -m 755 puppy-*/puppy ~/.local/bin/        # Linux
+sudo install -m 755 puppy-*/puppy /usr/local/bin/ # macOS
+```
+
+The macOS binaries are not signed. If the archive was downloaded with a browser,
+macOS refuses to run it at first; clear the quarantine flag with
+`xattr -d com.apple.quarantine /usr/local/bin/puppy`.
+
+**Windows:** unzip it and move `puppy.exe` to
+`%LOCALAPPDATA%\Programs\puppy\`, then add that folder to your user `PATH`
+(Settings → System → About → Advanced system settings → Environment
+Variables). The binary is not signed, so SmartScreen may warn the first time.
+
+## Build from source
 
 Requires a recent stable Rust toolchain (edition 2024).
 
@@ -373,7 +412,9 @@ so no network port is opened. Firefox is not supported yet.
    uninstall` removes it. Re-run `install` after moving the puppy binary
    (`status` then says "stale").
 2. **Load the extension.** Open `chrome://extensions`, turn on Developer mode,
-   choose Load unpacked and pick this repo's `extension/` folder. The card must
+   choose Load unpacked and pick the `extension/` folder from the release
+   archive (or from this repo). Keep the folder where it is: the browser loads
+   it from there every time. The card must
    show the ID `cbfmabianfipnmdcdipmcpaggpejlaeg`.
 3. **What happens.** Every download goes to puppy's download folder, sent with
    the browser's cookies, referrer and user agent. The browser's own copy is
@@ -431,7 +472,7 @@ so no network port is opened. Firefox is not supported yet.
 
 | Crate                     | What it is                                                      |
 |---------------------------|-----------------------------------------------------------------|
-| `crates/puppy`            | The `puppy` binary: dashboard, `status` and `daemon`.           |
+| `crates/puppy`            | The `puppy` binary: dashboard, subcommands and native host.     |
 | `crates/puppy-tui`        | The full-screen dashboard (ratatui).                            |
 | `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S) engine.        |
 | `crates/puppy-torrent`    | The BitTorrent engine (librqbit behind the `Engine` trait).     |
@@ -442,6 +483,19 @@ so no network port is opened. Firefox is not supported yet.
 | `extension/`              | The browser extension (MV3) that hands downloads to puppy.      |
 
 The design is in [docs/superpowers/specs/](docs/superpowers/specs/).
+
+## Releasing
+
+1. Bump `version` in the root `Cargo.toml` and commit.
+2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The [Release workflow](.github/workflows/release.yml) runs the tests on
+   every platform, builds the six archives and creates a **draft** release
+   with them and `SHA256SUMS`. Check it, edit the notes, and publish.
+
+The archives are built by `cargo build --profile dist` and
+[`scripts/package.sh`](scripts/package.sh), which also run locally. The
+workflow can be started from the Actions tab to build the archives without
+making a release.
 
 ## License
 
