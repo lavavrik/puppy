@@ -453,7 +453,7 @@ pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
                 Event::SeedingFinished { id } => {
                     format!("seeding finished {id} {}", name(&names, id))
                 }
-                Event::Unknown => continue,
+                Event::ChoosingFiles { .. } | Event::Unknown => continue,
             };
             out(format_args!("{} {line}", timestamp()));
         }

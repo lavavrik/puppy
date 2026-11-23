@@ -218,6 +218,11 @@ pub enum Event {
     SeedingFinished {
         id: DownloadId,
     },
+    /// A torrent waits for its files to be chosen.
+    ChoosingFiles {
+        id: DownloadId,
+        name: String,
+    },
     /// A kind this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
@@ -534,6 +539,10 @@ mod tests {
             Event::NeedsAttention {
                 id: 1,
                 reason: WireAttention::ValidationFailed { detail: "d".into() },
+            },
+            Event::ChoosingFiles {
+                id: 4,
+                name: "Big.Show.S01".into(),
             },
         ];
         for ev in events {

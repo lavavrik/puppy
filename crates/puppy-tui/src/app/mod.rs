@@ -770,6 +770,7 @@ impl App {
             Event::Added { .. }
             | Event::Removed { .. }
             | Event::SeedingFinished { .. }
+            | Event::ChoosingFiles { .. }
             | Event::Unknown => {}
         }
     }

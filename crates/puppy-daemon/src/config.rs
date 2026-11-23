@@ -108,6 +108,29 @@ impl Default for TorrentConfig {
     }
 }
 
+/// Desktop notification settings (`[notifications]`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub completed: bool,
+    pub failed: bool,
+    pub choose_files: bool,
+    pub seeding_finished: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            completed: true,
+            failed: true,
+            choose_files: true,
+            seeding_finished: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -119,6 +142,7 @@ pub struct Config {
     pub theme: String,
     pub proxy: Option<url::Url>,
     pub torrent: TorrentConfig,
+    pub notifications: NotificationsConfig,
     /// First delay before a transiently failed download is retried automatically;
     /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
     /// the file.
@@ -146,6 +170,7 @@ impl Default for Config {
             theme: "auto".into(),
             proxy: None,
             torrent: TorrentConfig::default(),
+            notifications: NotificationsConfig::default(),
             retry_base: Duration::from_secs(30),
             shutdown_pause_timeout: Duration::from_secs(10),
         }
@@ -202,6 +227,25 @@ mod tests {
     /// tests change.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn config_notifications_defaults_and_overrides() {
+        let _env = env_lock();
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        std::fs::write(&p, "max_active = 5\n").unwrap();
+        let n = Config::load(&p).unwrap().notifications;
+        assert!(n.enabled && n.completed && n.failed && n.choose_files && !n.seeding_finished);
+        std::fs::write(
+            &p,
+            "[notifications]\nenabled = false\nseeding_finished = true\n",
+        )
+        .unwrap();
+        let n = Config::load(&p).unwrap().notifications;
+        assert!(!n.enabled && n.seeding_finished && n.completed);
+        std::fs::write(&p, "[notifications]\ncompleted = \"yes\"\n").unwrap();
+        assert!(Config::load(&p).unwrap_err().to_string().contains("line 2"));
     }
 
     #[test]
