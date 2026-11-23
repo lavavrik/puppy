@@ -28,6 +28,9 @@ tokio.workspace = true
 unicode-width.workspace = true
 url.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 

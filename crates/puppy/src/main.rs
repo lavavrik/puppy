@@ -10,10 +10,12 @@
 //! - `--json` (global) makes commands print JSON; errors map to exit codes (see
 //!   [`cli::CliError`]).
 
+mod browser;
 mod cli;
 mod native_host;
 
 use anyhow::Context;
+use browser::Browser;
 use clap::{Parser, Subcommand, ValueEnum};
 use cli::add::AddArgs;
 use cli::list::StateFilter;
@@ -219,6 +221,11 @@ enum Command {
     Watch,
     /// Stop the background daemon.
     Stop,
+    /// Set up browser download pickup (the puppy extension).
+    Browser {
+        #[command(subcommand)]
+        action: BrowserAction,
+    },
     /// Native messaging host started by the browser extension.
     #[command(hide = true)]
     NativeHost {
@@ -227,6 +234,24 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         browser_args: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum BrowserAction {
+    /// Register puppy's native messaging host with Chrome-family browsers.
+    Install {
+        /// Only this browser, even if it was not found.
+        #[arg(long, value_enum)]
+        browser: Option<Browser>,
+    },
+    /// Remove the registration.
+    Uninstall {
+        /// Only this browser.
+        #[arg(long, value_enum)]
+        browser: Option<Browser>,
+    },
+    /// Show what is registered, per browser.
+    Status,
 }
 
 /// `all` (any case) alone means every download; otherwise the ids as given.
@@ -344,6 +369,15 @@ fn main() -> ExitCode {
             Some(Command::Wait { ids }) => cli::wait::wait(&Ctx::from_env(cli.json)?, ids).await,
             Some(Command::Watch) => cli::wait::watch(&Ctx::from_env(cli.json)?).await,
             Some(Command::Stop) => cli::control::stop(&Ctx::from_env(cli.json)?).await,
+            Some(Command::Browser { action }) => match action {
+                BrowserAction::Install { browser } => {
+                    cli::browser::install(cli.json, browser).await
+                }
+                BrowserAction::Uninstall { browser } => {
+                    cli::browser::uninstall(cli.json, browser).await
+                }
+                BrowserAction::Status => cli::browser::status(cli.json).await,
+            },
             Some(Command::NativeHost { browser_args: _ }) => native_host::run().await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }

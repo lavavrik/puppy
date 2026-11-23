@@ -95,3 +95,166 @@ async fn native_host_binary_autostarts_daemon() {
     );
     assert!(!info.contains("SECRET"), "{info}");
 }
+
+#[cfg(unix)]
+mod install {
+    use super::common::*;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    const ID: &str = "cbfmabianfipnmdcdipmcpaggpejlaeg";
+
+    /// `puppy <args>` with a fake `HOME` and no `XDG_CONFIG_HOME`, so nothing outside the
+    /// temp dir is touched.
+    fn run(env: &Env, home: &Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+        let out = home.join("stdout");
+        let err = home.join("stderr");
+        let child = env
+            .command(args)
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .stdout(std::fs::File::create(&out).unwrap())
+            .stderr(std::fs::File::create(&err).unwrap())
+            .spawn()
+            .unwrap();
+        let st = wait_exit(child, TIMEOUT);
+        (
+            st,
+            std::fs::read_to_string(out).unwrap(),
+            std::fs::read_to_string(err).unwrap(),
+        )
+    }
+
+    /// (config dir, manifest) of a browser under `home`, per the Linux or macOS layout.
+    fn dirs(home: &Path, linux: &str, mac: &str) -> (PathBuf, PathBuf) {
+        let cfg = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support").join(mac)
+        } else {
+            home.join(".config").join(linux)
+        };
+        let m = cfg.join("NativeMessagingHosts/dev.puppy.native_host.json");
+        (cfg, m)
+    }
+
+    fn chrome(home: &Path) -> (PathBuf, PathBuf) {
+        dirs(home, "google-chrome", "Google/Chrome")
+    }
+    fn brave(home: &Path) -> (PathBuf, PathBuf) {
+        dirs(
+            home,
+            "BraveSoftware/Brave-Browser",
+            "BraveSoftware/Brave-Browser",
+        )
+    }
+    fn chromium(home: &Path) -> (PathBuf, PathBuf) {
+        dirs(home, "chromium", "Chromium")
+    }
+
+    fn fake_home(env: &Env) -> PathBuf {
+        let h = env.home.path().join("fakehome");
+        std::fs::create_dir_all(&h).unwrap();
+        h
+    }
+
+    fn browser_status(env: &Env, home: &Path, name: &str) -> Value {
+        let (st, out, err) = run(env, home, &["--json", "browser", "status"]);
+        assert!(st.success(), "{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        v["browsers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["browser"] == name)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn install_status_uninstall_under_temp_home() {
+        let env = Env::new();
+        let home = fake_home(&env);
+        let exe = std::fs::canonicalize(BIN).unwrap();
+        let (c, cm) = chrome(&home);
+        let (b, bm) = brave(&home);
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (st, _, err) = run(&env, &home, &["browser", "install"]);
+        assert!(st.success(), "{err}");
+        for m in [&cm, &bm] {
+            let v: Value = serde_json::from_slice(&std::fs::read(m).unwrap()).unwrap();
+            assert_eq!(v["path"], exe.to_str().unwrap());
+            assert_eq!(
+                v["allowed_origins"],
+                serde_json::json!([format!("chrome-extension://{ID}/")])
+            );
+        }
+        assert!(!chromium(&home).0.exists());
+
+        let ch = browser_status(&env, &home, "chrome");
+        assert_eq!(ch["found"], true);
+        assert_eq!(ch["host"]["state"], "ok");
+        let cr = browser_status(&env, &home, "chromium");
+        assert_eq!(cr["found"], false);
+        assert_eq!(cr["host"]["state"], "missing");
+
+        let (st, out, _) = run(&env, &home, &["browser", "status"]);
+        assert!(st.success());
+        let line = out.lines().find(|l| l.starts_with("chrome ")).unwrap();
+        assert!(line.contains("ok"), "{out}");
+        assert_eq!(out.lines().last().unwrap(), format!("extension id: {ID}"));
+
+        let (st, _, err) = run(&env, &home, &["browser", "uninstall"]);
+        assert!(st.success(), "{err}");
+        assert!(!cm.exists() && !bm.exists());
+        assert_eq!(
+            browser_status(&env, &home, "chrome")["host"]["state"],
+            "missing"
+        );
+        let (st, out, _) = run(&env, &home, &["browser", "uninstall"]);
+        assert!(st.success());
+        assert!(out.contains("nothing to remove"), "{out}");
+    }
+
+    #[test]
+    fn install_without_browsers_fails_unless_forced() {
+        let env = Env::new();
+        let home = fake_home(&env);
+        let (st, _, err) = run(&env, &home, &["browser", "install"]);
+        assert_eq!(st.code(), Some(1));
+        assert!(err.contains("--browser"), "{err}");
+
+        let (st, _, err) = run(
+            &env,
+            &home,
+            &["browser", "install", "--browser", "chromium"],
+        );
+        assert!(st.success(), "{err}");
+        assert!(chromium(&home).1.exists());
+    }
+
+    #[test]
+    fn stale_path_is_flagged() {
+        let env = Env::new();
+        let home = fake_home(&env);
+        let (c, cm) = chrome(&home);
+        std::fs::create_dir_all(&c).unwrap();
+        let (st, _, err) = run(&env, &home, &["browser", "install"]);
+        assert!(st.success(), "{err}");
+
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&cm).unwrap()).unwrap();
+        v["path"] = "/old/puppy".into();
+        std::fs::write(&cm, serde_json::to_vec(&v).unwrap()).unwrap();
+
+        let (st, out, _) = run(&env, &home, &["browser", "status"]);
+        assert!(st.success());
+        let line = out.lines().find(|l| l.starts_with("chrome ")).unwrap();
+        for want in ["stale", "/old/puppy", "re-run puppy browser install"] {
+            assert!(line.contains(want), "{line}");
+        }
+        assert_eq!(
+            browser_status(&env, &home, "chrome")["host"],
+            serde_json::json!({"state": "stale_path", "found": "/old/puppy"})
+        );
+    }
+}

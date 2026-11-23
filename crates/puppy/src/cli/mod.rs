@@ -2,6 +2,7 @@
 //! pipe-safe output.
 
 pub mod add;
+pub mod browser;
 pub mod control;
 pub mod files;
 pub mod list;
