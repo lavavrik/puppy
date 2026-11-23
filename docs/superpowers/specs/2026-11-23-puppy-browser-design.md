@@ -19,7 +19,7 @@ in place for it.
   differences, so Firefox later is mostly manifest keys plus a test pass.
 - Every download is taken over automatically — no per-download prompt.
 - Logged-in downloads work: the site's cookies, the referring page and the browser's user
-  agent travel with the request.
+  agent travel with the request, and survive a daemon restart (see Cookies).
 - Nothing is ever lost: the browser download is cancelled only after puppy confirmed it
   accepted the download; if puppy is unreachable or refuses, the browser keeps it.
 - Configurable extension.
@@ -35,8 +35,9 @@ in place for it.
 
 - No security hole: no network port any web page could hit; only the browser-launched
   native host talks to the daemon, over the existing local socket / named pipe.
-- Cookies never written to disk, logs, `state.json`, `puppy info` or `--json` output
-  (`RequestContext` is already excluded from persisted state; keep it so).
+- Cookies never written to logs, `puppy info`, `--json` output or the resume sidecar
+  next to the download. They ARE kept in the private state file (user decision, see
+  below) and removed from it once the download completes or is removed.
 - Never break a download the browser could have done: `blob:`/`data:` URLs, POST-backed
   downloads, and anything puppy refuses stay with the browser.
 
@@ -62,13 +63,28 @@ in place for it.
   downloads where detectable, and anything else puppy refuses.
 - **Where files go:** puppy's own download directory (same as every other puppy download);
   the browser's "ask where to save" choice is not mirrored.
+- **Cookies (user decision 2026-11-23, option A):** a browser download's cookies live in
+  the daemon's existing private state file (mode 0600, same as every `RequestContext`
+  today), so an interrupted logged-in download resumes after a restart or reboot. When
+  the download completes or is removed, its context (cookies, auth, headers) is cleared
+  from the stored record. Tests assert cookies never appear in logs, `puppy info`,
+  `--json` output or the sidecar, and are gone from `state.json` after completion.
+- **No modifier key (user decision 2026-11-23, option A):** detecting a held key would
+  need a content script on every site and "read and change all your data on all
+  websites". Instead: a toolbar-popup button "Let the browser take the next download"
+  and a keyboard shortcut (`commands` API, default Alt+Shift+B, user-rebindable in
+  `chrome://extensions/shortcuts`) that arms the same one-shot bypass; it expires after
+  60 s. The extension needs no host/content-script permissions beyond `cookies` for
+  the download URLs (`<all_urls>` host permission is required by the cookies API to read
+  cookies for arbitrary download hosts — that is the one broad permission, and it is
+  read-cookies-only, not page access).
 - **Settings page (options):** enabled on/off; minimum file size (smaller stays in the
   browser; unknown size ⇒ take over); file types (extensions) to leave to the browser;
-  sites (domains/patterns) to leave to the browser; a modifier key held while clicking
-  (default Alt) lets the browser keep that one download; a status line showing whether
-  puppy is reachable (native host installed + daemon answers). Settings stored in
+  sites (domains/patterns) to leave to the browser; a status line showing whether
+  puppy is reachable (native host installed + daemon answers + versions). Settings in
   `storage.sync`.
-- **Toolbar popup:** on/off toggle and the last few handed-over downloads (name, ok/error).
+- **Toolbar popup:** on/off toggle, the "browser takes the next download" button, and
+  the last few handed-over downloads (name, ok/error) kept in `storage.session`.
 - **Native host:** a `puppy native-host` subcommand of the main binary (no separate
   binary to ship); hidden from normal help.
 - **Install:** `puppy browser install` writes the native messaging host manifest for each
@@ -90,12 +106,41 @@ in place for it.
   needs-attention / failed state.
 - Downloads that require a form submit (POST) or page-generated data stay in the browser.
 
+## Controller calls (from the builder check)
+
+- **"Accepted"** means the daemon's `Add` returned a download id (the add path does not
+  wait for a probe; builder verifies, and if it does wait, the host replies as soon as the
+  id exists). Puppy "refuses" = any `Add` error (invalid URL, unsupported scheme,
+  BadRequest) or the host/daemon being unreachable.
+- **Timeouts and duplicates:** the browser download is paused while waiting; the extension
+  waits up to 10 s (covers a cold daemon autostart). If no reply, it resumes the browser
+  download; if an "accepted" arrives after that, the extension asks the host to remove
+  that puppy download (no file deleted), so the file is never downloaded twice. Every
+  request carries a client request id echoed in the reply.
+- **Version handshake:** the first message is `hello {extension_version, protocol}`;
+  the host answers with puppy's version and protocol; a mismatch shows in the options
+  status line and the extension leaves downloads to the browser.
+- **Filename:** the extension passes Chrome's final filename (already derived from
+  Content-Disposition/URL) as `filename`; collisions follow puppy's existing rules.
+  `user:pass@` in the URL moves into `basic_auth`.
+- **Host binary path:** `puppy browser install` writes the canonical `current_exe()` path
+  into the host manifests; `puppy browser status` flags a missing or different path
+  ("re-run puppy browser install"). The host subcommand is hidden from help and accepts
+  the browser's extra argv (origin on Linux/macOS, `--parent-window=` on Windows).
+- **Extension ID:** generate an RSA keypair once, commit only the public key as the
+  manifest `key` (and the derived ID as a constant); the private key is not needed for
+  unpacked loading and is not committed.
+- **Browsers:** Chrome, Chromium, Brave, Edge, Vivaldi using each vendor's documented
+  per-user NativeMessagingHosts directory (Linux, macOS) and HKCU registry key
+  (Windows, via a Windows-only target-gated `winreg` dependency). Flatpak/Snap browsers
+  are out of scope for v1 (documented). Install writes for every browser whose config
+  directory exists; `--browser <name>` forces one.
+
 ## Left to the builder
 
 - Exact message schema between extension and native host (versioned, small).
 - Which `downloads` events to hook per browser to avoid a visible flash of the browser's
   download bar; how to detect POST-backed downloads.
-- Timeout before falling back to the browser (suggest ~3 s).
 - Testing: Rust side unit/integration tests of the native host framing and install
   (temp HOME, no real browser); extension logic unit-tested with mocked `chrome.*` APIs
   (e.g. node's built-in test runner, no npm dependencies if possible); a manual Chrome
