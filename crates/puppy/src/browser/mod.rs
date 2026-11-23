@@ -195,6 +195,39 @@ pub fn location(b: Browser, os: Os, env: &BrowserEnv) -> Location {
     }
 }
 
+/// Windows: Chrome's registration (key and manifest file) is also what Vivaldi reads, and
+/// Brave is given it as a fallback, so these browsers share it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const SHARED_GROUP: [Browser; 3] = [Browser::Chrome, Browser::Vivaldi, Browser::Brave];
+
+/// The shared registration (Windows only): Chrome's key and manifest.
+///
+/// Brave's own key (`Software\BraveSoftware\Brave-Browser\NativeMessagingHosts`) is also
+/// written, and the shared one as well. UNVERIFIED: which of the two Brave on Windows
+/// actually reads is not confirmed against Brave's documentation.
+pub fn shared_registration(os: Os, env: &BrowserEnv) -> Option<Location> {
+    (os == Os::Windows).then(|| location(Browser::Chrome, os, env))
+}
+
+/// The other members of the shared group whose browser is installed (`found`) and still
+/// need the shared registration when `target` is uninstalled on its own.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn shared_blockers(target: Browser, found: impl Fn(Browser) -> bool) -> Vec<Browser> {
+    SHARED_GROUP
+        .into_iter()
+        .filter(|&b| b != target && found(b))
+        .collect()
+}
+
+/// Whether two paths are the same file name-wise; Windows paths ignore case.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
 /// Who may start the host: a Chrome extension origin, or a Firefox extension id.
 pub enum Allowed<'a> {
     ChromeOrigin(&'a str),
@@ -271,7 +304,7 @@ pub fn check_manifest(manifest: &Path, exe: &Path) -> HostState {
             error: "no \"path\" in the manifest".into(),
         };
     };
-    if Path::new(path) != exe {
+    if !same_path(Path::new(path), exe) {
         return HostState::StalePath {
             found: PathBuf::from(path),
         };
@@ -426,6 +459,68 @@ mod tests {
         for same in [r"\\?\UNC\srv\x\puppy.exe", "/usr/bin/puppy"] {
             assert_eq!(manifest_exe_path(same), same);
         }
+    }
+
+    #[test]
+    fn shared_registration_decisions() {
+        use Browser::*;
+        let found = |set: &'static [Browser]| move |b: Browser| set.contains(&b);
+        // Chrome alone: nothing else needs it.
+        assert_eq!(shared_blockers(Chrome, found(&[Chrome])), vec![]);
+        // Vivaldi and Chrome both installed: removing one keeps the shared registration.
+        assert_eq!(
+            shared_blockers(Vivaldi, found(&[Chrome, Vivaldi])),
+            vec![Chrome]
+        );
+        assert_eq!(
+            shared_blockers(Chrome, found(&[Chrome, Vivaldi])),
+            vec![Vivaldi]
+        );
+        assert_eq!(
+            shared_blockers(Brave, found(&[Chrome, Vivaldi, Brave, Edge])),
+            vec![Chrome, Vivaldi]
+        );
+        // Browsers outside the group never block.
+        assert_eq!(shared_blockers(Chrome, found(&[Edge, Chromium])), vec![]);
+        // Only Windows has a shared registration.
+        assert!(shared_registration(Os::Linux, &env(None)).is_none());
+        assert_eq!(
+            shared_registration(Os::Windows, &env(None)),
+            Some(location(Chrome, Os::Windows, &env(None)))
+        );
+    }
+
+    #[test]
+    fn same_path_case() {
+        assert!(same_path(Path::new("/a/b"), Path::new("/a/b")));
+        assert_eq!(
+            same_path(
+                Path::new(r"C:\Bin\Puppy.exe"),
+                Path::new(r"c:\bin\puppy.exe")
+            ),
+            cfg!(windows)
+        );
+        assert!(!same_path(Path::new("/a"), Path::new("/b")));
+    }
+
+    #[test]
+    fn extension_id_matches_manifest_key() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let text = include_str!("../../../../extension/manifest.json");
+        let v: Value = serde_json::from_str(text).unwrap();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(v["key"].as_str().unwrap())
+            .unwrap();
+        let hex: String = Sha256::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let id: String = hex[..32]
+            .chars()
+            .map(|c| (b'a' + c.to_digit(16).unwrap() as u8) as char)
+            .collect();
+        assert_eq!(id, EXTENSION_ID);
     }
 
     #[test]

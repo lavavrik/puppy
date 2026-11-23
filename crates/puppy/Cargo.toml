@@ -35,6 +35,8 @@ winreg = "0.56"
 libc = "0.2"
 
 [dev-dependencies]
+base64 = "0.22"
+sha2 = "0.10"
 puppy-testserver = { path = "../puppy-testserver" }
 fs4.workspace = true
 # The torrent tests' local seeder (crates/puppy-torrent/tests/support).
