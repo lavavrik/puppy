@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>puppy options</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body>
+  <h1>puppy</h1>
+  <p id="status" class="status">Checking puppy…</p>
+  <label class="check"><input type="checkbox" id="enabled"> Hand downloads to puppy</label>
+  <label for="minSizeMiB">Leave files smaller than (MiB) to the browser</label>
+  <input type="number" id="minSizeMiB" min="0" step="any">
+  <label for="extensions">File types to leave to the browser</label>
+  <textarea id="extensions" placeholder="pdf, jpg"></textarea>
+  <label for="sites">Sites to leave to the browser</label>
+  <textarea id="sites" placeholder="example.com"></textarea>
+  <p class="hint">One site per line; subdomains are included.</p>
+  <p class="hint">Shortcut for "Let the browser take the next download": <b id="shortcut">…</b>. Change it in chrome://extensions/shortcuts</p>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

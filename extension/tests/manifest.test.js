@@ -28,3 +28,17 @@ test("key derives the extension id puppy installs", () => {
   const want = rust.match(/EXTENSION_ID: &str = "([a-p]{32})"/)[1];
   assert.equal(id, want);
 });
+
+test("popup and options page are wired, with no inline scripts", () => {
+  assert.equal(manifest.action.default_popup, "popup.html");
+  assert.equal(manifest.options_ui.page, "options.html");
+  for (const page of ["../popup.html", "../options.html"]) {
+    const scripts = [...readFileSync(here(page), "utf8").matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+    assert.ok(scripts.length > 0, page);
+    for (const [, attrs, body] of scripts) {
+      assert.match(attrs, /\bsrc="[^"]+"/, page);
+      assert.match(attrs, /\btype="module"/, page);
+      assert.equal(body.trim(), "", page);
+    }
+  }
+});

@@ -19,7 +19,12 @@
     "type": "module"
   },
   "action": {
-    "default_title": "puppy"
+    "default_title": "puppy",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
   },
   "commands": {
     "bypass-next": {
