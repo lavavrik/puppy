@@ -2,5 +2,31 @@
   "manifest_version": 3,
   "name": "puppy",
   "version": "0.1.0",
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtK6KqexAjyaIb12WDpvooRKx2AlEudQe5/pSCG45cMg1UR54ES6vQ72v6pQMNCSALi/bsp5dYKxBBS0mN8kbkGuNz8vty9QOtjWK6IbJWA2iQ5734sH5FXDqBKg069RDDdQNDIDdKvbcdt2rMsoqDkfGuCAK+AKJR8MmVXMlZ4HnYgLG3Owfe75sh/QCPELXqU1JKLbve5XCYaNEteulQXiXesx6XaQrdDbwvLTsy4ANIbZB5KdDGLRZvQ5YBkPSXnOh/UVl5BxOMhodqOp03RvGKFuI+KeA1/k01sxCTfgoMTtRCpDmHGsEPr21UGCYn1FBS4tgm35NBZkVUfS7UQIDAQAB"
+  "description": "Hands browser downloads to the puppy download manager",
+  "minimum_chrome_version": "102",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtK6KqexAjyaIb12WDpvooRKx2AlEudQe5/pSCG45cMg1UR54ES6vQ72v6pQMNCSALi/bsp5dYKxBBS0mN8kbkGuNz8vty9QOtjWK6IbJWA2iQ5734sH5FXDqBKg069RDDdQNDIDdKvbcdt2rMsoqDkfGuCAK+AKJR8MmVXMlZ4HnYgLG3Owfe75sh/QCPELXqU1JKLbve5XCYaNEteulQXiXesx6XaQrdDbwvLTsy4ANIbZB5KdDGLRZvQ5YBkPSXnOh/UVl5BxOMhodqOp03RvGKFuI+KeA1/k01sxCTfgoMTtRCpDmHGsEPr21UGCYn1FBS4tgm35NBZkVUfS7UQIDAQAB",
+  "permissions": [
+    "downloads",
+    "cookies",
+    "nativeMessaging",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "puppy"
+  },
+  "commands": {
+    "bypass-next": {
+      "suggested_key": {
+        "default": "Alt+Shift+B"
+      },
+      "description": "Let the browser take the next download"
+    }
+  }
 }
