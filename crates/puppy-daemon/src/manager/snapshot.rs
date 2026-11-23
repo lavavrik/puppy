@@ -124,6 +124,14 @@ impl Inner {
 }
 
 impl Manager {
+    /// The name a snapshot shows for `id` (`None`: unknown id).
+    pub fn display_name(&self, id: DownloadId) -> Option<String> {
+        let inner = &self.inner;
+        let st = inner.lock();
+        let e = st.entries.get(&id)?;
+        Some(inner.snap(id, e, None, false).0.name)
+    }
+
     /// Every download in queue order, finished ones (completed or seeding) last (most
     /// recently finished first), plus totals (seeding counts as completed, choosing
     /// files as paused).

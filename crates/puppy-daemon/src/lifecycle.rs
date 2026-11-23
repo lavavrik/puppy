@@ -4,6 +4,7 @@
 
 use crate::config::Config;
 use crate::manager::Manager;
+use crate::notify::{self, Notifier};
 use crate::paths::{Paths, SocketName};
 use crate::server::Server;
 use crate::store::Store;
@@ -29,6 +30,8 @@ const FORCED_FLUSH: Duration = Duration::from_secs(1);
 /// How long the torrent session may take to stop (it normally takes about 1 s). Taken
 /// from the manager's pause phase, so shutdown stays within its overall bound.
 const TORRENT_SHUTDOWN: Duration = Duration::from_millis(1500);
+/// How long the notifier may take to hand its last popups to the system at shutdown.
+const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -51,6 +54,8 @@ pub struct DaemonOptions {
     /// listening on 127.0.0.1) with these peers given to every torrent.
     #[doc(hidden)]
     pub torrent_test: Option<TorrentTestOptions>,
+    /// Where desktop notifications go. `None`: no notifications (the default; tests).
+    pub notifier: Option<Arc<dyn Notifier>>,
 }
 
 /// See [`DaemonOptions::torrent_test`].
@@ -90,6 +95,7 @@ impl std::fmt::Debug for DaemonOptions {
             .field("http", &self.http)
             .field("engine", &self.engine.as_ref().map(|e| e.kind()))
             .field("torrent_test", &self.torrent_test)
+            .field("notifier", &self.notifier.is_some())
             .finish()
     }
 }
@@ -153,12 +159,25 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(TORRENT_SHUTDOWN);
     }
     let store = Store::new(paths.state_file.clone());
+    let notifications = cfg.notifications.clone();
     let manager = match Manager::start(engines, store, cfg).await {
         Ok(m) => m,
         Err(e) => {
             shutdown_torrent(torrent.as_deref()).await;
             return Err(e).context("refusing to start");
         }
+    };
+    let notify_task = match opts.notifier {
+        Some(sink) if notifications.enabled => {
+            let weak = Arc::downgrade(&manager);
+            Some(notify::spawn(
+                manager.events(),
+                move |id| weak.upgrade().and_then(|m| m.display_name(id)),
+                notifications,
+                sink,
+            ))
+        }
+        _ => None,
     };
     let server = match Server::bind(&paths.socket, manager.clone()).await {
         Ok(s) => s,
@@ -206,6 +225,9 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         manager.shutdown().await;
         // After the manager paused its torrents: stops the session (listener, DHT).
         shutdown_torrent(torrent.as_deref()).await;
+        if let Some(t) = notify_task {
+            t.finish(NOTIFY_FLUSH).await;
+        }
     };
     tokio::select! {
         _ = graceful => {}

@@ -8,6 +8,7 @@ use interprocess::local_socket::{GenericFilePath, GenericNamespaced};
 use puppy_core::config::HttpConfig;
 use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
+use puppy_daemon::notify::{Notification, NotifyKind, RecordingNotifier};
 use puppy_daemon::{Paths, SocketName};
 use puppy_proto::{
     Envelope, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg, WireState,
@@ -74,6 +75,29 @@ impl Env {
             }),
             engine: None,
             torrent_test: Some(Default::default()),
+            notifier: None,
+        }
+    }
+
+    /// Like `opts`, with notifications going to `sink`.
+    fn opts_notify(&self, sink: RecordingNotifier) -> DaemonOptions {
+        DaemonOptions {
+            notifier: Some(Arc::new(sink)),
+            ..self.opts(None)
+        }
+    }
+
+    /// Starts a daemon with notifications going to `sink`.
+    async fn start_notify(&self, sink: RecordingNotifier) -> Daemon {
+        let d = tokio::spawn(run_daemon(self.opts_notify(sink)));
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            assert!(!d.is_finished(), "daemon exited early: {:?}", d.await);
+            if self.try_connect().await.is_some() {
+                return d;
+            }
+            assert!(Instant::now() < deadline, "daemon never listened");
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -637,4 +661,75 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
     }
     drop(c);
     shutdown(&env, d).await;
+}
+
+/// Waits until download `id` reaches `want`.
+async fn wait_state(c: &mut Client, id: DownloadId, want: fn(&WireState) -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let (st, _) = c.get(id).await;
+        if want(&st) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "state never reached: {st:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A download that finishes just before the daemon stops still gets its popup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_notification_flushed_on_shutdown() {
+    let env = Env::new();
+    let s = server(|c| c.len = 16 * KIB).await;
+    let rec = RecordingNotifier::default();
+    let d = env.start_notify(rec.clone()).await;
+    let mut c = env.client().await;
+    let id = c.add(env.req(&s, "a.bin")).await;
+    wait_state(&mut c, id, |s| matches!(s, WireState::Completed)).await;
+    drop(c);
+    shutdown(&env, d).await;
+    assert_eq!(
+        rec.take(),
+        [Notification {
+            kind: NotifyKind::Completed,
+            title: "puppy".into(),
+            body: "Finished: a.bin".into()
+        }]
+    );
+}
+
+/// Runs a download that fails permanently with notifications on; returns the popups.
+async fn failing_run(env: &Env) -> Vec<Notification> {
+    let s = server(|_| {}).await;
+    let rec = RecordingNotifier::default();
+    let d = env.start_notify(rec.clone()).await;
+    let mut c = env.client().await;
+    let mut req = env.req(&s, "a.bin");
+    req.source = Source::Http {
+        url: s.url("/missing"),
+    };
+    let id = c.add(req).await;
+    wait_state(&mut c, id, |s| matches!(s, WireState::Failed { .. })).await;
+    drop(c);
+    shutdown(env, d).await;
+    rec.take()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanent_failure_notifies_and_config_disables() {
+    let env = Env::new();
+    let got = failing_run(&env).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].kind, NotifyKind::Failed);
+    assert!(
+        got[0].body.starts_with("Failed: a.bin — "),
+        "{}",
+        got[0].body
+    );
+
+    let env = Env::new();
+    let cfg = env.paths().config_file();
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(&cfg, "[notifications]\nenabled = false\n").unwrap();
+    assert!(failing_run(&env).await.is_empty());
 }

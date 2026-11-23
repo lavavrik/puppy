@@ -111,6 +111,7 @@ impl Env {
                 initial_peers: self.peers.clone(),
                 probe: self.probe.clone(),
             }),
+            notifier: None,
         }
     }
 

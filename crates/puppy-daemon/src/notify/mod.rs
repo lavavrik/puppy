@@ -6,7 +6,11 @@ use std::time::Duration;
 
 use puppy_core::types::DownloadId;
 use puppy_proto::Event;
+use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::config::NotificationsConfig;
 
@@ -227,6 +231,99 @@ impl Notifier for RecordingNotifier {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(n.clone());
+    }
+}
+
+/// The running notifier task (see [`spawn`]).
+pub struct NotifyTask {
+    stop: CancellationToken,
+    handle: JoinHandle<()>,
+    sink: Arc<dyn Notifier>,
+}
+
+/// Subscribes to the daemon's events and delivers popups to `sink`: `lookup` gives the
+/// name of a download whose event carries none (called from the task, so it must be
+/// quick). One task; sending never blocks the manager.
+pub fn spawn(
+    rx: broadcast::Receiver<Event>,
+    lookup: impl Fn(DownloadId) -> Option<String> + Send + 'static,
+    cfg: NotificationsConfig,
+    sink: Arc<dyn Notifier>,
+) -> NotifyTask {
+    let stop = CancellationToken::new();
+    let handle = tokio::spawn(run(rx, lookup, cfg, sink.clone(), stop.clone()));
+    NotifyTask { stop, handle, sink }
+}
+
+impl NotifyTask {
+    /// Stops the task, sending whatever is still pending, then waits (at most `within`
+    /// in all) for the sink to hand the popups to the system.
+    pub async fn finish(self, within: Duration) {
+        self.stop.cancel();
+        let work = async {
+            let _ = self.handle.await;
+            let sink = self.sink;
+            let _ = tokio::task::spawn_blocking(move || sink.flush(within)).await;
+        };
+        if tokio::time::timeout(within, work).await.is_err() {
+            debug!("notifications were not delivered in time");
+        }
+    }
+}
+
+fn enqueue(
+    ev: &Event,
+    cfg: &NotificationsConfig,
+    lookup: &impl Fn(DownloadId) -> Option<String>,
+    batcher: &mut Batcher,
+) {
+    if let Some((kind, mut item)) = classify(ev, cfg) {
+        if item.name.is_empty() {
+            item.name = lookup(item.id).unwrap_or_else(|| format!("download {}", item.id));
+        }
+        batcher.push(kind, item, Instant::now());
+    }
+}
+
+async fn run(
+    mut rx: broadcast::Receiver<Event>,
+    lookup: impl Fn(DownloadId) -> Option<String>,
+    cfg: NotificationsConfig,
+    sink: Arc<dyn Notifier>,
+    stop: CancellationToken,
+) {
+    let mut batcher = Batcher::new();
+    loop {
+        let deadline = batcher.next_deadline();
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            r = rx.recv() => match r {
+                Ok(ev) => enqueue(&ev, &cfg, &lookup, &mut batcher),
+                Err(RecvError::Lagged(n)) => debug!(missed = n, "notifier lagged behind events"),
+                Err(RecvError::Closed) => break,
+            },
+            _ = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                for n in batcher.due(Instant::now()) {
+                    sink.notify(&n);
+                }
+            }
+        }
+    }
+    // Events already sent but not yet read count too.
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => enqueue(&ev, &cfg, &lookup, &mut batcher),
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    for n in batcher.drain_all() {
+        sink.notify(&n);
     }
 }
 
@@ -460,5 +557,135 @@ mod tests {
         for ev in [done, fail(false), choose, seeded] {
             assert_eq!(classify(&ev, &disabled), None);
         }
+    }
+
+    fn bodies(rec: &RecordingNotifier) -> Vec<String> {
+        rec.take().into_iter().map(|n| n.body).collect()
+    }
+
+    /// Lets the notifier task run.
+    async fn settle() {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets the task take the pending events, then moves the clock.
+    async fn advance(d: Duration) {
+        settle().await;
+        tokio::time::advance(d).await;
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn task_groups_and_names() {
+        let (tx, rx) = broadcast::channel(16);
+        let rec = RecordingNotifier::default();
+        let lookup = |id| (id == 2).then(|| "b".to_string());
+        let _task = spawn(
+            rx,
+            lookup,
+            NotificationsConfig::default(),
+            Arc::new(rec.clone()),
+        );
+        tx.send(Event::Completed {
+            id: 1,
+            name: "a".into(),
+        })
+        .unwrap();
+        tx.send(Event::Completed {
+            id: 2,
+            name: String::new(),
+        })
+        .unwrap();
+        tx.send(Event::Failed {
+            id: 7,
+            reason: "boom".into(),
+            transient: false,
+        })
+        .unwrap();
+        advance(Duration::from_secs(2)).await;
+        assert!(rec.take().is_empty());
+        advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            bodies(&rec),
+            ["2 downloads finished", "Failed: download 7 — boom"]
+        );
+    }
+
+    /// A failure carries no name of its own: the lookup supplies the real one.
+    #[tokio::test(start_paused = true)]
+    async fn failed_popup_carries_the_looked_up_name() {
+        let (tx, rx) = broadcast::channel(16);
+        let rec = RecordingNotifier::default();
+        let lookup = |id| (id == 7).then(|| "big.tar".to_string());
+        let _task = spawn(
+            rx,
+            lookup,
+            NotificationsConfig::default(),
+            Arc::new(rec.clone()),
+        );
+        tx.send(Event::Failed {
+            id: 7,
+            reason: "boom".into(),
+            transient: false,
+        })
+        .unwrap();
+        advance(Duration::from_secs(4)).await;
+        assert_eq!(bodies(&rec), ["Failed: big.tar — boom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn task_skips_transient_and_disabled() {
+        let (tx, rx) = broadcast::channel(16);
+        let rec = RecordingNotifier::default();
+        let _task = spawn(
+            rx,
+            |_| None,
+            NotificationsConfig::default(),
+            Arc::new(rec.clone()),
+        );
+        tx.send(Event::Failed {
+            id: 1,
+            reason: "x".into(),
+            transient: true,
+        })
+        .unwrap();
+        tx.send(Event::Added { id: 2 }).unwrap();
+        advance(Duration::from_secs(15)).await;
+        assert!(rec.take().is_empty());
+
+        let (tx, rx) = broadcast::channel(16);
+        let cfg = NotificationsConfig {
+            enabled: false,
+            ..NotificationsConfig::default()
+        };
+        let _task = spawn(rx, |_| None, cfg, Arc::new(rec.clone()));
+        tx.send(Event::Completed {
+            id: 3,
+            name: "c".into(),
+        })
+        .unwrap();
+        advance(Duration::from_secs(15)).await;
+        assert!(rec.take().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finish_sends_what_is_pending() {
+        let (tx, rx) = broadcast::channel(16);
+        let rec = RecordingNotifier::default();
+        let task = spawn(
+            rx,
+            |_| None,
+            NotificationsConfig::default(),
+            Arc::new(rec.clone()),
+        );
+        tx.send(Event::Completed {
+            id: 1,
+            name: "a".into(),
+        })
+        .unwrap();
+        task.finish(Duration::from_secs(1)).await;
+        assert_eq!(bodies(&rec), ["Finished: a"]);
     }
 }

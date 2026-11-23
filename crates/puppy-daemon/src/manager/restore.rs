@@ -91,7 +91,9 @@ impl Inner {
                     limit: rec.limit,
                 },
             });
+            let was_choosing = matches!(rec.state, StoredState::ChoosingFiles);
             let mut entry = Entry::new(rec, state, engine);
+            entry.choose_files_sent = was_choosing;
             if super::is_transient_failure(&entry.state) {
                 // Failed transiently before the restart: retried like any other.
                 self.arm_retry(id, &mut entry);
