@@ -4,8 +4,8 @@
 use super::CliError;
 use super::output::{json, out};
 use crate::browser::{
-    Allowed, Browser, BrowserEnv, EXTENSION_ID, HostState, Location, Os, SHARED_GROUP,
-    canonical_exe, check_manifest, host_manifest, location, shared_blockers, shared_registration,
+    Allowed, Browser, BrowserEnv, EXTENSION_ID, HostState, Location, Os, canonical_exe,
+    check_manifest, host_manifest, location, shared_registration, uninstall_plan,
 };
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -105,29 +105,20 @@ pub async fn uninstall(json_out: bool, only: Option<Browser>) -> Result<(), CliE
     let (mut removed, mut kept) = (Vec::new(), Vec::new());
     for b in targets(only) {
         let loc = location(b, os, &env);
+        let plan = uninstall_plan(b, &loc, shared.as_ref(), only.is_none(), |o| {
+            location(o, os, &env).config_dir.exists()
+        });
         let mut any = false;
-        // Chrome and Vivaldi have no registration of their own: it is the shared one.
-        if shared.as_ref() != Some(&loc) {
-            any |= remove_registration(&loc)?;
+        for reg in &plan.delete {
+            any |= remove_registration(reg)?;
         }
-        if let Some(sh) = shared.as_ref().filter(|_| SHARED_GROUP.contains(&b)) {
-            // A plain `uninstall` removes everything; `--browser X` keeps what the
-            // other installed browsers of the group still need.
-            let blockers = if only.is_some() {
-                shared_blockers(b, |o| location(o, os, &env).config_dir.exists())
-            } else {
-                Vec::new()
-            };
-            if blockers.is_empty() {
-                any |= remove_registration(sh)?;
-            } else {
-                let names: Vec<_> = blockers.iter().map(|b| b.name()).collect();
-                let msg = format!("kept the shared registration for {}", names.join(", "));
-                if !json_out {
-                    out(&msg);
-                }
-                kept.push(msg);
+        if !plan.kept.is_empty() {
+            let names: Vec<_> = plan.kept.iter().map(|b| b.name()).collect();
+            let msg = format!("kept the shared registration for {}", names.join(", "));
+            if !json_out {
+                out(&msg);
             }
+            kept.push(msg);
         }
         if any {
             if !json_out {

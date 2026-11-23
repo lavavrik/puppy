@@ -219,6 +219,55 @@ pub fn shared_blockers(target: Browser, found: impl Fn(Browser) -> bool) -> Vec<
         .collect()
 }
 
+/// What uninstalling one browser deletes.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct UninstallPlan {
+    /// Registrations (manifest file and key) to delete.
+    pub delete: Vec<Location>,
+    /// Browsers that keep the shared registration alive.
+    pub kept: Vec<Browser>,
+}
+
+/// Decides what uninstalling `b` deletes. `own` is its registration; `shared` the shared
+/// one, if the OS has one. A registration is identified by its manifest and key, not by
+/// the browser's config dir: Vivaldi's own registration *is* the shared one. `all` is a
+/// plain `uninstall`, which removes everything; otherwise the shared registration stays
+/// while another installed group member (`found`) needs it.
+pub fn uninstall_plan(
+    b: Browser,
+    own: &Location,
+    shared: Option<&Location>,
+    all: bool,
+    found: impl Fn(Browser) -> bool,
+) -> UninstallPlan {
+    let mut plan = UninstallPlan {
+        delete: Vec::new(),
+        kept: Vec::new(),
+    };
+    let same =
+        |a: &Location, b: &Location| a.manifest == b.manifest && a.registry_key == b.registry_key;
+    match shared.filter(|_| SHARED_GROUP.contains(&b)) {
+        None => plan.delete.push(own.clone()),
+        Some(sh) => {
+            if !same(own, sh) {
+                plan.delete.push(own.clone());
+            }
+            let blockers = if all {
+                Vec::new()
+            } else {
+                shared_blockers(b, found)
+            };
+            if blockers.is_empty() {
+                plan.delete.push(sh.clone());
+            } else {
+                plan.kept = blockers;
+            }
+        }
+    }
+    plan
+}
+
 /// Whether two paths are the same file name-wise; Windows paths ignore case.
 pub fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
@@ -487,6 +536,63 @@ mod tests {
         assert_eq!(
             shared_registration(Os::Windows, &env(None)),
             Some(location(Chrome, Os::Windows, &env(None)))
+        );
+    }
+
+    #[test]
+    fn uninstall_plans() {
+        use Browser::*;
+        let env = env(None);
+        let loc = |b| location(b, Os::Windows, &env);
+        let shared = loc(Chrome);
+        // The distinct config dirs must not matter.
+        assert_ne!(loc(Vivaldi).config_dir, shared.config_dir);
+        let plan = |b, all, set: &'static [Browser]| {
+            uninstall_plan(b, &loc(b), Some(&shared), all, move |o| set.contains(&o))
+        };
+        let kept = |kept: &[Browser]| UninstallPlan {
+            delete: vec![],
+            kept: kept.to_vec(),
+        };
+        assert_eq!(plan(Vivaldi, false, &[Vivaldi, Chrome]), kept(&[Chrome]));
+        assert_eq!(
+            plan(Vivaldi, false, &[Vivaldi]),
+            UninstallPlan {
+                delete: vec![shared.clone()],
+                kept: vec![]
+            }
+        );
+        assert_eq!(
+            plan(Brave, false, &[Brave, Chrome]),
+            UninstallPlan {
+                delete: vec![loc(Brave)],
+                kept: vec![Chrome]
+            }
+        );
+        assert_eq!(plan(Chrome, false, &[Chrome, Vivaldi]), kept(&[Vivaldi]));
+        // Plain uninstall removes everything.
+        assert_eq!(
+            plan(Chrome, true, &[Chrome, Vivaldi]),
+            UninstallPlan {
+                delete: vec![shared.clone()],
+                kept: vec![]
+            }
+        );
+        // Outside the group, or without a shared registration: just its own.
+        assert_eq!(
+            plan(Edge, false, &[Edge, Chrome]),
+            UninstallPlan {
+                delete: vec![loc(Edge)],
+                kept: vec![]
+            }
+        );
+        let linux = location(Chrome, Os::Linux, &env);
+        assert_eq!(
+            uninstall_plan(Chrome, &linux, None, false, |_| true),
+            UninstallPlan {
+                delete: vec![linux],
+                kept: vec![]
+            }
         );
     }
 
