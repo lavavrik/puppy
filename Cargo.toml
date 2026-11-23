@@ -41,6 +41,9 @@ librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] 
 bytes = "1"
 humantime = "2.4.0"
 globset = "0.4"
+base64 = "0.22"
+webpki-root-certs = "1"
+rustls-native-certs = "0.8"
 
 # Release binaries (GitHub releases): `cargo build --profile dist`. Kept separate so
 # everyday `--release` builds stay quick.

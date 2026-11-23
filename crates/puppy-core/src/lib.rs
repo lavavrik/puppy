@@ -4,6 +4,7 @@ pub mod fsutil;
 pub mod http;
 pub mod limiter;
 pub mod meter;
+pub mod tls;
 pub mod types;
 
 pub use engine::{AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode};

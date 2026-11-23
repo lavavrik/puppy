@@ -321,3 +321,39 @@ fn cleanup_ignores_stale_pid_file() {
     let _ = bystander.wait();
     assert!(alive, "the cleanup killed an unrelated process");
 }
+
+/// A system without CA certificates (a minimal container without `ca-certificates`):
+/// the daemon falls back to puppy's bundled roots instead of failing to start, and the
+/// torrent engine (which builds its own HTTPS client) starts too.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_starts_without_system_ca_certificates() {
+    let mut env = Env::new();
+    let nowhere = env.home.path().join("no-certs");
+    env.extra = vec![
+        (
+            "SSL_CERT_FILE",
+            nowhere.join("ca.pem").to_str().unwrap().to_string(),
+        ),
+        ("SSL_CERT_DIR", nowhere.to_str().unwrap().to_string()),
+    ];
+    let s = TestServer::start(ServerCfg {
+        len: 64 * KIB,
+        ..ServerCfg::default()
+    })
+    .await;
+    let c = env.spawn_client().await.unwrap();
+    let id = c.add(env.req(&s, "a.bin"), false, None).await.unwrap();
+    wait_completed(&c, id).await;
+    env.assert_file("a.bin", 64 * KIB);
+
+    let paths = env.paths();
+    let pem = std::fs::read_to_string(paths.data_dir.join("ca-roots.pem")).unwrap();
+    assert!(
+        pem.matches("-----BEGIN CERTIFICATE-----").count() > 100,
+        "bundled roots"
+    );
+    let log = std::fs::read_to_string(paths.log_dir.join("puppyd.log")).unwrap();
+    assert!(log.contains("no CA certificates"), "{log}");
+    assert!(!log.contains("cannot start the torrent engine"), "{log}");
+}

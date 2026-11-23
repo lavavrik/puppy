@@ -276,6 +276,9 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if matches!(cli.command, Some(Command::Daemon { .. })) {
+        bundled_roots_for_daemon();
+    }
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -398,6 +401,20 @@ fn main() -> ExitCode {
 
 async fn act(json: bool, action: cli::control::Action, ids: Vec<String>) -> Result<(), CliError> {
     cli::control::act(&Ctx::from_env(json)?, action, targets(ids)).await
+}
+
+/// The daemon on a system without CA certificates (a minimal container): trust
+/// puppy's bundled roots instead of failing to build any HTTPS client. Runs before the
+/// async runtime exists, while this is the process's only thread.
+fn bundled_roots_for_daemon() {
+    // A failure to resolve the paths is reported by the daemon itself.
+    let Ok(paths) = Paths::resolve() else { return };
+    // SAFETY: no other thread has been started yet.
+    if let Err(e) = unsafe { puppy_core::tls::use_bundled_roots_if_missing(&paths.data_dir) } {
+        err(format_args!(
+            "puppy: cannot write the bundled CA certificates: {e}"
+        ));
+    }
 }
 
 async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {

@@ -135,6 +135,13 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         None => Paths::resolve().context("cannot set up the daemon's directories")?,
     };
     init_logging(&paths.log_dir);
+    if let Some(roots) = puppy_core::tls::bundled_roots_in_use() {
+        tracing::warn!(
+            "no CA certificates found on this system (install the ca-certificates package); \
+             trusting puppy's bundled roots in {}",
+            roots.display()
+        );
+    }
 
     // Held (open) until this function returns; closing it releases the lock.
     let Some(_lock) = acquire_lock(&paths.lock_file)? else {

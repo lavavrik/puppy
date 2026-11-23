@@ -94,9 +94,10 @@ Download the archive for your platform from the
 
 Each archive holds the `puppy` binary, the browser extension (`extension/`),
 the service files (`packaging/`), this README and the licenses. The Linux
-builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later)
-and the system's CA certificates (the `ca-certificates` package, present on
-any desktop; minimal containers may lack it).
+builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
+HTTPS trusts the system's CA certificates; on a system without any (a minimal
+container without `ca-certificates`), the daemon falls back to Mozilla's root
+list built into puppy and says so in its log.
 `SHA256SUMS` in the release lists every archive's checksum.
 
 **Linux and macOS:** put the binary on your `PATH`, e.g.

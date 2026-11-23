@@ -48,7 +48,20 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
     }
     builder
         .build()
-        .map_err(|e| EngineError::Network(e.to_string()))
+        .map_err(|e| EngineError::Network(error_chain(&e)))
+}
+
+/// `e` followed by its causes ("outer: inner"). reqwest's own text for a failed client
+/// build is just "builder error"; the cause says what went wrong.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        out.push_str(": ");
+        out.push_str(&c.to_string());
+        cause = c.source();
+    }
+    out
 }
 
 /// Bounds one wait on the network (response headers or the next body chunk) by `limit`.
@@ -288,5 +301,39 @@ fn decode_rfc5987(v: &str) -> Option<String> {
         "utf-8" | "" => String::from_utf8(bytes).ok(),
         "iso-8859-1" => Some(bytes.iter().map(|&b| b as char).collect()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_names_every_cause() {
+        let e = Layer(
+            "builder error",
+            Some(Box::new(Layer(
+                "no CA certificates found",
+                Some(Box::new(Layer("os error 2", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&e),
+            "builder error: no CA certificates found: os error 2"
+        );
+        assert_eq!(error_chain(&Layer("plain", None)), "plain");
     }
 }

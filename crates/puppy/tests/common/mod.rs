@@ -34,6 +34,8 @@ pub struct Env {
     pub socket: SocketName,
     /// Local seeders every torrent of the daemon starts with (`PUPPY_TORRENT_TEST_PEERS`).
     pub peers: Vec<std::net::SocketAddr>,
+    /// More environment for every `puppy` process of this test.
+    pub extra: Vec<(&'static str, String)>,
 }
 
 impl Env {
@@ -42,6 +44,7 @@ impl Env {
             home: tempfile::tempdir().unwrap(),
             socket: socket_name(),
             peers: Vec::new(),
+            extra: Vec::new(),
         }
     }
 
@@ -60,7 +63,7 @@ impl Env {
             SocketName::Pipe(n) => n.clone(),
         };
         let peers: Vec<String> = self.peers.iter().map(|p| p.to_string()).collect();
-        vec![
+        let mut vars = vec![
             ("PUPPY_TORRENT_TEST_PEERS", peers.join(",")),
             ("PUPPY_HOME", self.home.path().to_str().unwrap().to_string()),
             ("PUPPY_SOCKET", socket),
@@ -69,7 +72,9 @@ impl Env {
             ("PUPPY_TORRENT_TEST_MODE", "1".to_string()),
             // Never pop real desktop notifications from tests.
             ("PUPPY_NO_NOTIFY", "1".to_string()),
-        ]
+        ];
+        vars.extend(self.extra.iter().cloned());
+        vars
     }
 
     /// `Client::connect_or_spawn` with the real binary.
