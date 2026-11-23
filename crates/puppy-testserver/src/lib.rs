@@ -42,6 +42,8 @@ pub struct ServerCfg {
     /// Answer every request for the file with this status (e.g. 503), and abort the
     /// bodies being sent once it is set: the server "goes down".
     pub fail_status: Option<u16>,
+    /// Where `/away` redirects (an absolute URL, e.g. another server: a different origin).
+    pub redirect_to: Option<String>,
 }
 
 impl Default for ServerCfg {
@@ -64,6 +66,7 @@ impl Default for ServerCfg {
             slow_range_start: None,
             slow_bytes_per_sec: None,
             fail_status: None,
+            redirect_to: None,
         }
     }
 }
@@ -112,6 +115,11 @@ impl TestServer {
             axum::serve(listener, app).await.unwrap();
         });
         Self { shared, addr, task }
+    }
+
+    /// The port the server listens on (127.0.0.1).
+    pub fn port(&self) -> u16 {
+        self.addr.port()
     }
 
     pub fn url(&self, path: &str) -> url::Url {
@@ -218,6 +226,15 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
         return Response::builder()
             .status(StatusCode::FOUND)
             .header(header::LOCATION, "/file.bin")
+            .body(Body::empty())
+            .unwrap();
+    }
+    if path == "/away"
+        && let Some(to) = sh.cfg.lock().unwrap().redirect_to.clone()
+    {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, to)
             .body(Body::empty())
             .unwrap();
     }

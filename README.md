@@ -184,6 +184,11 @@ JSON value (`watch` excepted):
   `puppy --json watch | jq` works; without `--json` it prints lines like
   `14:02:11 completed 3 a.iso` and leaves out snapshots.
 
+`-H` and `--cookie` are sent to the URL you give and to redirect targets on
+the same origin (scheme, host and port). A redirect to another origin gets no
+cookies and no `Cookie`, `Authorization` or `Proxy-Authorization` header; the
+referer, user agent and other headers still go along.
+
 `ls --state` takes `queued`, `starting`, `active`, `paused`, `completed`
 (completed only, not seeding), `done` (finished downloading: completed or
 seeding), `choosing`, `seeding`, `failed` (for good), `retrying` and
@@ -362,7 +367,8 @@ downloads to puppy. It talks to puppy through the browser's native messaging,
 so no network port is opened. Firefox is not supported yet.
 
 1. **Install the native host.** `puppy browser install` registers it for every
-   browser found; `--browser chrome|chromium|brave|edge|vivaldi` forces one.
+   browser found; `--browser chrome|chromium|brave|edge|vivaldi` picks one, and
+   `--force` with it registers that browser even if it is not found.
    `puppy browser status` shows what is registered, and `puppy browser
    uninstall` removes it. Re-run `install` after moving the puppy binary
    (`status` then says "stale").
@@ -390,8 +396,10 @@ so no network port is opened. Firefox is not supported yet.
   browser.
 - POST-backed (form) downloads can't be detected, and may fail in puppy. Use
   the bypass (toolbar button or Alt+Shift+B) for them.
-- Cookies are read for the original URL only, so a redirect to another host
-  gets none.
+- Cookies are read for the original URL only. If that URL redirects to another
+  origin (a different scheme, host or port), the target gets none of them, and
+  no basic-auth credentials or `Cookie`/`Authorization` headers either. A
+  download whose redirect target needs a login fails in puppy.
 - CHIPS partitioned cookies are not read below Chrome 119.
 - "Ask where to save each file" is not mirrored: files go to puppy's folder.
 - Re-downloading a completed download after a post-completion recheck failure

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { handleDownload, resumeStranded, FINISHED_FIRST } from "../lib/takeover.js";
 import { armBypass, getRecent, getStatus } from "../lib/state.js";
 import { HOST_NAME } from "../lib/native.js";
-import { fakeApi, item, until } from "./fake-chrome.js";
+import { fakeApi, item, until, acceptAs } from "./fake-chrome.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -231,13 +231,116 @@ test("paused downloads are remembered until the takeover is done", async () => {
   const api = setup({ reply: (m) => new Promise((r) => (answer = () => r({ id: m.id, type: "accepted", download_id: 3 }))) });
   const r = start(api);
   await until(() => has(api, "send"));
-  assert.deepEqual(api.storage.session.data.paused, [7]);
+  assert.deepEqual(api.storage.session.data.paused, [{ id: 7 }]);
   answer();
   await r.outcome;
   assert.deepEqual(api.storage.session.data.paused, []);
   const left = setup({ settings: { enabled: false } });
   await run(left);
   assert.equal(left.storage.session.data.paused, undefined, "never paused, never remembered");
+});
+
+test("puppy's id is recorded before the browser copy is cancelled", async () => {
+  const api = setup();
+  let atCancel;
+  const cancel = api.downloads.cancel;
+  api.downloads.cancel = async (id) => {
+    atCancel = structuredClone(api.storage.session.data.paused);
+    return cancel(id);
+  };
+  assert.equal((await run(api)).kind, "taken");
+  assert.deepEqual(atCancel, [{ id: 7, puppyId: 3 }]);
+  assert.deepEqual(api.storage.session.data.paused, []);
+});
+
+test("a stranded download puppy had accepted is removed from puppy and resumed", async () => {
+  const api = fakeApi({
+    session: { paused: [{ id: 5, puppyId: 40 }, { id: 6, puppyId: 41 }, { id: 8, puppyId: 42 }, { id: 9 }] },
+    downloads: [
+      item({ id: 5, paused: true }),
+      // Finished in the browser meanwhile: puppy's copy is the second one.
+      item({ id: 6, state: "complete", paused: false }),
+      // 8 is gone: it was cancelled after puppy took it, so puppy's copy is the only one.
+      item({ id: 9, paused: true }),
+    ],
+    reply: (m) => ({ id: m.id, type: "removed" }),
+  });
+  await resumeStranded(api);
+  const removes = sends(api);
+  assert.deepEqual(
+    removes.map((m) => [m.type, m.download_id, m.delete_files, m.protocol]),
+    [
+      ["remove", 40, true, 1],
+      ["remove", 41, true, 1],
+    ],
+  );
+  assert.deepEqual(api.calls.filter((c) => c[0] === "resume"), [["resume", 5], ["resume", 9]]);
+  assert.equal(api.storage.session.data.paused, undefined);
+});
+
+test("a throw after the pause resumes the browser download", async () => {
+  // markPaused fails.
+  const marking = setup();
+  const set = marking.storage.session.set;
+  marking.storage.session.set = async (items) => {
+    if ("paused" in items) throw new Error("session storage broke");
+    return set(items);
+  };
+  const a = start(marking);
+  await assert.rejects(a.outcome, /session storage broke/);
+  assert.equal(a.releases(), 1);
+  assert.ok(has(marking, "pause", 7) && has(marking, "resume", 7));
+  assert.ok(at(marking, "resume") < at(marking, "release"));
+  assert.ok(!has(marking, "send"));
+
+  // The search fails.
+  const searching = setup();
+  searching.downloads.search = async () => {
+    throw new Error("search broke");
+  };
+  const b = start(searching);
+  await assert.rejects(b.outcome, /search broke/);
+  assert.equal(b.releases(), 1);
+  assert.ok(has(searching, "resume", 7));
+  assert.ok(!has(searching, "send"));
+});
+
+test("a throw after the browser copy is cancelled does not resume it", async () => {
+  const api = setup();
+  const set = api.storage.session.set;
+  api.storage.session.set = async (items) => {
+    if ("recent" in items) throw new Error("recent broke");
+    return set(items);
+  };
+  await assert.rejects(start(api).outcome, /recent broke/);
+  assert.ok(has(api, "cancel", 7));
+  assert.ok(!has(api, "resume"));
+});
+
+test("a cached mismatch older than a minute is checked again", async () => {
+  const t0 = 1_000_000;
+  const helloOk = (m) => ({ id: m.id, type: "hello", protocol: 1, puppy_version: "1", daemon_version: "1", daemon_error: null });
+  const reply = (m) => (m.type === "hello" ? helloOk(m) : acceptAs(3)(m));
+  // Fresh: left without asking.
+  const fresh = setup({ reply, session: { status: { state: "mismatch", at: t0 } } });
+  assert.deepEqual(await run(fresh, item(), { now: () => t0 + 30_000 }), { kind: "left", reason: "protocol mismatch" });
+  assert.deepEqual(sends(fresh), []);
+  // Stale, and puppy was updated meanwhile: taken.
+  const stale = setup({ reply, session: { status: { state: "mismatch", at: t0 } } });
+  assert.deepEqual(await run(stale, item(), { now: () => t0 + 61_000 }), { kind: "taken", downloadId: 3 });
+  assert.deepEqual(sends(stale).map((m) => m.type), ["hello", "add"]);
+  assert.equal((await getStatus(stale)).state, "ok");
+  // Stale and still a mismatch: left, the new status cached.
+  const still = setup({
+    reply: (m) => ({ ...helloOk(m), protocol: 2 }),
+    session: { status: { state: "mismatch", at: t0 } },
+  });
+  assert.deepEqual(await run(still, item(), { now: () => t0 + 61_000 }), { kind: "left", reason: "protocol mismatch" });
+  assert.deepEqual(sends(still).map((m) => m.type), ["hello"]);
+  assert.ok(!has(still, "pause"));
+  const status = await getStatus(still);
+  assert.equal(status.state, "mismatch");
+  assert.equal(status.hostProtocol, 2);
 });
 
 test("stranded paused downloads are resumed", async () => {

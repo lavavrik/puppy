@@ -51,7 +51,10 @@ fn remove_registration(loc: &Location) -> anyhow::Result<bool> {
     Ok(any)
 }
 
-pub async fn install(json_out: bool, only: Option<Browser>) -> Result<(), CliError> {
+/// Registers for every browser found, or only `only`. A browser that is not found is
+/// skipped, or (named with `only`) an error unless `force`: its config dir, where the
+/// Linux and macOS manifests live, is never created on a guess.
+pub async fn install(json_out: bool, only: Option<Browser>, force: bool) -> Result<(), CliError> {
     let os = Os::current();
     let env = BrowserEnv::from_env()?;
     let exe = canonical_exe()?;
@@ -62,9 +65,18 @@ pub async fn install(json_out: bool, only: Option<Browser>) -> Result<(), CliErr
     let (mut installed, mut skipped) = (Vec::new(), Vec::new());
     for b in targets(only) {
         let loc = location(b, os, &env);
-        if only.is_none() && !loc.config_dir.exists() {
-            skipped.push(b.name());
-            continue;
+        if !loc.config_dir.exists() {
+            if only.is_none() {
+                skipped.push(b.name());
+                continue;
+            }
+            if !force {
+                return Err(CliError::Other(anyhow::anyhow!(
+                    "{} not found (no {}); use --force to register anyway",
+                    b.name(),
+                    loc.config_dir.display()
+                )));
+            }
         }
         write_registration(&loc, &bytes).await?;
         // Windows: Brave gets its own key and, as a fallback, the shared (Chrome) one.
@@ -89,7 +101,7 @@ pub async fn install(json_out: bool, only: Option<Browser>) -> Result<(), CliErr
     if installed.is_empty() {
         return Err(CliError::Other(anyhow::anyhow!(
             "no Chrome-family browser found (Flatpak and Snap browsers are not supported); \
-             use --browser <name> to install for one anyway"
+             use --browser <name> --force to install for one anyway"
         )));
     }
     if json_out {

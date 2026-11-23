@@ -2940,6 +2940,7 @@ dependencies = [
  "crossterm",
  "fs4",
  "humantime",
+ "interprocess",
  "libc",
  "librqbit",
  "percent-encoding",

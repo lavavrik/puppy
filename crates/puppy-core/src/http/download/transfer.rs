@@ -257,10 +257,11 @@ impl Inner {
             Some(_) => None,
             None => r.last_modified.clone(),
         };
+        let url = self.lock().final_url.clone();
         WorkerCtx {
             client: self.client.clone(),
-            url: self.lock().final_url.clone(),
-            context: self.request.context.clone(),
+            context: self.context_for(&url),
+            url,
             if_range,
             expected_total: r.total,
             file,

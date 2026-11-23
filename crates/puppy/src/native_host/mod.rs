@@ -144,13 +144,13 @@ impl<C: Connector> Host<C> {
             Err((id, why)) => return error(id, ErrorKind::BadMessage, why),
         };
         let id = env.id;
-        if !matches!(env.body, Incoming::Hello { .. }) && env.protocol != HOST_PROTOCOL {
+        if !matches!(env.body, Incoming::Hello { .. }) && env.protocol != Some(HOST_PROTOCOL) {
             return error(
                 Some(id),
                 ErrorKind::ProtocolMismatch,
                 format!(
                     "the extension speaks host protocol {}, this puppy speaks {HOST_PROTOCOL}",
-                    env.protocol
+                    env.protocol.unwrap_or_default()
                 ),
             );
         }
@@ -177,8 +177,11 @@ impl<C: Connector> Host<C> {
                     Err(why) => return error(Some(id), ErrorKind::Refused, why),
                 };
                 // Never retried: the daemon may have added it before a reply was lost.
+                // Nor timed out: the extension has given the download back to the
+                // browser by then, and only a late `accepted` lets it drop one copy;
+                // an `unreachable` here would leave the daemon's copy running too.
                 let added = match self.client().await {
-                    Ok(c) => c.add(req, false, None).await,
+                    Ok(c) => c.add_unbounded(req).await,
                     Err(e) => Err(e),
                 };
                 match added {
@@ -571,6 +574,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hello_without_protocol_gets_the_versions() {
+        let r = exchange(
+            Failing,
+            &[json!({"id": "h1", "type": "hello", "extension_version": "9.0.0"})],
+        )
+        .await;
+        assert_eq!(r[0]["id"], "h1");
+        assert_eq!(r[0]["type"], "hello");
+        assert_eq!(r[0]["protocol"], HOST_PROTOCOL);
+        assert_eq!(r[0]["puppy_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn empty_frame_is_a_bad_message_and_serving_goes_on() {
+        let bodies = vec![Vec::new(), serde_json::to_vec(&hello("h1")).unwrap()];
+        let r = exchange_raw(Failing, &bodies).await;
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(r[0]["id"], Value::Null);
+        assert_eq!(r[0]["code"], "bad_message");
+        assert_eq!(r[1]["type"], "hello");
+    }
+
+    #[tokio::test]
+    async fn overlong_id_is_not_echoed() {
+        let mut h = hello("h1");
+        h["id"] = json!("i".repeat(message::MAX_ID_BYTES + 1));
+        let r = exchange(Failing, &[h]).await;
+        assert_eq!(r[0]["id"], Value::Null);
+        assert_eq!(r[0]["code"], "bad_message");
+    }
+
+    #[tokio::test]
     async fn oversized_message_is_answered_then_ends_serving() {
         let input = ((framing::MAX_IN + 1) as u32).to_ne_bytes();
         let mut out = Vec::new();
@@ -591,6 +626,106 @@ mod tests {
         assert_eq!(r[1]["type"], "accepted", "{r:?}");
         assert_eq!(c.calls.load(Ordering::SeqCst), 1);
         d.stop().await;
+    }
+
+    /// Hands out one already connected client.
+    struct Given(Option<Client>);
+
+    impl Connector for Given {
+        async fn connect(&mut self) -> Result<Client, ClientError> {
+            self.0.take().ok_or(ClientError::Disconnected)
+        }
+    }
+
+    /// A daemon stub on its own thread (real time): answers `hello`, then holds the
+    /// reply to the first `add` until `go` fires, and answers it `Added { id: 7 }`.
+    fn stalling_daemon(socket: SocketName, go: std::sync::mpsc::Receiver<()>) {
+        use interprocess::local_socket::tokio::prelude::*;
+        use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
+        use puppy_proto::{Envelope, MsgReader, PROTOCOL_VERSION, ReplyData, ServerMsg, write_msg};
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let name = match &socket {
+                    SocketName::Path(p) => p.as_path().to_fs_name::<GenericFilePath>().unwrap(),
+                    SocketName::Pipe(n) => n.as_str().to_ns_name::<GenericNamespaced>().unwrap(),
+                };
+                let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+                ready_tx.send(()).unwrap();
+                let conn = listener.accept().await.unwrap();
+                let (rd, mut wr) = tokio::io::split(conn);
+                let mut rd = MsgReader::new(tokio::io::BufReader::new(rd));
+                let ok = |req_id, data| ServerMsg::Response {
+                    req_id,
+                    result: puppy_proto::Reply::Ok { data },
+                };
+                while let Ok(Some(env)) = rd.next::<Envelope<Request>>().await {
+                    let data = match env.body {
+                        Request::Hello { .. } => ReplyData::Hello {
+                            daemon_version: "stub".into(),
+                            protocol: PROTOCOL_VERSION,
+                        },
+                        Request::Add { .. } => {
+                            tokio::task::spawn_blocking(move || go.recv().unwrap())
+                                .await
+                                .unwrap();
+                            let msg = ok(env.req_id, ReplyData::Added { id: 7 });
+                            write_msg(&mut wr, &msg).await.unwrap();
+                            break;
+                        }
+                        _ => ReplyData::Done,
+                    };
+                    write_msg(&mut wr, &ok(env.req_id, data)).await.unwrap();
+                }
+                // Keep the connection open until the host hangs up.
+                let _ = rd.next::<Envelope<Request>>().await;
+            });
+        });
+        ready.recv().unwrap();
+    }
+
+    /// A slow daemon reply to `add` is waited for, however long it takes: an
+    /// `unreachable` answer would make the extension hand the download back to the
+    /// browser while the daemon adds it too.
+    #[tokio::test]
+    async fn slow_add_reply_is_waited_for() {
+        let socket = socket_name();
+        let (go_tx, go) = std::sync::mpsc::channel();
+        stalling_daemon(socket.clone(), go);
+        let client = Client::connect(&socket, "test").await.unwrap();
+        // From here on the clock only moves when everything waits.
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(puppy_client::CALL_TIMEOUT + Duration::from_secs(5)).await;
+            // Real time again: the stub's reply takes real time to arrive.
+            tokio::time::resume();
+            go_tx.send(()).unwrap();
+        });
+        let (mut browser, host_in) = tokio::io::duplex(1 << 16);
+        let body = serde_json::to_vec(&add("a1", NEVER)).unwrap();
+        browser.write_all(&frame(&body)).await.unwrap();
+        drop(browser);
+        let mut out = Vec::new();
+        let served = serve(host_in, &mut out, Given(Some(client)));
+        tokio::time::timeout(Duration::from_secs(300), served)
+            .await
+            .expect("serve hung")
+            .unwrap();
+        let r = decode(&out);
+        release.await.unwrap();
+        assert_eq!(
+            r,
+            vec![json!({"id": "a1", "type": "accepted", "download_id": 7})]
+        );
+        assert!(start.elapsed() > puppy_client::CALL_TIMEOUT);
+        if let SocketName::Path(p) = &socket {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[tokio::test]

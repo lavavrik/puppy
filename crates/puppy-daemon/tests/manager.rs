@@ -1642,9 +1642,12 @@ async fn unfinished_download_keeps_its_context() {
         .unwrap();
     wait_active_with_bytes(&m, id).await;
     assert!(m.save_state(TIMEOUT).await);
+    let context = &stored(&env, id)["request"]["context"];
+    assert_eq!(context["cookies"], "sid=COOKIESECRET");
+    // Kept so the download can still resume after a restart.
     assert_eq!(
-        stored(&env, id)["request"]["context"]["cookies"],
-        "sid=COOKIESECRET"
+        context["basic_auth"],
+        serde_json::json!(["alice", "PWSECRET"])
     );
     m.shutdown().await;
 }

@@ -20,7 +20,7 @@ use crate::http::worker::{SegmentShared, is_url_rejected};
 use crate::limiter::TokenBucket;
 use crate::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
-    SegmentView, Source,
+    RequestContext, SegmentView, Source,
 };
 use files::{blocking, open_part, prepare};
 use std::fs::File;
@@ -450,6 +450,15 @@ impl HttpDownload {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The request context for a request to `target` (the final URL, possibly on another
+    /// origin than the source): see [`RequestContext::for_target`].
+    fn context_for(&self, target: &url::Url) -> RequestContext {
+        match &self.request.source {
+            Source::Http { url } => self.request.context.for_target(url, target),
+            _ => RequestContext::default(),
+        }
     }
 
     /// Records a transition and emits `StateChanged` (repeated states are not re-emitted).

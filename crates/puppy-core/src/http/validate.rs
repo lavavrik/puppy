@@ -6,7 +6,7 @@ use crate::engine::EngineError;
 use crate::http::probe::{apply_context, timed};
 use crate::http::resume::HttpResumeState;
 use crate::http::worker::{compressed, parse_content_range};
-use crate::types::RequestContext;
+use crate::types::{RequestContext, Source};
 use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use std::io::{Read, Seek, SeekFrom};
@@ -37,6 +37,11 @@ pub async fn validate_remote(
     cfg: &HttpConfig,
 ) -> Result<Validation, EngineError> {
     let limit = Duration::from_millis(cfg.validate_timeout_ms);
+    // Validation goes to the final URL, which may be another origin than the source.
+    let ctx = &match &state.request.source {
+        Source::Http { url } => ctx.for_target(url, &state.final_url),
+        _ => RequestContext::default(),
+    };
     let net = Net {
         client,
         ctx,

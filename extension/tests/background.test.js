@@ -29,8 +29,12 @@ test("background registers its listeners", async () => {
 });
 
 test("startup and install record the hello status", async () => {
+  // Stranded downloads are resumed at worker start only, not again on startup.
+  await api.storage.session.set({ paused: [{ id: 5 }] });
   const before = api.calls.length;
   await Promise.all(api.runtime.onStartup.fire());
+  assert.ok(!api.calls.slice(before).some((c) => c[0] === "resume"));
+  await api.storage.session.remove("paused");
   // The default fake reply is not a hello reply; the status records an error.
   const msg = api.calls.slice(before).find((c) => c[0] === "send")[2];
   assert.equal(msg.type, "hello");

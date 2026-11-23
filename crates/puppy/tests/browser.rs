@@ -224,13 +224,40 @@ mod install {
         assert_eq!(st.code(), Some(1));
         assert!(err.contains("--browser"), "{err}");
 
+        // One named browser that is not there: nothing is created without --force.
         let (st, _, err) = run(
             &env,
             &home,
             &["browser", "install", "--browser", "chromium"],
         );
+        assert_eq!(st.code(), Some(1), "{err}");
+        assert!(
+            err.contains("chromium not found") && err.contains("--force"),
+            "{err}"
+        );
+        assert!(!chromium(&home).0.exists());
+        assert!(!home.join(".config").exists() && !home.join("Library").exists());
+
+        let (st, _, err) = run(
+            &env,
+            &home,
+            &["browser", "install", "--browser", "chromium", "--force"],
+        );
         assert!(st.success(), "{err}");
         assert!(chromium(&home).1.exists());
+    }
+
+    #[test]
+    fn install_for_a_found_browser_creates_only_the_hosts_dir() {
+        let env = Env::new();
+        let home = fake_home(&env);
+        let (c, cm) = chrome(&home);
+        std::fs::create_dir_all(&c).unwrap();
+        let (st, _, err) = run(&env, &home, &["browser", "install", "--browser", "chrome"]);
+        assert!(st.success(), "{err}");
+        assert!(cm.exists());
+        // No other browser's config dir appeared.
+        assert!(!chromium(&home).0.exists() && !brave(&home).0.exists());
     }
 
     #[test]

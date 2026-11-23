@@ -312,6 +312,21 @@ impl Client {
     /// Sends a request and waits (up to [`CALL_TIMEOUT`]) for its reply. Error replies
     /// become [`ClientError::Daemon`].
     pub async fn call(&self, req: Request) -> Result<ReplyData, ClientError> {
+        self.call_within(req, Some(CALL_TIMEOUT)).await
+    }
+
+    /// Like [`call`](Self::call), but waits for the reply however long it takes (until
+    /// it arrives or the connection closes). For requests whose effect must not be
+    /// mistaken for a failure, e.g. an `add` the caller would otherwise hand elsewhere.
+    pub async fn call_unbounded(&self, req: Request) -> Result<ReplyData, ClientError> {
+        self.call_within(req, None).await
+    }
+
+    async fn call_within(
+        &self,
+        req: Request,
+        limit: Option<Duration>,
+    ) -> Result<ReplyData, ClientError> {
         let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let rx = self.shared.register(req_id)?;
         let _unregister = Unregister(&self.shared, req_id);
@@ -323,9 +338,12 @@ impl Client {
                 Err(_) => Err(ClientError::Disconnected),
             }
         };
-        let reply = timeout(CALL_TIMEOUT, exchange)
-            .await
-            .map_err(|_| ClientError::Timeout)??;
+        let reply = match limit {
+            Some(limit) => timeout(limit, exchange)
+                .await
+                .map_err(|_| ClientError::Timeout)??,
+            None => exchange.await?,
+        };
         reply_data(reply)
     }
 
@@ -370,17 +388,22 @@ impl Client {
         start_paused: bool,
         limit: Option<u64>,
     ) -> Result<DownloadId, ClientError> {
-        match self
-            .call(Request::Add {
-                request: req,
-                start_paused,
-                limit,
-            })
-            .await?
-        {
-            ReplyData::Added { id } => Ok(id),
-            other => Err(unexpected(other)),
-        }
+        let req = Request::Add {
+            request: req,
+            start_paused,
+            limit,
+        };
+        added(self.call(req).await?)
+    }
+
+    /// [`add`](Self::add) without [`CALL_TIMEOUT`]: waits for the daemon's answer.
+    pub async fn add_unbounded(&self, req: AddRequest) -> Result<DownloadId, ClientError> {
+        let req = Request::Add {
+            request: req,
+            start_paused: false,
+            limit: None,
+        };
+        added(self.call_unbounded(req).await?)
     }
 
     /// All downloads, in queue order.
@@ -551,6 +574,13 @@ fn reply_data(reply: Reply) -> Result<ReplyData, ClientError> {
     match reply {
         Reply::Ok { data } => Ok(data),
         Reply::Err { code, message } => Err(ClientError::Daemon { code, message }),
+    }
+}
+
+fn added(data: ReplyData) -> Result<DownloadId, ClientError> {
+    match data {
+        ReplyData::Added { id } => Ok(id),
+        other => Err(unexpected(other)),
     }
 }
 

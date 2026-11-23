@@ -958,6 +958,27 @@ mod tests {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
+    /// Entering `Seeding` means the data is complete: the stored record drops its
+    /// cookies and credentials then, not only on `Completed`.
+    #[tokio::test]
+    async fn seeding_transition_clears_the_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("state.json"));
+        let m = Manager::start(Vec::new(), store, Config::default())
+            .await
+            .unwrap();
+        let mut fx = Effects::default();
+        let mut e = entry(DownloadState::Active);
+        e.rec.request.context = puppy_core::types::RequestContext {
+            cookies: Some("sid=COOKIESECRET".into()),
+            basic_auth: Some(("alice".into(), Some("PWSECRET".into()))),
+            ..Default::default()
+        };
+        assert!(m.inner.transition(1, &mut e, seeding(0), &mut fx));
+        assert_eq!(e.rec.request.context, Default::default());
+        m.shutdown().await;
+    }
+
     /// Data completing emits `Completed` (once), seeding stopping `SeedingFinished`
     /// (once, however it is learned); new counters alone are no change.
     #[tokio::test]

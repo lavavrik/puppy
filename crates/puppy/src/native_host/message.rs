@@ -11,15 +11,31 @@ use serde::{Deserialize, Serialize};
 pub const HOST_PROTOCOL: u32 = 1;
 /// Error messages are cut to this many characters.
 pub const MAX_MESSAGE_CHARS: usize = 1000;
+/// Longest request id (in bytes) the host echoes; a longer one is a `bad_message`.
+pub const MAX_ID_BYTES: usize = 256;
 
 /// A request from the extension: its id (echoed in the reply), the protocol it
-/// speaks and what it asks.
-#[derive(Deserialize, Debug)]
+/// speaks and what it asks. `protocol` may be missing only from a `hello` (so an
+/// extension of any protocol learns the host's versions); [`parse`] refuses any other
+/// request without it.
+#[derive(Deserialize)]
 pub struct Envelope {
     pub id: String,
-    pub protocol: u32,
+    #[serde(default)]
+    pub protocol: Option<u32>,
     #[serde(flatten)]
     pub body: Incoming,
+}
+
+/// The body's cookies and credentials are never printed (see [`AddMsg`]).
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Envelope")
+            .field("id", &self.id)
+            .field("protocol", &self.protocol)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -41,7 +57,7 @@ pub enum Incoming {
 
 /// A download the browser hands over. `final_url` (after redirects) is diagnostic
 /// only: puppy fetches `url` and follows redirects itself.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Default)]
 pub struct AddMsg {
     pub url: String,
     #[allow(dead_code)]
@@ -55,6 +71,36 @@ pub struct AddMsg {
     pub cookies: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+}
+
+/// Cookies and the passwords in URLs are never printed: a stray `{:?}` must not leak
+/// them.
+impl std::fmt::Debug for AddMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const HIDDEN: &str = "<redacted>";
+        f.debug_struct("AddMsg")
+            .field("url", &redact_password(&self.url))
+            .field("final_url", &self.final_url.as_deref().map(redact_password))
+            .field("filename", &self.filename)
+            .field("referrer", &self.referrer.as_deref().map(redact_password))
+            .field("cookies", &self.cookies.as_ref().map(|_| HIDDEN))
+            .field("user_agent", &self.user_agent)
+            .finish()
+    }
+}
+
+/// `url` with any password replaced; an unparsable URL is hidden as a whole, since it
+/// may still hold one.
+fn redact_password(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            if u.password().is_some() {
+                let _ = u.set_password(Some("redacted"));
+            }
+            u.to_string()
+        }
+        Err(_) => "<unparsable URL>".to_string(),
+    }
 }
 
 /// A reply to the extension; `id` is the request's, `None` when it could not be read.
@@ -98,13 +144,28 @@ pub enum ErrorKind {
 }
 
 /// Reads a request. `Err`: the request's id when it is readable, and why it failed.
+/// An id over [`MAX_ID_BYTES`] is never echoed (`None`).
 pub fn parse(bytes: &[u8]) -> Result<Envelope, (Option<String>, String)> {
-    serde_json::from_slice(bytes).map_err(|e| {
+    let env: Envelope = serde_json::from_slice(bytes).map_err(|e| {
         let id = serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
-            .and_then(|v| v.get("id")?.as_str().map(str::to_owned));
+            .and_then(|v| v.get("id")?.as_str().map(str::to_owned))
+            .filter(|id| id.len() <= MAX_ID_BYTES);
         (id, format!("unreadable message: {e}"))
-    })
+    })?;
+    if env.id.len() > MAX_ID_BYTES {
+        return Err((
+            None,
+            format!("the request id is longer than {MAX_ID_BYTES} bytes"),
+        ));
+    }
+    if env.protocol.is_none() && !matches!(env.body, Incoming::Hello { .. }) {
+        return Err((
+            Some(env.id),
+            "unreadable message: missing field `protocol`".into(),
+        ));
+    }
+    Ok(env)
 }
 
 /// The daemon request for a browser download: puppy's own download folder, the
@@ -303,10 +364,48 @@ mod tests {
     }
 
     #[test]
+    fn debug_redacts_cookies_and_passwords() {
+        let e = parse(
+            br#"{"id":"r1","protocol":1,"type":"add","url":"https://u:PWSECRET@h/f","final_url":"https://u:PW2SECRET@c/f","referrer":"https://r:PW3SECRET@r/","cookies":"sid=COOKIESECRET"}"#,
+        )
+        .unwrap();
+        let s = format!("{e:?}");
+        for secret in ["PWSECRET", "PW2SECRET", "PW3SECRET", "COOKIESECRET"] {
+            assert!(!s.contains(secret), "{s}");
+        }
+        assert!(s.contains("r1") && s.contains("h/f"), "{s}");
+    }
+
+    #[test]
+    fn ids_are_capped() {
+        let long = "x".repeat(MAX_ID_BYTES + 1);
+        let ok = "x".repeat(MAX_ID_BYTES);
+        let msg = |id: &str, ty: &str| {
+            format!(r#"{{"id":"{id}","protocol":1,"type":"{ty}","download_id":1}}"#).into_bytes()
+        };
+        assert_eq!(parse(&msg(&ok, "remove")).unwrap().id, ok);
+        let (id, why) = parse(&msg(&long, "remove")).unwrap_err();
+        assert_eq!(id, None);
+        assert!(why.contains("256"), "{why}");
+        // Also when the message is unreadable for another reason.
+        let (id, _) = parse(&msg(&long, "nope")).unwrap_err();
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn protocol_may_be_missing_only_from_hello() {
+        let e = parse(br#"{"id":"h1","type":"hello","extension_version":"9"}"#).unwrap();
+        assert_eq!(e.protocol, None);
+        let (id, why) = parse(br#"{"id":"r1","type":"remove","download_id":1}"#).unwrap_err();
+        assert_eq!(id.as_deref(), Some("r1"));
+        assert!(why.contains("protocol"), "{why}");
+    }
+
+    #[test]
     fn envelopes_and_replies() {
         let e = parse(br#"{"id":"r1","protocol":1,"type":"remove","download_id":7}"#).unwrap();
         assert_eq!(e.id, "r1");
-        assert_eq!(e.protocol, 1);
+        assert_eq!(e.protocol, Some(1));
         assert!(
             matches!(
                 e.body,

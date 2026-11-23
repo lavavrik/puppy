@@ -860,3 +860,107 @@ async fn restore_after_kill_mid_steal() {
     assert_file(&final_path, LEN, 0);
     assert_no_leftovers(&final_path);
 }
+
+fn secret_context() -> RequestContext {
+    RequestContext {
+        cookies: Some("session=topsecret".into()),
+        basic_auth: Some(("user".into(), Some("hunter2".into()))),
+        headers: vec![
+            ("X-Token".into(), "tok".into()),
+            ("authorization".into(), "Bearer hdr-secret".into()),
+            ("Proxy-Authorization".into(), "Basic proxy-secret".into()),
+            ("COOKIE".into(), "hdr=cookie".into()),
+        ],
+        referer: Some("https://example.com/page".into()),
+        user_agent: Some("TestAgent/1".into()),
+    }
+}
+
+/// A redirect to another origin (host and port) must not carry the original host's
+/// cookies or credentials to the target: not on the probe, not on segment requests, not
+/// on the validation after a restart.
+#[tokio::test]
+async fn cross_origin_redirect_target_gets_no_credentials() {
+    let target = server(|_| {}).await;
+    let to = format!("http://localhost:{}/file.bin", target.port());
+    let origin = server(|c| c.redirect_to = Some(to)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&origin, dir.path());
+    req.source = Source::Http {
+        url: origin.url("/away"),
+    };
+    req.context = secret_context();
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    let before_restore = target.requests_seen().len();
+    target.set_cfg(|c| c.bytes_per_sec = None);
+    let (tx, _) = broadcast::channel(256);
+    let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+
+    let seen = target.requests_seen();
+    assert!(seen.len() > before_restore, "no request after the restore");
+    assert!(seen.len() >= 3, "{} requests", seen.len());
+    for h in &seen {
+        assert!(h.get("cookie").is_none(), "cookie leaked: {h:?}");
+        assert!(h.get("authorization").is_none(), "auth leaked: {h:?}");
+        assert!(h.get("proxy-authorization").is_none(), "proxy auth leaked");
+        assert_eq!(h.get("user-agent").unwrap(), "TestAgent/1");
+        assert_eq!(h.get("x-token").unwrap(), "tok");
+    }
+    // Requests sent straight to the target keep the referer (on the redirect hop itself
+    // reqwest substitutes the redirecting URL).
+    let with_referer = seen
+        .iter()
+        .filter(|h| {
+            h.get("referer")
+                .is_some_and(|r| r == "https://example.com/page")
+        })
+        .count();
+    assert!(
+        with_referer >= 2,
+        "{with_referer} requests kept the referer"
+    );
+    // The original host did get them.
+    let first = &origin.requests_seen()[0];
+    assert!(first.get("cookie").is_some());
+    assert!(first.get("authorization").is_some());
+}
+
+#[tokio::test]
+async fn same_origin_redirect_keeps_credentials() {
+    let s = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&s, dir.path());
+    req.source = Source::Http {
+        url: s.url("/redirect"),
+    };
+    req.context = RequestContext {
+        cookies: Some("session=topsecret".into()),
+        basic_auth: Some(("user".into(), Some("hunter2".into()))),
+        ..RequestContext::default()
+    };
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    s.set_cfg(|c| c.bytes_per_sec = None);
+    let (tx, _) = broadcast::channel(256);
+    let (dl, _) = restore_req(req, &added.path, cfg(dir.path()), AddOptions::default(), tx).await;
+    wait_completed(&dl).await;
+    let paths = s.paths_seen();
+    let seen = s.requests_seen();
+    let to_file: Vec<_> = paths
+        .iter()
+        .zip(&seen)
+        .filter(|(p, _)| *p == "/file.bin")
+        .collect();
+    assert!(to_file.len() >= 3);
+    for (_, h) in to_file {
+        assert_eq!(h.get("cookie").unwrap(), "session=topsecret");
+        assert!(h.get("authorization").is_some());
+    }
+}

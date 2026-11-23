@@ -22,6 +22,32 @@ pub struct RequestContext {
     pub basic_auth: Option<(String, Option<String>)>,
 }
 
+impl RequestContext {
+    /// The context for a request to `target` on behalf of a download of `original` (e.g.
+    /// its redirect target). On another origin (scheme, host or port) the original host's
+    /// cookies and credentials are dropped, including `Cookie`, `Authorization` and
+    /// `Proxy-Authorization` given as headers; the referer, user agent and other headers
+    /// are kept.
+    pub fn for_target(&self, original: &url::Url, target: &url::Url) -> RequestContext {
+        if original.origin() == target.origin() {
+            return self.clone();
+        }
+        const SENSITIVE: [&str; 3] = ["cookie", "authorization", "proxy-authorization"];
+        RequestContext {
+            headers: self
+                .headers
+                .iter()
+                .filter(|(n, _)| !SENSITIVE.iter().any(|s| n.trim().eq_ignore_ascii_case(s)))
+                .cloned()
+                .collect(),
+            cookies: None,
+            referer: self.referer.clone(),
+            user_agent: self.user_agent.clone(),
+            basic_auth: None,
+        }
+    }
+}
+
 /// Header values, cookies and passwords are never printed: a stray `{:?}` in a log line
 /// must not leak them.
 impl std::fmt::Debug for RequestContext {
@@ -205,6 +231,37 @@ pub enum EngineDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_target_drops_credentials_across_origins() {
+        let c = RequestContext {
+            headers: vec![
+                ("Authorization".into(), "Bearer a".into()),
+                ("cookie".into(), "c=1".into()),
+                ("PROXY-AUTHORIZATION".into(), "p".into()),
+                ("X-Other".into(), "keep".into()),
+            ],
+            cookies: Some("sid=1".into()),
+            referer: Some("https://example.com/p".into()),
+            user_agent: Some("UA/1".into()),
+            basic_auth: Some(("alice".into(), Some("pw".into()))),
+        };
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let orig = u("https://a.example/f");
+        assert_eq!(c.for_target(&orig, &u("https://a.example:443/g?x")), c);
+        for other in [
+            "http://a.example/f",
+            "https://b.example/f",
+            "https://a.example:8443/f",
+        ] {
+            let t = c.for_target(&orig, &u(other));
+            assert_eq!(t.headers, vec![("X-Other".to_string(), "keep".to_string())]);
+            assert_eq!(t.cookies, None);
+            assert_eq!(t.basic_auth, None);
+            assert_eq!(t.referer, c.referer);
+            assert_eq!(t.user_agent, c.user_agent);
+        }
+    }
 
     #[test]
     fn debug_redacts_secrets() {

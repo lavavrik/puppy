@@ -240,9 +240,13 @@ enum Command {
 enum BrowserAction {
     /// Register puppy's native messaging host with Chrome-family browsers.
     Install {
-        /// Only this browser, even if it was not found.
+        /// Only this browser.
         #[arg(long, value_enum)]
         browser: Option<Browser>,
+        /// With --browser: register even if that browser is not found (creating its
+        /// config dir).
+        #[arg(long, requires = "browser")]
+        force: bool,
     },
     /// Remove the registration.
     Uninstall {
@@ -370,8 +374,8 @@ fn main() -> ExitCode {
             Some(Command::Watch) => cli::wait::watch(&Ctx::from_env(cli.json)?).await,
             Some(Command::Stop) => cli::control::stop(&Ctx::from_env(cli.json)?).await,
             Some(Command::Browser { action }) => match action {
-                BrowserAction::Install { browser } => {
-                    cli::browser::install(cli.json, browser).await
+                BrowserAction::Install { browser, force } => {
+                    cli::browser::install(cli.json, browser, force).await
                 }
                 BrowserAction::Uninstall { browser } => {
                     cli::browser::uninstall(cli.json, browser).await

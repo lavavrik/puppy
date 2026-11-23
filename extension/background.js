@@ -19,8 +19,6 @@ api.commands.onCommand.addListener((command) => {
 });
 
 const refreshStatus = async () => setStatus(api, await hello(api, api.runtime.getManifest().version));
-api.runtime.onStartup.addListener(async () => {
-  await resumeStranded(api);
-  await refreshStatus();
-});
+// Stranded downloads were already resumed at worker start, above.
+api.runtime.onStartup.addListener(refreshStatus);
 api.runtime.onInstalled.addListener(refreshStatus);

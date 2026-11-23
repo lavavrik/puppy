@@ -38,25 +38,42 @@ export function addRecent(api, entry) {
   });
 }
 
+// `paused` holds one record per browser download the extension paused and is not done
+// with: `{id}`, plus `puppyId` once puppy accepted it (before the browser copy is
+// cancelled). Bare ids are records of an older version.
+const record = (p) => (typeof p === "number" ? { id: p } : p);
+async function pausedRecords(api) {
+  const { paused = [] } = await api.storage.session.get("paused");
+  return paused.map(record);
+}
+
 /** Remembers a download the extension paused, until it is done with it. */
 export function markPaused(api, id) {
   return serialized(async () => {
-    const { paused = [] } = await api.storage.session.get("paused");
-    await api.storage.session.set({ paused: [...paused.filter((p) => p !== id), id] });
+    const paused = (await pausedRecords(api)).filter((p) => p.id !== id);
+    await api.storage.session.set({ paused: [...paused, { id }] });
+  });
+}
+
+/** Notes that puppy accepted paused download `id` as its download `puppyId`. */
+export function markAccepted(api, id, puppyId) {
+  return serialized(async () => {
+    const paused = (await pausedRecords(api)).filter((p) => p.id !== id);
+    await api.storage.session.set({ paused: [...paused, { id, puppyId }] });
   });
 }
 
 export function unmarkPaused(api, id) {
   return serialized(async () => {
-    const { paused = [] } = await api.storage.session.get("paused");
-    await api.storage.session.set({ paused: paused.filter((p) => p !== id) });
+    const paused = await pausedRecords(api);
+    await api.storage.session.set({ paused: paused.filter((p) => p.id !== id) });
   });
 }
 
-/** The remembered paused ids, forgetting them. */
+/** The remembered paused records (`{id, puppyId?}`), forgetting them. */
 export function takePaused(api) {
   return serialized(async () => {
-    const { paused = [] } = await api.storage.session.get("paused");
+    const paused = await pausedRecords(api);
     await api.storage.session.remove("paused");
     return paused;
   });

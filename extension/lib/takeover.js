@@ -4,13 +4,15 @@
 import { unsupportedReason, excludedReason, basename } from "./rules.js";
 import { loadSettings } from "./settings.js";
 import { cookieHeader, addMessage } from "./request.js";
-import { send, within, PROTOCOL, TIMEOUT_TEXT } from "./native.js";
-import { takeBypass, addRecent, getStatus, setStatus, markPaused, unmarkPaused, takePaused } from "./state.js";
+import { send, within, hello, PROTOCOL, TIMEOUT_TEXT } from "./native.js";
+import { takeBypass, addRecent, getStatus, setStatus, markPaused, markAccepted, unmarkPaused, takePaused } from "./state.js";
 
 const left = (reason) => ({ kind: "left", reason });
 const resumed = (reason) => ({ kind: "resumed", reason });
 const swallow = () => {};
 export const FINISHED_FIRST = "the browser finished it first";
+/** A cached protocol mismatch older than this is checked again before a download is left. */
+export const MISMATCH_RECHECK_MS = 60_000;
 
 /**
  * → {kind: "taken", downloadId} | {kind: "left", reason} | {kind: "resumed", reason}.
@@ -20,13 +22,15 @@ export const FINISHED_FIRST = "the browser finished it first";
  */
 export async function handleDownload(api, item, release, { now = Date.now, userAgent = navigator.userAgent, ownId } = {}) {
   let paused = false;
+  // Paused, and neither resumed nor handed over yet: a throw must resume it.
+  let holding = false;
   try {
     const unsupported = unsupportedReason(item, ownId);
     if (unsupported) return left(unsupported);
     const excluded = excludedReason(item, await loadSettings(api));
     if (excluded) return left(excluded);
     if (await takeBypass(api, now())) return left("bypass");
-    if ((await getStatus(api))?.state === "mismatch") return left("protocol mismatch");
+    if (await mismatched(api, now())) return left("protocol mismatch");
 
     try {
       await api.downloads.pause(item.id);
@@ -34,6 +38,7 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
       return left("could not pause");
     }
     paused = true;
+    holding = true;
     await markPaused(api, item.id);
 
     const [current] = await api.downloads.search({ id: item.id });
@@ -43,6 +48,7 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
     try {
       cookies = cookieHeader(await api.cookies.getAll({ url: item.url }));
     } catch {
+      holding = false;
       await api.downloads.resume(item.id).catch(swallow);
       return resumed("cookies unreadable");
     }
@@ -50,6 +56,7 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
     const name = basename(current.filename || item.filename) || basename(new URL(item.url).pathname) || new URL(item.url).hostname;
     const record = (ok, detail) => addRecent(api, { name, ok, detail, at: now() });
     const giveBack = async (detail) => {
+      holding = false;
       await api.downloads.resume(item.id).catch(swallow);
       await record(false, detail);
       return resumed(detail);
@@ -69,7 +76,12 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
     }
     const reply = r.value;
     if (reply.type === "accepted") {
-      if (await browserFinishedFirst(api, item.id)) {
+      // Recorded before the cancel: a worker dying in between leaves both copies, and
+      // the next worker's resumeStranded removes puppy's.
+      await markAccepted(api, item.id, reply.download_id).catch(swallow);
+      const finishedFirst = await browserFinishedFirst(api, item.id);
+      holding = false;
+      if (finishedFirst) {
         await removeInPuppy(api, reply.download_id);
         await record(false, FINISHED_FIRST);
         return left(FINISHED_FIRST);
@@ -87,10 +99,27 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
       return await giveBack(reply.message);
     }
     return await giveBack(`unexpected reply "${reply.type}"`);
+  } catch (e) {
+    if (holding) await api.downloads.resume(item.id).catch(swallow);
+    throw e;
   } finally {
     if (paused) await unmarkPaused(api, item.id).catch(swallow);
     release();
   }
+}
+
+/**
+ * Whether puppy is known to speak another protocol. A cached mismatch older than
+ * MISMATCH_RECHECK_MS is checked again with a fresh hello (puppy may have been updated),
+ * and the answer cached.
+ */
+async function mismatched(api, nowMs) {
+  const status = await getStatus(api);
+  if (status?.state !== "mismatch") return false;
+  if (nowMs - (status.at ?? 0) <= MISMATCH_RECHECK_MS) return true;
+  const fresh = await hello(api, api.runtime.getManifest().version);
+  await setStatus(api, { ...fresh, at: nowMs });
+  return fresh.state === "mismatch";
 }
 
 /**
@@ -120,11 +149,15 @@ function removeInPuppy(api, downloadId) {
 
 /**
  * Resumes the downloads a previous service worker paused and never finished with (it
- * died mid-takeover). Runs at every worker start, before any new download is handled.
+ * died mid-takeover). Runs once per worker start, before any new download is handled.
+ * One puppy had already accepted is taken back from puppy (with its files) while the
+ * browser still has its copy; if that copy is gone, it was cancelled for puppy, which
+ * keeps it.
  */
 export async function resumeStranded(api) {
-  for (const id of await takePaused(api)) {
+  for (const { id, puppyId } of await takePaused(api)) {
     const [d] = await api.downloads.search({ id }).catch(() => []);
+    if (puppyId != null && (d?.state === "in_progress" || d?.state === "complete")) await removeInPuppy(api, puppyId);
     if (d?.state === "in_progress" && d.paused) await api.downloads.resume(id).catch(swallow);
   }
 }
