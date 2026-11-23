@@ -67,6 +67,8 @@ impl Env {
             ("PUPPY_IDLE_EXIT", "1".to_string()),
             // The daemon's torrent engine stays off the network.
             ("PUPPY_TORRENT_TEST_MODE", "1".to_string()),
+            // Never pop real desktop notifications from tests.
+            ("PUPPY_NO_NOTIFY", "1".to_string()),
         ]
     }
 

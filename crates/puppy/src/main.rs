@@ -19,6 +19,7 @@ use cli::{CliError, Ctx};
 use puppy_client::Paths;
 use puppy_daemon::Config;
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run_daemon};
+use puppy_daemon::notify::{DesktopNotifier, Notifier, desktop_wanted};
 use puppy_tui::api::ClientApi;
 use puppy_tui::theme::{Theme, ThemeChoice};
 use std::io::IsTerminal;
@@ -375,6 +376,8 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
     let outcome = run_daemon(DaemonOptions {
         idle_exit: idle_exit.map(Duration::from_secs),
         torrent_test,
+        notifier: desktop_wanted(|k| std::env::var(k).ok())
+            .then(|| Arc::new(DesktopNotifier::new()) as Arc<dyn Notifier>),
         ..DaemonOptions::default()
     })
     .await?;

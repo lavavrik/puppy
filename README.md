@@ -267,6 +267,24 @@ an older puppy with `seed_ratio = 0.0` (to stop at completion) therefore now
 seeds for up to 2 hours; add `seed_time = 0` as well to keep stopping at
 completion.
 
+Desktop notifications come from the daemon, so they work with the dashboard and
+terminal closed:
+
+```toml
+[notifications]
+enabled = true
+completed = true        # download finished (incl. a torrent entering seeding)
+failed = true           # failed permanently (transient retries never notify)
+choose_files = true     # torrent waiting for its files to be chosen
+seeding_finished = false
+```
+
+Several popups of one kind are grouped into one ("3 downloads finished"): it is
+sent after 3 seconds without another such event, and at most 10 seconds after the
+first. Config is read when the daemon starts, so run `puppy stop` and let the next
+command restart it. `PUPPY_NO_NOTIFY=1` turns popups off for a daemon. A headless
+box or SSH session without a notification server simply shows none.
+
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening
 puppy, run the daemon as a login service (a systemd user unit, a launchd

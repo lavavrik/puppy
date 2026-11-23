@@ -14,6 +14,9 @@ use tracing::debug;
 
 use crate::config::NotificationsConfig;
 
+mod desktop;
+pub use desktop::DesktopNotifier;
+
 /// Every popup's title.
 pub const TITLE: &str = "puppy";
 /// A kind's popup is sent once this long passes with no new event of that kind.
@@ -205,6 +208,13 @@ impl Batcher {
     }
 }
 
+/// Whether the binary should install the real desktop sink: not when notifications are
+/// switched off (`PUPPY_NO_NOTIFY=1`) or under the torrent test harness.
+pub fn desktop_wanted(var: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |k: &str| var(k).as_deref() == Some("1");
+    !(set("PUPPY_NO_NOTIFY") || set("PUPPY_TORRENT_TEST_MODE"))
+}
+
 pub trait Notifier: Send + Sync + 'static {
     /// Must return at once.
     fn notify(&self, n: &Notification);
@@ -329,6 +339,17 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_wanted_reads_env() {
+        use super::desktop_wanted;
+        let with =
+            |k: &'static str, v: &'static str| move |name: &str| (name == k).then(|| v.to_string());
+        assert!(desktop_wanted(|_| None));
+        assert!(!desktop_wanted(with("PUPPY_NO_NOTIFY", "1")));
+        assert!(!desktop_wanted(with("PUPPY_TORRENT_TEST_MODE", "1")));
+        assert!(desktop_wanted(with("PUPPY_NO_NOTIFY", "0")));
+    }
+
     use super::*;
 
     fn item(id: DownloadId, name: &str) -> Item {
