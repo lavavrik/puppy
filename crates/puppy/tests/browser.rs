@@ -65,14 +65,20 @@ async fn native_host_binary_autostarts_daemon() {
         .unwrap();
     drop(stdin);
     let mut stdout = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         stdout.read_to_end(&mut out).unwrap();
-        out
+        let _ = tx.send(out);
     });
     let status = wait_exit(child, TIMEOUT);
     assert!(status.success(), "{status:?}");
-    let replies = frames(&reader.join().unwrap());
+    // End-of-file once the host exited: nothing it started (the daemon) holds its
+    // stdout open (on Windows a leaked inheritable handle would).
+    let out = rx
+        .recv_timeout(TIMEOUT)
+        .expect("the host's stdout stayed open after it exited");
+    let replies = frames(&out);
     assert_eq!(replies.len(), 2, "{replies:?}");
     assert_eq!(replies[0]["id"], "h1");
     assert_eq!(replies[0]["type"], "hello");

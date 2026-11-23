@@ -577,9 +577,11 @@ async fn choose_then_download_via_daemon() {
             == support::content("sub/b.bin", MULTI[1].1),
         "the selected file differs"
     );
-    let a_len = std::fs::metadata(folder.join("a.bin")).map_or(0, |m| m.len());
+    // a.bin shares its last piece with b.bin, and librqbit may write that piece into
+    // it (up to a.bin's full length): compare contents, not the size.
+    let a = std::fs::read(folder.join("a.bin")).unwrap_or_default();
     assert!(
-        a_len < MULTI[0].1 as u64,
+        a != support::content("a.bin", MULTI[0].1),
         "the unselected file was downloaded"
     );
     // The choice is made once.

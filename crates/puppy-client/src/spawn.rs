@@ -94,6 +94,7 @@ fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
     };
     const ERROR_ACCESS_DENIED: i32 = 5;
+    keep_std_handles_from_children();
     let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
     cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
     match cmd.spawn() {
@@ -102,6 +103,34 @@ fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
             cmd.spawn()
         }
         r => r,
+    }
+}
+
+/// Clears the inherit flag on this process's stdin, stdout and stderr.
+///
+/// Rust starts every child with handle inheritance on, so each inheritable handle of
+/// this process leaks into it, whatever its `Stdio` says. When this process was given
+/// pipes (a browser talking to the native host, a script capturing `puppy add`), the
+/// daemon would keep them open as long as it runs, and whoever reads them would never
+/// see end-of-file. Children that do inherit stdio (`Stdio::inherit`) get duplicates
+/// made for them, so they are unaffected.
+#[cfg(windows)]
+fn keep_std_handles_from_children() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on this process's own standard handles; a missing or
+        // invalid handle is skipped, and a failure only leaves the flag as it was.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
     }
 }
 
