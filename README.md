@@ -483,8 +483,6 @@ so no network port is opened. Firefox is not supported yet.
 | `crates/puppy-testserver` | An HTTP server for tests (ranges, throttling, failures).        |
 | `extension/`              | The browser extension (MV3) that hands downloads to puppy.      |
 
-The design is in [docs/superpowers/specs/](docs/superpowers/specs/).
-
 ## Releasing
 
 1. Bump `version` in the root `Cargo.toml` and commit.
