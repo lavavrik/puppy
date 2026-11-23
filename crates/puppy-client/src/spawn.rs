@@ -45,8 +45,7 @@ pub fn spawn_daemon_detached(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    detach(&mut cmd);
-    let child = cmd.spawn()?;
+    let child = spawn_detached(&mut cmd)?;
     reap(child);
     Ok(())
 }
@@ -69,7 +68,7 @@ fn root_dir() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn detach(cmd: &mut Command) {
+fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     // SAFETY: the closure runs in the forked child before exec and only calls setsid
     // and reads errno, both async-signal-safe; it allocates nothing and takes no locks.
@@ -81,15 +80,29 @@ fn detach(cmd: &mut Command) {
             Ok(())
         });
     }
+    cmd.spawn()
 }
 
+/// Also breaks away from the caller's job object, so the daemon outlives a client a
+/// browser started (Chrome runs native messaging hosts in a job that is closed with
+/// them). A job that forbids breaking away fails the spawn with access denied: then
+/// the daemon is started inside it.
 #[cfg(windows)]
-fn detach(cmd: &mut Command) {
+fn spawn_detached(cmd: &mut Command) -> io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
     };
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            cmd.creation_flags(flags);
+            cmd.spawn()
+        }
+        r => r,
+    }
 }
 
 /// Unix: wait for the child in the background so it does not linger as a zombie of a

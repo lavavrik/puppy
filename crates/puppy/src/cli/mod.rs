@@ -65,7 +65,7 @@ pub fn is_mismatch(e: &ClientError) -> bool {
 }
 
 /// What to do about an incompatible daemon.
-const MISMATCH_HINT: &str =
+pub const MISMATCH_HINT: &str =
     "an incompatible puppy daemon is running \u{2014} run `puppy stop` first";
 
 impl From<ClientError> for CliError {

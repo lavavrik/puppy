@@ -5,10 +5,13 @@
 //! - `puppy` opens the full-screen dashboard (starting a daemon if none runs).
 //! - `puppy status`, `add`, `ls`, `info`, `pause`, ..., `wait`, `watch`: scriptable
 //!   commands (see [`cli`] and the README's "Command line" section).
+//! - `puppy native-host` (hidden) is the native messaging host the browser extension
+//!   starts (see [`native_host`]).
 //! - `--json` (global) makes commands print JSON; errors map to exit codes (see
 //!   [`cli::CliError`]).
 
 mod cli;
+mod native_host;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -216,6 +219,14 @@ enum Command {
     Watch,
     /// Stop the background daemon.
     Stop,
+    /// Native messaging host started by the browser extension.
+    #[command(hide = true)]
+    NativeHost {
+        /// What the browser passes: the extension's origin (Linux, macOS) or
+        /// `--parent-window=` (Windows); ignored.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        browser_args: Vec<String>,
+    },
 }
 
 /// `all` (any case) alone means every download; otherwise the ids as given.
@@ -333,6 +344,7 @@ fn main() -> ExitCode {
             Some(Command::Wait { ids }) => cli::wait::wait(&Ctx::from_env(cli.json)?, ids).await,
             Some(Command::Watch) => cli::wait::watch(&Ctx::from_env(cli.json)?).await,
             Some(Command::Stop) => cli::control::stop(&Ctx::from_env(cli.json)?).await,
+            Some(Command::NativeHost { browser_args: _ }) => native_host::run().await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
     });
