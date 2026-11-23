@@ -621,7 +621,7 @@ async fn restore_choosing_and_selected() {
 }
 
 /// Not piece-aligned: pieces 1 and 2 are each shared by the selected `a/two.bin` and an
-/// unselected file, so librqbit writes those bytes into the unselected files.
+/// unselected file, so librqbit may write those bytes into the unselected files.
 const SHARED: &[(&str, usize)] = &[
     ("a/one.bin", P + 100),
     ("a/two.bin", P + 300),
@@ -654,12 +654,11 @@ async fn shared_pieces_selected_only_and_delete() {
     let seeder = Seeder::start(SHARED).await;
     let env = Env::new(vec![seeder.addr]).await;
     let st = download_two(&env, &seeder, 1).await;
+    // Whether librqbit wrote the shared piece's bytes into the placeholder varies from
+    // run to run (seen both ways on CI); deleting must remove it either way.
     assert!(
-        std::fs::metadata(env.folder().join("b/three.bin"))
-            .unwrap()
-            .len()
-            > 0,
-        "librqbit wrote the shared piece's bytes into the placeholder"
+        env.folder().join("b/three.bin").exists(),
+        "placeholder created"
     );
     env.engine.remove(1, true).await.unwrap();
     assert!(!st.path.exists(), "placeholders and folders deleted");

@@ -1142,8 +1142,14 @@ fn assert_only_b_downloaded(env: &Env) {
             == support::content("sub/b.bin", MULTI[1].1),
         "the selected file differs"
     );
-    let a = std::fs::metadata(folder.join("a.bin")).map_or(0, |m| m.len());
-    assert!(a < MULTI[0].1 as u64, "the unselected file was downloaded");
+    // a.bin is not a whole number of pieces: its last piece is shared with b.bin, and
+    // librqbit may write that piece's bytes into a.bin too (up to a.bin's full length).
+    // So compare contents, not the size.
+    let a = std::fs::read(folder.join("a.bin")).unwrap_or_default();
+    assert!(
+        a != support::content("a.bin", MULTI[0].1),
+        "the unselected file was downloaded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -12,8 +12,12 @@ use common::*;
 use puppy_client::Client;
 use puppy_proto::{ReplyData, Request, WireState};
 use puppy_testserver::{ServerCfg, TestServer};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autospawn_then_idle_exit() {
