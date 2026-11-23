@@ -35,7 +35,7 @@ use crate::store::{
     PersistedState, RuntimeSettings, Store, StoreError, StoredDownload, StoredState,
 };
 use puppy_core::engine::{Engine, EngineError, EngineEvent};
-use puppy_core::types::{DownloadId, DownloadState, Source};
+use puppy_core::types::{DownloadId, DownloadState, RequestContext, Source};
 use puppy_proto::{ErrorCode, Event};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -498,6 +498,8 @@ impl Inner {
     /// The data of `e` is complete: emits `Completed`, unless it was already (a restore
     /// retried, or the daemon stopped before recording the seeding state).
     fn data_completed(&self, id: DownloadId, e: &mut Entry) {
+        // Nothing left to request: the cookies and credentials go from the stored record.
+        e.rec.request.context = RequestContext::default();
         if e.rec.finished_unix.is_none() {
             e.rec.finished_unix = Some(now_unix());
             self.emit(Event::Completed {

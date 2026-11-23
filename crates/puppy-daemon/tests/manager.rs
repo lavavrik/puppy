@@ -63,6 +63,12 @@ impl Env {
             .unwrap()
     }
 
+    fn req_with_cookie(&self, s: &TestServer, name: &str) -> AddRequest {
+        let mut r = self.req(s, name);
+        r.context = cookie_context();
+        r
+    }
+
     fn req(&self, s: &TestServer, name: &str) -> AddRequest {
         AddRequest {
             source: Source::Http {
@@ -1570,5 +1576,136 @@ async fn snapshot_reads_torrent_peers_from_status() {
         detail,
         Some(puppy_core::types::EngineDetail::Torrent { peers: 99, .. })
     ));
+    m.shutdown().await;
+}
+
+fn cookie_context() -> RequestContext {
+    RequestContext {
+        cookies: Some("sid=COOKIESECRET".into()),
+        user_agent: Some("UA/1".into()),
+        basic_auth: Some(("alice".into(), Some("PWSECRET".into()))),
+        ..RequestContext::default()
+    }
+}
+
+fn stored(env: &Env, id: DownloadId) -> serde_json::Value {
+    let text = std::fs::read_to_string(env.state_path()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == id)
+        .unwrap_or_else(|| panic!("download {id} not stored: {text}"))
+        .clone()
+}
+
+fn state_text(env: &Env) -> String {
+    std::fs::read_to_string(env.state_path()).unwrap()
+}
+
+#[tokio::test]
+async fn completed_download_forgets_its_context() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    let m = env.manager(3).await;
+    let id = m
+        .add(env.req_with_cookie(&s, "a.bin"), false, None)
+        .await
+        .unwrap();
+    wait_completed(&m, id).await;
+    assert!(m.save_state(TIMEOUT).await);
+    assert_eq!(
+        stored(&env, id)["request"]["context"],
+        serde_json::json!({"headers":[],"cookies":null,"referer":null,"user_agent":null,"basic_auth":null})
+    );
+    let text = state_text(&env);
+    assert!(
+        !text.contains("COOKIESECRET") && !text.contains("PWSECRET"),
+        "{text}"
+    );
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn unfinished_download_keeps_its_context() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 4096 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let m = env.manager(3).await;
+    let id = m
+        .add(env.req_with_cookie(&s, "a.bin"), false, None)
+        .await
+        .unwrap();
+    wait_active_with_bytes(&m, id).await;
+    assert!(m.save_state(TIMEOUT).await);
+    assert_eq!(
+        stored(&env, id)["request"]["context"]["cookies"],
+        "sid=COOKIESECRET"
+    );
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn restored_completed_download_forgets_its_context() {
+    let env = Env::new();
+    let s = server(|c| c.len = 64 * KIB).await;
+    let rec = puppy_daemon::StoredDownload {
+        id: 3,
+        request: env.req_with_cookie(&s, "a.bin"),
+        limit: None,
+        state: puppy_daemon::StoredState::Completed,
+        name: Some("a.bin".into()),
+        path: Some(env.dl_dir().join("a.bin")),
+        total_bytes: Some(64 * KIB),
+        created_unix: 1,
+        finished_unix: Some(2),
+        choose_files_sent: false,
+    };
+    let st = puppy_daemon::PersistedState {
+        next_id: 4,
+        order: vec![3],
+        downloads: vec![rec],
+        ..Default::default()
+    };
+    Store::new(env.state_path()).save_now(&st).await.unwrap();
+    assert!(state_text(&env).contains("COOKIESECRET"));
+    let m = env.manager(3).await;
+    assert!(m.save_state(TIMEOUT).await);
+    let text = state_text(&env);
+    assert!(
+        !text.contains("COOKIESECRET") && !text.contains("PWSECRET"),
+        "{text}"
+    );
+    assert!(matches!(snap(&m, 3).state, WireState::Completed));
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn removed_download_leaves_no_context() {
+    let env = Env::new();
+    let s = server(|c| {
+        c.len = 4096 * KIB;
+        c.bytes_per_sec = Some(64 * KIB);
+    })
+    .await;
+    let m = env.manager(3).await;
+    let id = m
+        .add(env.req_with_cookie(&s, "a.bin"), false, None)
+        .await
+        .unwrap();
+    wait_active_with_bytes(&m, id).await;
+    assert!(m.save_state(TIMEOUT).await);
+    assert!(state_text(&env).contains("COOKIESECRET"));
+    m.remove(id, true).await.unwrap();
+    assert!(m.save_state(TIMEOUT).await);
+    let text = state_text(&env);
+    assert!(
+        !text.contains("COOKIESECRET") && !text.contains("PWSECRET"),
+        "{text}"
+    );
     m.shutdown().await;
 }

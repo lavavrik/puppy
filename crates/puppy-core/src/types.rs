@@ -13,13 +13,33 @@ pub enum Source {
     TorrentFile { path: PathBuf },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestContext {
     pub headers: Vec<(String, String)>,
     pub cookies: Option<String>,
     pub referer: Option<String>,
     pub user_agent: Option<String>,
     pub basic_auth: Option<(String, Option<String>)>,
+}
+
+/// Header values, cookies and passwords are never printed: a stray `{:?}` in a log line
+/// must not leak them.
+impl std::fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const HIDDEN: &str = "<redacted>";
+        let headers: Vec<(&String, &str)> = self.headers.iter().map(|(n, _)| (n, HIDDEN)).collect();
+        let basic_auth = self
+            .basic_auth
+            .as_ref()
+            .map(|(user, pw)| (user, pw.as_ref().map(|_| HIDDEN)));
+        f.debug_struct("RequestContext")
+            .field("headers", &headers)
+            .field("cookies", &self.cookies.as_ref().map(|_| HIDDEN))
+            .field("referer", &self.referer)
+            .field("user_agent", &self.user_agent)
+            .field("basic_auth", &basic_auth)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +205,24 @@ pub enum EngineDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let c = RequestContext {
+            headers: vec![("Authorization".into(), "Bearer HDRSECRET".into())],
+            cookies: Some("sid=COOKIESECRET".into()),
+            referer: Some("https://example.com/p".into()),
+            user_agent: Some("UA/1".into()),
+            basic_auth: Some(("alice".into(), Some("PWSECRET".into()))),
+        };
+        let s = format!("{c:?}");
+        for secret in ["HDRSECRET", "COOKIESECRET", "PWSECRET"] {
+            assert!(!s.contains(secret), "{s}");
+        }
+        for shown in ["Authorization", "alice", "https://example.com/p", "UA/1"] {
+            assert!(s.contains(shown), "{s}");
+        }
+    }
 
     #[test]
     fn new_types_roundtrip_and_defaults() {

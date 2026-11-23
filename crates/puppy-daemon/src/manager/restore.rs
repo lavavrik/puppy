@@ -4,7 +4,7 @@ use super::schedule::{Job, JobKind};
 use super::{Entry, Inner};
 use crate::store::{PersistedState, StoredState};
 use puppy_core::engine::{AddOptions, StartMode};
-use puppy_core::types::{DownloadId, DownloadState};
+use puppy_core::types::{DownloadId, DownloadState, RequestContext};
 use std::collections::HashSet;
 
 impl Inner {
@@ -52,10 +52,14 @@ impl Inner {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(rec) = by_id.remove(&id) else {
+            let Some(mut rec) = by_id.remove(&id) else {
                 continue;
             };
             st.next_id = st.next_id.max(id + 1);
+            if matches!(rec.state, StoredState::Completed) {
+                // Older state files kept the context of finished downloads.
+                rec.request.context = RequestContext::default();
+            }
             let engine = self
                 .engines
                 .iter()
