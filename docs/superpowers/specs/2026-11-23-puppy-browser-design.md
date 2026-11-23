@@ -115,8 +115,13 @@ in place for it.
 - **Timeouts and duplicates:** the browser download is paused while waiting; the extension
   waits up to 10 s (covers a cold daemon autostart). If no reply, it resumes the browser
   download; if an "accepted" arrives after that, the extension asks the host to remove
-  that puppy download (no file deleted), so the file is never downloaded twice. Every
-  request carries a client request id echoed in the reply.
+  that puppy download with `delete_files: true` (amended 2026-11-23, Task 4 review: the
+  browser already has the download, so puppy's copy is a duplicate or partial file in
+  puppy's own folder; puppy deletes only files it created, as `rm --delete-files` does),
+  so the file is never downloaded twice. The same remove is sent when cancelling the
+  browser download fails because the browser finished it first. `remove`'s
+  `delete_files` is optional and defaults to false. Every request carries a client
+  request id echoed in the reply.
 - **Version handshake:** the first message is `hello {extension_version, protocol}`;
   the host answers with puppy's version and protocol; a mismatch shows in the options
   status line and the extension leaves downloads to the browser.

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { handleDownload } from "../lib/takeover.js";
+import { handleDownload, resumeStranded, FINISHED_FIRST } from "../lib/takeover.js";
 import { armBypass, getRecent, getStatus } from "../lib/state.js";
 import { HOST_NAME } from "../lib/native.js";
 import { fakeApi, item, until } from "./fake-chrome.js";
@@ -39,10 +39,12 @@ test("accepted download is paused, sent, then cancelled and erased", async () =>
   const api = setup();
   const outcome = await run(api);
   assert.deepEqual(outcome, { kind: "taken", downloadId: 3 });
-  assert.ok(at(api, "pause") < at(api, "release"));
-  assert.ok(at(api, "release") < at(api, "send"));
+  // The target stays undetermined (no suggest) until puppy has it and the browser
+  // download is cancelled.
+  assert.ok(at(api, "pause") < at(api, "send"));
   assert.ok(at(api, "send") < at(api, "cancel"));
   assert.ok(at(api, "cancel") < at(api, "erase"));
+  assert.ok(at(api, "erase") < at(api, "release"));
   assert.ok(has(api, "pause", 7) && has(api, "cancel", 7));
   assert.deepEqual(api.calls.find((c) => c[0] === "erase")[1], { id: 7 });
   assert.ok(!has(api, "resume"));
@@ -72,6 +74,7 @@ test("error reply resumes the browser download", async () => {
   const outcome = await run(api);
   assert.equal(outcome.kind, "resumed");
   assert.ok(has(api, "resume", 7));
+  assert.ok(at(api, "resume") < at(api, "release"));
   assert.ok(!has(api, "cancel") && !has(api, "erase"));
   const [recent] = await getRecent(api);
   assert.equal(recent.ok, false);
@@ -97,6 +100,15 @@ test("reply with another id is treated as an error", async () => {
   assert.equal(outcome.kind, "resumed");
   assert.ok(has(api, "resume", 7));
   assert.ok(!has(api, "cancel") && !has(api, "erase"));
+});
+
+test("an error the host could not tie to a request is still ours", async () => {
+  const api = setup({ reply: () => ({ id: null, type: "error", code: "bad_message", message: "unreadable message: x" }) });
+  assert.equal((await run(api)).kind, "resumed");
+  assert.equal((await getRecent(api))[0].detail, "unreadable message: x");
+  const other = setup({ reply: () => ({ id: null, type: "accepted", download_id: 3 }) });
+  assert.equal((await run(other)).kind, "resumed");
+  assert.ok(!has(other, "cancel"));
 });
 
 test("an unexpected reply type resumes", async () => {
@@ -125,6 +137,7 @@ test("no reply in 10 s resumes; a late accept is removed in puppy", async (t) =>
   assert.equal(remove.type, "remove");
   assert.equal(remove.download_id, 9);
   assert.equal(remove.protocol, 1);
+  assert.equal(remove.delete_files, true);
   assert.match(remove.id, UUID);
   assert.notEqual(remove.id, add.id);
   assert.ok(!has(api, "cancel") && !has(api, "erase"));
@@ -155,6 +168,83 @@ test("reply at 9999 ms is still in time", async (t) => {
   assert.deepEqual(await r.outcome, { kind: "taken", downloadId: 4 });
   t.mock.timers.tick(1);
   assert.ok(!has(api, "resume"));
+});
+
+/** Makes the browser's cancel fail, leaving the item in `state` (or gone). */
+function failCancel(api, state) {
+  api.downloads.cancel = async (id) => {
+    api.calls.push(["cancel", id]);
+    if (state === "gone") api.items.length = 0;
+    else api.items[0].state = state;
+    throw new Error("Download must be in progress");
+  };
+}
+
+test("a download the browser finished first is removed from puppy with its files", async () => {
+  const api = setup({ reply: (m) => (m.type === "add" ? { id: m.id, type: "accepted", download_id: 5 } : { id: m.id, type: "removed" }) });
+  failCancel(api, "complete");
+  assert.deepEqual(await run(api), { kind: "left", reason: FINISHED_FIRST });
+  const remove = sends(api)[1];
+  assert.equal(remove.type, "remove");
+  assert.equal(remove.download_id, 5);
+  assert.equal(remove.delete_files, true);
+  assert.notEqual(remove.id, sends(api)[0].id);
+  assert.ok(!has(api, "erase") && !has(api, "resume"));
+  const [recent] = await getRecent(api);
+  assert.equal(recent.ok, false);
+  assert.equal(recent.detail, FINISHED_FIRST);
+});
+
+test("a failed cancel of a download gone, interrupted or cancelled keeps it taken", async () => {
+  for (const state of ["gone", "interrupted"]) {
+    const api = setup();
+    failCancel(api, state);
+    assert.deepEqual(await run(api), { kind: "taken", downloadId: 3 }, state);
+    assert.equal(sends(api).length, 1, state);
+  }
+});
+
+test("a failed erase is warned about without the URL or cookies", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const api = setup();
+  api.downloads.erase = async () => {
+    throw new Error("erase broke");
+  };
+  assert.deepEqual(await run(api), { kind: "taken", downloadId: 3 });
+  assert.equal(warn.mock.callCount(), 1);
+  const text = warn.mock.calls[0].arguments.join(" ");
+  assert.ok(text.includes("erase broke"), text);
+  assert.ok(!text.includes("example") && !text.includes("sid"), text);
+});
+
+test("paused downloads are remembered until the takeover is done", async () => {
+  let answer;
+  const api = setup({ reply: (m) => new Promise((r) => (answer = () => r({ id: m.id, type: "accepted", download_id: 3 }))) });
+  const r = start(api);
+  await until(() => has(api, "send"));
+  assert.deepEqual(api.storage.session.data.paused, [7]);
+  answer();
+  await r.outcome;
+  assert.deepEqual(api.storage.session.data.paused, []);
+  const left = setup({ settings: { enabled: false } });
+  await run(left);
+  assert.equal(left.storage.session.data.paused, undefined, "never paused, never remembered");
+});
+
+test("stranded paused downloads are resumed", async () => {
+  const api = fakeApi({
+    session: { paused: [5, 6, 7] },
+    downloads: [
+      item({ id: 5, paused: true }),
+      item({ id: 6, state: "complete", paused: false }),
+      item({ id: 7, paused: false }),
+    ],
+  });
+  await resumeStranded(api);
+  assert.deepEqual(api.calls.filter((c) => c[0] === "resume"), [["resume", 5]]);
+  assert.equal(api.storage.session.data.paused, undefined);
+  await resumeStranded(api);
+  assert.equal(api.calls.filter((c) => c[0] === "resume").length, 1);
 });
 
 test("protocol mismatch resumes and caches it; the next download is left unpaused", async () => {

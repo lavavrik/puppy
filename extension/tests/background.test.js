@@ -4,9 +4,16 @@ import { fakeApi, item, until, flush } from "./fake-chrome.js";
 import { onNewDownload, extensionApi } from "../lib/compat.js";
 import { hello } from "../lib/native.js";
 
-const api = fakeApi({ downloads: [item()] });
+// A previous worker died with download 5 paused.
+const api = fakeApi({ downloads: [item(), item({ id: 5, paused: true })], session: { paused: [5] } });
 globalThis.chrome = api;
 await import("../background.js");
+
+test("worker start resumes what a dead worker left paused", async () => {
+  await until(() => api.calls.some((c) => c[0] === "resume"));
+  assert.deepEqual(api.calls.filter((c) => c[0] === "resume"), [["resume", 5]]);
+  assert.equal(api.storage.session.data.paused, undefined);
+});
 
 test("background registers its listeners", async () => {
   assert.equal(api.downloads.onDeterminingFilename.listeners.length, 1);
@@ -37,10 +44,37 @@ test("determining-filename listener returns true and suggests after the pause", 
   const suggest = () => api.calls.push(["suggest"]);
   const [ret] = api.downloads.onDeterminingFilename.fire(item(), suggest);
   assert.equal(ret, true);
-  await until(() => api.calls.slice(before).some((c) => c[0] === "erase"));
+  await until(() => api.calls.slice(before).some((c) => c[0] === "suggest"));
+  await flush();
   const names = api.calls.slice(before).map((c) => c[0]);
   assert.equal(names.filter((n) => n === "suggest").length, 1);
   assert.ok(names.indexOf("pause") < names.indexOf("suggest"));
+  // Cancelled while the target is still pending: no "where to save" dialog flashes.
+  assert.ok(names.indexOf("cancel") < names.indexOf("suggest"));
+});
+
+test("a download the browser keeps is suggested once, after its resume", async () => {
+  const ch = fakeApi({ downloads: [item()], reply: (m) => ({ id: m.id, type: "error", code: "refused", message: "no" }) });
+  const { handleDownload } = await import("../lib/takeover.js");
+  onNewDownload(ch, (it, release) => handleDownload(ch, it, release, { ownId: "ownid", userAgent: "UA" }));
+  const [ret] = ch.downloads.onDeterminingFilename.fire(item(), () => ch.calls.push(["suggest"]));
+  assert.equal(ret, true);
+  await until(() => ch.calls.some((c) => c[0] === "suggest"));
+  await flush();
+  const names = ch.calls.map((c) => c[0]);
+  assert.equal(names.filter((n) => n === "suggest").length, 1);
+  assert.ok(names.indexOf("resume") < names.indexOf("suggest"));
+});
+
+test("a throwing suggest is warned about, not thrown", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const ch = fakeApi();
+  onNewDownload(ch, async (_it, release) => release());
+  ch.downloads.onDeterminingFilename.fire(item(), () => {
+    throw new Error("no such download");
+  });
+  await flush();
+  assert.equal(warn.mock.callCount(), 1);
 });
 
 test("Firefox falls back to onCreated", async () => {

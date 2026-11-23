@@ -38,6 +38,30 @@ export function addRecent(api, entry) {
   });
 }
 
+/** Remembers a download the extension paused, until it is done with it. */
+export function markPaused(api, id) {
+  return serialized(async () => {
+    const { paused = [] } = await api.storage.session.get("paused");
+    await api.storage.session.set({ paused: [...paused.filter((p) => p !== id), id] });
+  });
+}
+
+export function unmarkPaused(api, id) {
+  return serialized(async () => {
+    const { paused = [] } = await api.storage.session.get("paused");
+    await api.storage.session.set({ paused: paused.filter((p) => p !== id) });
+  });
+}
+
+/** The remembered paused ids, forgetting them. */
+export function takePaused(api) {
+  return serialized(async () => {
+    const { paused = [] } = await api.storage.session.get("paused");
+    await api.storage.session.remove("paused");
+    return paused;
+  });
+}
+
 export async function getRecent(api) {
   const { recent } = await api.storage.session.get("recent");
   return recent ?? [];

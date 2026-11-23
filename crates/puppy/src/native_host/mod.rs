@@ -186,12 +186,15 @@ impl<C: Connector> Host<C> {
                     Err(e) => return self.failed(id, &e),
                 }
             }
-            Incoming::Remove { download_id } => {
+            Incoming::Remove {
+                download_id,
+                delete_files,
+            } => {
                 let removed = match self.client().await {
                     Ok(c) => {
                         c.call(Request::Remove {
                             id: download_id,
-                            delete_files: false,
+                            delete_files,
                         })
                         .await
                     }
@@ -388,6 +391,10 @@ mod tests {
         json!({"id": id, "protocol": 1, "type": "remove", "download_id": download_id})
     }
 
+    fn remove_deleting(id: &str, download_id: u64) -> Value {
+        json!({"id": id, "protocol": 1, "type": "remove", "download_id": download_id, "delete_files": true})
+    }
+
     const NEVER: &str = "http://127.0.0.1:9/never";
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -474,6 +481,54 @@ mod tests {
         assert_eq!(r[1], json!({"id": "r1", "type": "removed"}));
         assert_eq!(r[2], json!({"id": "r2", "type": "removed"}));
         assert!(d.client().await.list().await.unwrap().is_empty());
+        d.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_deletes_files_only_when_asked() {
+        let server = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+            len: 64 * 1024,
+            ..Default::default()
+        })
+        .await;
+        let d = Daemon::start().await;
+        let r = exchange(
+            d.counting(),
+            &[
+                add("a1", server.url("/file.bin?k=1").as_str()),
+                add("a2", server.url("/file.bin?k=2").as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(r[0]["type"], "accepted", "{r:?}");
+        assert_eq!(r[1]["type"], "accepted", "{r:?}");
+        let deadline = Instant::now() + TIMEOUT;
+        let paths = loop {
+            let list = d.client().await.list().await.unwrap();
+            if list.len() == 2
+                && list
+                    .iter()
+                    .all(|s| matches!(s.state, puppy_proto::WireState::Completed))
+            {
+                let path = |id| {
+                    let s = list.iter().find(|s| s.id == id).unwrap();
+                    s.path.clone().unwrap()
+                };
+                break (path(1), path(2));
+            }
+            assert!(Instant::now() < deadline, "never completed: {list:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(paths.0.exists() && paths.1.exists(), "{paths:?}");
+        let r = exchange(d.counting(), &[remove("r1", 1), remove_deleting("r2", 2)]).await;
+        assert_eq!(r[0], json!({"id": "r1", "type": "removed"}));
+        assert_eq!(r[1], json!({"id": "r2", "type": "removed"}));
+        let deadline = Instant::now() + TIMEOUT;
+        while paths.1.exists() {
+            assert!(Instant::now() < deadline, "never deleted: {paths:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(paths.0.exists(), "a plain remove keeps the file");
         d.stop().await;
     }
 

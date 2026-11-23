@@ -33,6 +33,9 @@ pub enum Incoming {
     Add(AddMsg),
     Remove {
         download_id: DownloadId,
+        /// Delete the files puppy created for it. Absent (older extensions): false.
+        #[serde(default)]
+        delete_files: bool,
     },
 }
 
@@ -305,7 +308,27 @@ mod tests {
         assert_eq!(e.id, "r1");
         assert_eq!(e.protocol, 1);
         assert!(
-            matches!(e.body, Incoming::Remove { download_id: 7 }),
+            matches!(
+                e.body,
+                Incoming::Remove {
+                    download_id: 7,
+                    delete_files: false
+                }
+            ),
+            "{e:?}"
+        );
+        let e = parse(
+            br#"{"id":"r1","protocol":1,"type":"remove","download_id":7,"delete_files":true}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                e.body,
+                Incoming::Remove {
+                    download_id: 7,
+                    delete_files: true
+                }
+            ),
             "{e:?}"
         );
 

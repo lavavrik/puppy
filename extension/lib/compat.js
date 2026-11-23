@@ -7,8 +7,9 @@ export function extensionApi(g = globalThis) {
 
 /**
  * Calls `handler(item, release)` for every new download. On Chrome this hooks
- * `downloads.onDeterminingFilename`, which holds the download until `release()`
- * calls `suggest()` (once, and at the latest when the handler settles). Firefox has
+ * `downloads.onDeterminingFilename`, which holds the download's target until
+ * `release()` calls `suggest()` (once, and at the latest when the handler settles;
+ * suggest() on a download cancelled meanwhile is harmless). Firefox has
  * no such event, so it falls back to `onCreated`, where `release` does nothing.
  */
 export function onNewDownload(api, handler) {
@@ -19,7 +20,11 @@ export function onNewDownload(api, handler) {
       const release = () => {
         if (suggested) return;
         suggested = true;
-        suggest();
+        try {
+          suggest();
+        } catch (e) {
+          console.warn("puppy: suggest failed", e?.message ?? e);
+        }
       };
       Promise.resolve()
         .then(() => handler(item, release))

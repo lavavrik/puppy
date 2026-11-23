@@ -5,24 +5,21 @@ import { unsupportedReason, excludedReason, basename } from "./rules.js";
 import { loadSettings } from "./settings.js";
 import { cookieHeader, addMessage } from "./request.js";
 import { send, within, PROTOCOL, TIMEOUT_TEXT } from "./native.js";
-import { takeBypass, addRecent, getStatus, setStatus } from "./state.js";
+import { takeBypass, addRecent, getStatus, setStatus, markPaused, unmarkPaused, takePaused } from "./state.js";
 
 const left = (reason) => ({ kind: "left", reason });
 const resumed = (reason) => ({ kind: "resumed", reason });
 const swallow = () => {};
+export const FINISHED_FIRST = "the browser finished it first";
 
 /**
  * → {kind: "taken", downloadId} | {kind: "left", reason} | {kind: "resumed", reason}.
- * `release()` (which lets the browser go on) runs exactly once: right after the pause,
- * or when the browser keeps the download.
+ * `release()` (which lets the browser determine the target) runs exactly once, when the
+ * outcome is known: after the cancel for a taken download, so Chrome never shows its
+ * "where to save" dialog for it, and after the resume otherwise.
  */
 export async function handleDownload(api, item, release, { now = Date.now, userAgent = navigator.userAgent, ownId } = {}) {
-  let released = false;
-  const releaseOnce = () => {
-    if (released) return;
-    released = true;
-    release();
-  };
+  let paused = false;
   try {
     const unsupported = unsupportedReason(item, ownId);
     if (unsupported) return left(unsupported);
@@ -36,7 +33,8 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
     } catch {
       return left("could not pause");
     }
-    releaseOnce();
+    paused = true;
+    await markPaused(api, item.id);
 
     const [current] = await api.downloads.search({ id: item.id });
     if (current?.state !== "in_progress") return left("finished in the browser");
@@ -65,13 +63,20 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
       return await giveBack(`puppy is not reachable: ${e?.message ?? e}`);
     }
     if (r.timedOut) {
+      // The browser keeps it; a late accept would be a second copy in puppy.
       pending.then((late) => (late.type === "accepted" ? removeInPuppy(api, late.download_id) : null)).catch(swallow);
       return await giveBack(TIMEOUT_TEXT);
     }
     const reply = r.value;
     if (reply.type === "accepted") {
-      await api.downloads.cancel(item.id).catch(swallow);
-      await api.downloads.erase({ id: item.id }).catch(swallow);
+      if (await browserFinishedFirst(api, item.id)) {
+        await removeInPuppy(api, reply.download_id);
+        await record(false, FINISHED_FIRST);
+        return left(FINISHED_FIRST);
+      }
+      await api.downloads.erase({ id: item.id }).catch((e) => {
+        console.warn(`puppy: could not erase browser download ${item.id}: ${e?.message ?? e}`);
+      });
       await record(true, null);
       return { kind: "taken", downloadId: reply.download_id };
     }
@@ -83,11 +88,43 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
     }
     return await giveBack(`unexpected reply "${reply.type}"`);
   } finally {
-    releaseOnce();
+    if (paused) await unmarkPaused(api, item.id).catch(swallow);
+    release();
   }
 }
 
-/** Takes back a download puppy accepted after the browser already resumed it. */
+/**
+ * Cancels the browser download puppy took. True only when the cancel failed because
+ * the browser already completed it; a download gone, interrupted or cancelled is puppy's.
+ */
+async function browserFinishedFirst(api, id) {
+  try {
+    await api.downloads.cancel(id);
+    return false;
+  } catch {
+    const [now] = await api.downloads.search({ id }).catch(() => []);
+    return now?.state === "complete";
+  }
+}
+
+/** Takes back a download puppy accepted while the browser has its own copy. */
 function removeInPuppy(api, downloadId) {
-  return send(api, { id: crypto.randomUUID(), protocol: PROTOCOL, type: "remove", download_id: downloadId }).catch(swallow);
+  return send(api, {
+    id: crypto.randomUUID(),
+    protocol: PROTOCOL,
+    type: "remove",
+    download_id: downloadId,
+    delete_files: true,
+  }).catch(swallow);
+}
+
+/**
+ * Resumes the downloads a previous service worker paused and never finished with (it
+ * died mid-takeover). Runs at every worker start, before any new download is handled.
+ */
+export async function resumeStranded(api) {
+  for (const id of await takePaused(api)) {
+    const [d] = await api.downloads.search({ id }).catch(() => []);
+    if (d?.state === "in_progress" && d.paused) await api.downloads.resume(id).catch(swallow);
+  }
 }

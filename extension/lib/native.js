@@ -5,10 +5,15 @@ export const PROTOCOL = 1;
 export const TIMEOUT_MS = 10_000;
 export const TIMEOUT_TEXT = "puppy did not answer in 10 s";
 
-/** Sends `msg` and returns the host's reply; rejects if the reply is for another request. */
+/**
+ * Sends `msg` and returns the host's reply; rejects if the reply is for another
+ * request. An error with `id: null` (the host could not read the request) is ours:
+ * each sendNativeMessage starts its own host process.
+ */
 export async function send(api, msg) {
   const reply = await api.runtime.sendNativeMessage(HOST_NAME, msg);
-  if (!reply || reply.id !== msg.id) throw new Error("the host answered another request");
+  const ours = reply && (reply.id === msg.id || (reply.id === null && reply.type === "error"));
+  if (!ours) throw new Error("the host answered another request");
   return reply;
 }
 

@@ -1,12 +1,16 @@
 // The service worker: hands new downloads to puppy, arms the bypass from the
-// keyboard shortcut and caches the handshake status.
+// keyboard shortcut, caches the handshake status and resumes downloads a dead
+// worker left paused.
 
 import { extensionApi, onNewDownload } from "./lib/compat.js";
-import { handleDownload } from "./lib/takeover.js";
+import { handleDownload, resumeStranded } from "./lib/takeover.js";
 import { hello } from "./lib/native.js";
 import { armBypass, setStatus } from "./lib/state.js";
 
 const api = extensionApi();
+
+// Queued before any download event of this worker is handled (state.js serializes it).
+resumeStranded(api).catch((e) => console.warn("puppy: could not resume stranded downloads", e?.message ?? e));
 
 onNewDownload(api, (item, release) => handleDownload(api, item, release, { ownId: api.runtime.id }));
 
@@ -15,5 +19,8 @@ api.commands.onCommand.addListener((command) => {
 });
 
 const refreshStatus = async () => setStatus(api, await hello(api, api.runtime.getManifest().version));
-api.runtime.onStartup.addListener(refreshStatus);
+api.runtime.onStartup.addListener(async () => {
+  await resumeStranded(api);
+  await refreshStatus();
+});
 api.runtime.onInstalled.addListener(refreshStatus);
