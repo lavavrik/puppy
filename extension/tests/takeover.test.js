@@ -69,6 +69,15 @@ test("accepted download is paused, sent, then cancelled and erased", async () =>
   assert.equal(recent.ok, true);
 });
 
+test("recent name never falls back to the raw url", async () => {
+  const url = "https://us:pw@host.example/?token=secret";
+  const it = item({ url, filename: "" });
+  const api = setup({}, [it]);
+  await run(api, it);
+  const [recent] = await getRecent(api);
+  assert.equal(recent.name, "host.example");
+});
+
 test("error reply resumes the browser download", async () => {
   const api = setup({ reply: (m) => ({ id: m.id, type: "error", code: "refused", message: "no" }) });
   const outcome = await run(api);

@@ -2,7 +2,7 @@ import { extensionApi } from "./lib/compat.js";
 import { loadSettings, saveSettings } from "./lib/settings.js";
 import { hello } from "./lib/native.js";
 import { getStatus, setStatus } from "./lib/state.js";
-import { statusLine, formToSettings, settingsToForm } from "./lib/ui.js";
+import { statusLine, formToSettings, settingsToForm, mergeForm } from "./lib/ui.js";
 
 const api = extensionApi();
 const $ = (id) => document.getElementById(id);
@@ -24,8 +24,26 @@ async function init() {
   $("minSizeMiB").value = form.minSizeMiB;
   $("extensions").value = form.extensions;
   $("sites").value = form.sites;
-  for (const id of ["enabled", "minSizeMiB", "extensions", "sites"]) {
-    $(id).addEventListener("change", () => saveSettings(api, readForm()));
+  const FIELDS = {
+    enabled: ["enabled"],
+    minSizeMiB: ["minSizeBytes"],
+    extensions: ["skipExtensions"],
+    sites: ["skipSites"],
+  };
+  // Only the edited field is written over freshly loaded settings, so a toggle in the popup survives.
+  const save = async (id) => saveSettings(api, mergeForm(await loadSettings(api), readForm(), FIELDS[id]));
+  const timers = {};
+  for (const id of Object.keys(FIELDS)) {
+    $(id).addEventListener("change", () => {
+      clearTimeout(timers[id]);
+      save(id);
+    });
+    if (id !== "enabled") {
+      $(id).addEventListener("input", () => {
+        clearTimeout(timers[id]);
+        timers[id] = setTimeout(() => save(id), 300);
+      });
+    }
   }
 
   showStatus(await getStatus(api));

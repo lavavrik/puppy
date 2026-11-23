@@ -31,7 +31,8 @@ Early development, but the first four milestones are done:
   [Torrents](#torrents) for what v1 does and does not do.
 
 Tested locally on Linux; CI for Windows and macOS is pending. Scriptable
-subcommands (`puppy add`, `puppy ls`, …) and browser integration come later.
+subcommands (`puppy add`, `puppy ls`, …) come later; browser integration is
+described in [Browser downloads](#browser-downloads).
 
 ## Demo
 

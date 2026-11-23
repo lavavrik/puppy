@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { statusLine, formToSettings, settingsToForm, recentLines } from "../lib/ui.js";
+import { statusLine, formToSettings, settingsToForm, recentLines, mergeForm } from "../lib/ui.js";
 import { DEFAULTS } from "../lib/settings.js";
 
 test("status lines", () => {
@@ -58,4 +58,26 @@ test("recent lines", () => {
   assert.deepEqual(recentLines([{ name: "h", ok: false }]), [{ text: "✗ h", ok: false }]);
   assert.deepEqual(recentLines([]), []);
   assert.deepEqual(recentLines(undefined), []);
+});
+
+test("mismatch from an error reply and unknown states have no undefined", () => {
+  const line = statusLine({ state: "mismatch", message: "bad protocol" }, "0.1.0");
+  assert.ok(!line.includes("undefined"));
+  assert.ok(line.includes("bad protocol") && line.includes("Downloads stay in the browser."));
+  assert.ok(!statusLine({ state: "mismatch" }, "0.1.0").includes("undefined"));
+  assert.equal(statusLine({ state: "error" }, "0.1.0"), "Cannot reach puppy: unknown error");
+  assert.equal(statusLine({ state: "weird" }, "0.1.0"), "Cannot reach puppy: unknown error");
+});
+
+test("minimum size accepts a comma and is capped", () => {
+  const bytes = (minSizeMiB) => formToSettings({ enabled: true, minSizeMiB, extensions: "", sites: "" }).minSizeBytes;
+  assert.equal(bytes("1,5"), 1572864);
+  assert.equal(bytes("1e300"), 1048576 * 1048576);
+  assert.equal(bytes("Infinity"), 0);
+});
+
+test("merge keeps fields edited elsewhere", () => {
+  const current = { ...DEFAULTS, enabled: false, skipSites: ["a.com"] };
+  const edited = { enabled: true, minSizeBytes: 5, skipExtensions: ["zip"], skipSites: [] };
+  assert.deepEqual(mergeForm(current, edited, ["skipExtensions"]), { ...current, skipExtensions: ["zip"] });
 });

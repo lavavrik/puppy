@@ -47,7 +47,7 @@ export async function handleDownload(api, item, release, { now = Date.now, userA
       return resumed("cookies unreadable");
     }
 
-    const name = basename(current.filename || item.filename) || basename(new URL(item.url).pathname) || item.url;
+    const name = basename(current.filename || item.filename) || basename(new URL(item.url).pathname) || new URL(item.url).hostname;
     const record = (ok, detail) => addRecent(api, { name, ok, detail, at: now() });
     const giveBack = async (detail) => {
       await api.downloads.resume(item.id).catch(swallow);
