@@ -1,9 +1,13 @@
 [package]
 name = "puppy"
-description = "A modern download manager: HTTP(S) and BitTorrent, with a background daemon"
+description = "A modern terminal download manager: HTTP(S) and BitTorrent, with a background daemon, a live dashboard and browser pickup"
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "puppy"

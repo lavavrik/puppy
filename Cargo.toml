@@ -6,6 +6,10 @@ members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver",
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/lavavrik/puppy"
+homepage = "https://github.com/lavavrik/puppy"
+# Distributed as prebuilt binaries from GitHub releases, not through crates.io.
+publish = false
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
