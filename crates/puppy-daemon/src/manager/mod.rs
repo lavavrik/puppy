@@ -134,10 +134,6 @@ struct Entry {
     /// `Event::SeedingFinished` was emitted since it last entered `Seeding` (the engine
     /// event and the manager's own look may both report the end).
     seeding_finished_sent: bool,
-    /// `Event::ChoosingFiles` was emitted for this download (once per download; also set
-    /// for one restored as choosing files, so a restarting daemon does not ask again).
-    /// Cleared when the choice is made or the download is restarted.
-    choose_files_sent: bool,
 }
 
 /// When a transiently failed download is requeued.
@@ -159,7 +155,6 @@ impl Entry {
             backoff: None,
             progress_mark: None,
             seeding_finished_sent: false,
-            choose_files_sent: false,
         }
     }
 
@@ -473,8 +468,8 @@ impl Inner {
                     reason: reason.into(),
                 });
             }
-            DownloadState::ChoosingFiles if !e.choose_files_sent => {
-                e.choose_files_sent = true;
+            DownloadState::ChoosingFiles if !e.rec.choose_files_sent => {
+                e.rec.choose_files_sent = true;
                 self.emit(Event::ChoosingFiles {
                     id,
                     name: e.rec.name.clone().unwrap_or_default(),
@@ -927,6 +922,7 @@ mod tests {
             total_bytes: None,
             created_unix: 1,
             finished_unix: None,
+            choose_files_sent: false,
         };
         Entry::new(rec, state, Some(0))
     }
@@ -1130,11 +1126,76 @@ mod tests {
         let mut rx = m.events();
         let inner = &m.inner;
         let mut e = inner.lock().entries.remove(&5).expect("restored");
-        assert!(e.choose_files_sent);
+        assert!(e.rec.choose_files_sent);
         let mut fx = Effects::default();
         e.state = DownloadState::Active;
         assert!(inner.transition(5, &mut e, DownloadState::ChoosingFiles, &mut fx));
         assert_eq!(drain(&mut rx), Vec::<Event>::new());
+    }
+
+    /// A choosing torrent without a stored path is re-queued to refetch its metadata; if
+    /// the daemon stops again before it re-enters choosing, the next one still must not
+    /// ask again (the flag is persisted, not only derived from the stored state).
+    #[tokio::test]
+    async fn interrupted_refetch_does_not_ask_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut rec = entry(DownloadState::Queued).rec;
+        rec.id = 5;
+        rec.request.source = puppy_core::types::Source::Magnet {
+            uri: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        rec.state = crate::store::StoredState::ChoosingFiles;
+        let st = crate::store::PersistedState {
+            next_id: 6,
+            order: vec![5],
+            downloads: vec![rec],
+            ..Default::default()
+        };
+        Store::new(path.clone()).save_now(&st).await.unwrap();
+        // Run 1: restored (re-queued, no path), stopped before choosing again.
+        let m = Manager::start(
+            vec![std::sync::Arc::new(Empty)],
+            Store::new(path.clone()),
+            Config::default(),
+        )
+        .await
+        .unwrap();
+        m.shutdown().await;
+        let saved = Store::new(path.clone()).load().await.unwrap();
+        assert_ne!(
+            saved.downloads[0].state,
+            crate::store::StoredState::ChoosingFiles
+        );
+        assert!(saved.downloads[0].choose_files_sent);
+        // Run 2: still does not ask when the metadata arrives.
+        let m = Manager::start(
+            vec![std::sync::Arc::new(Empty)],
+            Store::new(path),
+            Config::default(),
+        )
+        .await
+        .unwrap();
+        let mut rx = m.events();
+        let mut e = m.inner.lock().entries.remove(&5).expect("restored");
+        assert!(e.rec.choose_files_sent);
+        let mut fx = Effects::default();
+        e.state = DownloadState::Active;
+        assert!(
+            m.inner
+                .transition(5, &mut e, DownloadState::ChoosingFiles, &mut fx)
+        );
+        assert_eq!(drain(&mut rx), Vec::<Event>::new());
+    }
+
+    /// State written before the flag existed reads as not asked yet.
+    #[test]
+    fn stored_download_without_flag_defaults_to_false() {
+        let rec = entry(DownloadState::Queued).rec;
+        let mut v = serde_json::to_value(&rec).unwrap();
+        v.as_object_mut().unwrap().remove("choose_files_sent");
+        let back: StoredDownload = serde_json::from_value(v).unwrap();
+        assert!(!back.choose_files_sent);
     }
 
     /// A seeding download its engine does not hold is completed, never stuck seeding

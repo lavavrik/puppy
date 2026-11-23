@@ -105,6 +105,7 @@ impl Manager {
                 total_bytes: None,
                 created_unix: now_unix(),
                 finished_unix: None,
+                choose_files_sent: false,
             };
             st.entries.insert(id, Entry::new(rec, state, Some(engine)));
             st.order.push(id);
@@ -320,7 +321,7 @@ impl Manager {
             // Checked again: the state may have changed while the files were deleted.
             check_restartable(e)?;
             e.reset_retry();
-            e.choose_files_sent = false;
+            e.rec.choose_files_sent = false;
             let job = if e.held {
                 Inner::begin_job(id, e, JobKind::Reset)
             } else {
@@ -487,7 +488,7 @@ impl Manager {
                 && e.state == DownloadState::ChoosingFiles
             {
                 e.state = DownloadState::Queued;
-                e.choose_files_sent = false;
+                e.rec.choose_files_sent = false;
                 st.order.retain(|x| *x != id);
                 st.order.insert(0, id);
                 inner.persist(&st);

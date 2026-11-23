@@ -31,6 +31,7 @@ const FORCED_FLUSH: Duration = Duration::from_secs(1);
 /// from the manager's pause phase, so shutdown stays within its overall bound.
 const TORRENT_SHUTDOWN: Duration = Duration::from_millis(1500);
 /// How long the notifier may take to hand its last popups to the system at shutdown.
+/// Taken from the manager's pause phase like [`TORRENT_SHUTDOWN`].
 const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
@@ -123,7 +124,8 @@ pub enum RunOutcome {
 /// work or clients. Then it stops the server (removing the socket file), shuts the
 /// manager down (pausing downloads, then persisting state), stops the torrent session
 /// (about 1 s) and releases the lock. Pausing plus stopping the session take at most
-/// 10 s together: the session's 1.5 s are taken from the pause phase. Another signal during that shutdown makes it save the state for at most
+/// 10 s together: the session's 1.5 s (and the notifier's 1 s, when notifications are on)
+/// are taken from the pause phase. Another signal during that shutdown makes it save the state for at most
 /// 1 s and return [`RunOutcome::Forced`] at once.
 ///
 /// Fails without touching it if the state file exists but cannot be read.
@@ -157,6 +159,10 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         engines.push(t.clone());
         // The session stops after the pause phase, within the same overall bound.
         cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(TORRENT_SHUTDOWN);
+    }
+    if opts.notifier.is_some() && cfg.notifications.enabled {
+        // The last popups are flushed after that, within the same overall bound too.
+        cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(NOTIFY_FLUSH);
     }
     let store = Store::new(paths.state_file.clone());
     let notifications = cfg.notifications.clone();

@@ -17,7 +17,7 @@ pub struct DesktopNotifier {
     tx: Mutex<Option<SyncSender<Notification>>>,
     done: Mutex<Option<Receiver<()>>>,
     /// Set once the first backend failure has been logged (read by tests).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     logged: Arc<AtomicBool>,
 }
 

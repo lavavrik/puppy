@@ -393,6 +393,11 @@ fn timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
+/// The `watch` line for a torrent that waits for its files to be chosen.
+fn choosing_line(id: DownloadId, name: &str) -> String {
+    format!("choosing files {id} {name}")
+}
+
 /// `watch`: prints events as they happen until Ctrl-C (exit 0) or until stdout is
 /// closed. Human lines skip snapshots; `--json` prints every event as NDJSON.
 pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
@@ -453,7 +458,13 @@ pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
                 Event::SeedingFinished { id } => {
                     format!("seeding finished {id} {}", name(&names, id))
                 }
-                Event::ChoosingFiles { .. } | Event::Unknown => continue,
+                Event::ChoosingFiles { id, name: n } => {
+                    if !n.is_empty() {
+                        names.insert(id, n);
+                    }
+                    choosing_line(id, &name(&names, id))
+                }
+                Event::Unknown => continue,
             };
             out(format_args!("{} {line}", timestamp()));
         }
@@ -469,6 +480,18 @@ pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use puppy_proto::EngineKindTag;
+
+    #[test]
+    fn choosing_files_has_a_watch_line_and_json() {
+        assert_eq!(choosing_line(4, "Show.S01"), "choosing files 4 Show.S01");
+        let ev = Event::ChoosingFiles {
+            id: 4,
+            name: "Show.S01".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.to_string().contains("Show.S01"), "{v}");
+        assert!(v.to_string().to_lowercase().contains("choosing"), "{v}");
+    }
 
     fn snap(state: WireState, total: Option<u64>, done: u64, bps: u64) -> DownloadSnapshot {
         DownloadSnapshot {

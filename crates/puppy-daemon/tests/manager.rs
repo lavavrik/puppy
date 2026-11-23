@@ -1141,6 +1141,7 @@ async fn stored_transient_failure_is_retried_after_restart() {
         total_bytes: None,
         created_unix: 1,
         finished_unix: None,
+        choose_files_sent: false,
     };
     let st = puppy_daemon::PersistedState {
         next_id: 5,
@@ -1288,6 +1289,7 @@ async fn restart_of_unheld_download_deletes_its_partial_files() {
         total_bytes: Some(64 * KIB),
         created_unix: 1,
         finished_unix: None,
+        choose_files_sent: false,
     };
     let st = puppy_daemon::PersistedState {
         next_id: 2,
@@ -1333,6 +1335,7 @@ async fn restart_keeps_partial_files_another_download_owns() {
         total_bytes: Some(64 * KIB),
         created_unix: 1,
         finished_unix: None,
+        choose_files_sent: false,
     };
     let st = puppy_daemon::PersistedState {
         next_id: 3,

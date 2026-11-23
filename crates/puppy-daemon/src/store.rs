@@ -53,6 +53,11 @@ pub struct StoredDownload {
     pub total_bytes: Option<u64>,
     pub created_unix: u64,
     pub finished_unix: Option<u64>,
+    /// `Event::ChoosingFiles` was emitted for this download (once per download, also
+    /// across restarts; a download restored as choosing files counts as asked). Cleared
+    /// when the choice is made or the download is restarted.
+    #[serde(default)]
+    pub choose_files_sent: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -390,6 +395,7 @@ mod tests {
                 total_bytes: Some(10),
                 created_unix: 100,
                 finished_unix: None,
+                choose_files_sent: false,
             }],
             settings: Some(RuntimeSettings {
                 max_active: 3,

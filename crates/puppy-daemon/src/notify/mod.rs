@@ -270,10 +270,12 @@ impl NotifyTask {
     /// in all) for the sink to hand the popups to the system.
     pub async fn finish(self, within: Duration) {
         self.stop.cancel();
+        let deadline = Instant::now() + within;
         let work = async {
             let _ = self.handle.await;
             let sink = self.sink;
-            let _ = tokio::task::spawn_blocking(move || sink.flush(within)).await;
+            let left = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::task::spawn_blocking(move || sink.flush(left)).await;
         };
         if tokio::time::timeout(within, work).await.is_err() {
             debug!("notifications were not delivered in time");
@@ -339,6 +341,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn desktop_wanted_reads_env() {
         use super::desktop_wanted;
@@ -349,8 +353,6 @@ mod tests {
         assert!(!desktop_wanted(with("PUPPY_TORRENT_TEST_MODE", "1")));
         assert!(desktop_wanted(with("PUPPY_NO_NOTIFY", "0")));
     }
-
-    use super::*;
 
     fn item(id: DownloadId, name: &str) -> Item {
         Item {
