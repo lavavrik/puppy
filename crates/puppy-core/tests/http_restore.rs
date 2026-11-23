@@ -887,7 +887,7 @@ async fn cross_origin_redirect_target_gets_no_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let mut req = request(&origin, dir.path());
     req.source = Source::Http {
-        url: origin.url("/away"),
+        url: origin.url("/away?sig=signed-token"),
     };
     req.context = secret_context();
     let (dl, added) = start(req.clone(), cfg(dir.path())).await;
@@ -911,19 +911,15 @@ async fn cross_origin_redirect_target_gets_no_credentials() {
         assert_eq!(h.get("user-agent").unwrap(), "TestAgent/1");
         assert_eq!(h.get("x-token").unwrap(), "tok");
     }
-    // Requests sent straight to the target keep the referer (on the redirect hop itself
-    // reqwest substitutes the redirecting URL).
-    let with_referer = seen
-        .iter()
-        .filter(|h| {
-            h.get("referer")
-                .is_some_and(|r| r == "https://example.com/page")
-        })
-        .count();
-    assert!(
-        with_referer >= 2,
-        "{with_referer} requests kept the referer"
-    );
+    // Every request to the target carries the user's referer, never the redirecting URL
+    // (whose query may hold a signed token), including the redirect hop itself.
+    for h in &seen {
+        assert_eq!(
+            h.get("referer").and_then(|v| v.to_str().ok()),
+            Some("https://example.com/page"),
+            "referer: {h:?}"
+        );
+    }
     // The original host did get them.
     let first = &origin.requests_seen()[0];
     assert!(first.get("cookie").is_some());

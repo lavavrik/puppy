@@ -32,6 +32,10 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
         // multi-connection downloads (per-connection throttling is what they work around).
         .http1_only()
         .redirect(reqwest::redirect::Policy::limited(10))
+        // On a redirect reqwest would replace the caller's Referer with the full previous
+        // URL, query included (a signed token, say), and send it to the next host. Keep
+        // the caller's own Referer header instead (browsers send at most the origin).
+        .referer(false)
         // No client-level read timeout: its deadline keeps running while a caller is not
         // polling the body (e.g. waiting on a rate limiter) and then fires spuriously.
         // Callers bound each network wait with `timed` instead.
