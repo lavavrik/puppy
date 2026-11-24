@@ -937,8 +937,7 @@ fn reexec_after_reconnect_to_new_version() {
     assert!(a.update(reconnect("0.1.0"), now).is_empty());
     assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
     let cmds = a.update(reconnect("0.2.0"), now);
-    assert_eq!(cmds, vec![Cmd::Reexec]);
-    assert!(a.should_quit);
+    reexec_or_notice(&mut a, cmds);
 }
 
 #[test]
@@ -981,7 +980,7 @@ fn connection_banners_win_over_update_banners() {
 }
 
 #[test]
-fn installing_event_shows_updating_and_clear_keeps_it() {
+fn installing_event_shows_updating_and_confirmed_install_survives_clear() {
     let (mut a, now) = connected(vec![]);
     a.update(
         Msg::Daemon(Event::Update {
@@ -992,6 +991,73 @@ fn installing_event_shows_updating_and_clear_keeps_it() {
         now,
     );
     assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+    // A bare Installing event is cancelled by UpToDate; our own install is not.
+    a.update(Msg::UpdateStatus(UpdateStatus::UpToDate), now);
+    assert_eq!(a.banner, None);
+    a.update(available(true), now);
+    a.update(ch('U'), now);
     a.update(Msg::UpdateStatus(UpdateStatus::UpToDate), now);
     assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+}
+
+/// Unix hands over to the new puppy; Windows asks for a reopen.
+fn reexec_or_notice(a: &mut App, cmds: Vec<Cmd>) {
+    if cfg!(windows) {
+        assert!(cmds.is_empty());
+        assert_eq!(
+            banner_text(a),
+            "puppy updated to 0.2.0 \u{2014} quit and reopen the dashboard"
+        );
+    } else {
+        assert_eq!(cmds, vec![Cmd::Reexec]);
+        assert!(a.should_quit);
+    }
+}
+
+#[test]
+fn bare_installing_event_is_cancelled_by_available() {
+    let (mut a, now) = connected(vec![]);
+    a.update(
+        Msg::Daemon(Event::Update {
+            status: UpdateStatus::Installing {
+                version: "0.2.0".into(),
+            },
+        }),
+        now,
+    );
+    a.update(available(true), now);
+    assert!(matches!(a.banner, Some(Banner::UpdateAvailable { .. })));
+    assert_eq!(a.update(ch('U'), now), vec![Cmd::InstallUpdate]);
+}
+
+#[test]
+fn error_after_installed_event_still_reexecs() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    a.update(ch('U'), now);
+    a.update(
+        Msg::Daemon(Event::Update {
+            status: UpdateStatus::Installed {
+                version: "0.2.0".into(),
+            },
+        }),
+        now,
+    );
+    a.update(
+        Msg::CmdResult(CmdOutcome {
+            label: "update".into(),
+            result: Err(CmdError::Failed("connection closed".into())),
+        }),
+        now,
+    );
+    assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+    let cmds = a.update(
+        Msg::Connected {
+            version: "0.2.0".into(),
+            settings: settings(3),
+            downloads: vec![],
+        },
+        now,
+    );
+    reexec_or_notice(&mut a, cmds);
 }

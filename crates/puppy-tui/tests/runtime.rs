@@ -956,6 +956,7 @@ fn banner_sits_under_the_title_at_every_size() {
         },
         Banner::Updating("0.2.0".into()),
         Banner::UpdateFailed("checksum mismatch".into()),
+        Banner::Notice("puppy updated to 0.2.0".into()),
     ];
     for (w, h) in [(60, 16), (80, 24), (120, 40)] {
         for b in &banners {
@@ -981,6 +982,7 @@ fn banner_sits_under_the_title_at_every_size() {
                 Banner::UpdateAvailable { .. } => "puppy 0.2.0 is available",
                 Banner::Updating(_) => "updating to 0.2.0",
                 Banner::UpdateFailed(_) => "update failed",
+                Banner::Notice(_) => "puppy updated to 0.2.0",
             };
             assert!(rows[1].contains(want), "{w}x{h}:\n{t}");
             assert!(rows[2].starts_with('╭'), "{w}x{h}:\n{t}");

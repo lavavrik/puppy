@@ -237,7 +237,7 @@ fn banner(app: &App, buf: &mut Buffer, area: Rect) {
     let (mark, token) = match banner {
         Banner::Incompatible(_) => (" ! ", Token::Warn),
         Banner::NoDaemon(_) | Banner::Error(_) => (" ✗ ", Token::Err),
-        Banner::Restarting | Banner::Updating(_) => (" ◌ ", Token::Info),
+        Banner::Restarting | Banner::Updating(_) | Banner::Notice(_) => (" ◌ ", Token::Info),
         Banner::UpdateAvailable { .. } => (" ↑ ", Token::Info),
         Banner::UpdateFailed(_) => (" ✗ ", Token::Err),
     };

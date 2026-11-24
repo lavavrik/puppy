@@ -69,6 +69,8 @@ pub enum Banner {
     Updating(String),
     /// The last install failed (the error).
     UpdateFailed(String),
+    /// A plain message, drawn as is.
+    Notice(String),
 }
 
 impl Banner {
@@ -98,6 +100,7 @@ impl Banner {
             },
             Banner::Updating(v) => format!("updating to {v}\u{2026}"),
             Banner::UpdateFailed(e) => format!("update failed: {e}"),
+            Banner::Notice(t) => t.clone(),
         }
     }
 
@@ -403,6 +406,9 @@ pub struct App {
     /// The version being installed (by `U` here, or an event), until the dashboard
     /// reconnects to it or the install fails.
     updating: Option<String>,
+    /// Whether `updating` is ours (`U` here, or `Installed`) rather than a bare
+    /// `Installing` event, which a give-way install's `Available` cancels.
+    update_confirmed: bool,
     /// Set with [`Cmd::Reexec`]: after quitting, the runtime starts the updated puppy.
     pub reexec: bool,
     /// The last left click on a list row, for double-click detection.
@@ -442,6 +448,7 @@ impl App {
             banner: None,
             update: UpdateStatus::NotChecked,
             updating: None,
+            update_confirmed: false,
             reexec: false,
             last_click: None,
             submitted_at: None,
@@ -687,6 +694,11 @@ impl App {
                 if outcome.label == UPDATE_LABEL
                     && let Err(e) = outcome.result
                 {
+                    // The daemon dropping us as it restarts into a finished install is
+                    // no failure: the reconnect check takes over.
+                    if matches!(self.update, UpdateStatus::Installed { .. }) {
+                        return Vec::new();
+                    }
                     self.on_update_status(UpdateStatus::Failed {
                         version: self.updating.clone(),
                         error: one_line(&e.to_string()),
@@ -857,10 +869,17 @@ impl App {
     /// Folds in a new update status and redraws the update banner from it.
     fn on_update_status(&mut self, status: UpdateStatus) {
         match &status {
-            UpdateStatus::Installing { version } | UpdateStatus::Installed { version } => {
+            UpdateStatus::Installing { version } => self.updating = Some(version.clone()),
+            UpdateStatus::Installed { version } => {
                 self.updating = Some(version.clone());
+                self.update_confirmed = true;
             }
-            UpdateStatus::Failed { .. } => self.updating = None,
+            UpdateStatus::Failed { .. } => {
+                self.updating = None;
+                self.update_confirmed = false;
+            }
+            // Someone else's install gave way: it is not running any more.
+            _ if !self.update_confirmed => self.updating = None,
             _ => {}
         }
         self.update = status;
@@ -898,7 +917,7 @@ impl App {
     fn reexec_cmds(&mut self) -> Vec<Cmd> {
         let version = self.updating.take().unwrap_or_default();
         if cfg!(windows) {
-            self.banner = Some(Banner::Error(format!(
+            self.banner = Some(Banner::Notice(format!(
                 "puppy updated to {version} \u{2014} quit and reopen the dashboard"
             )));
             return Vec::new();
@@ -1052,6 +1071,7 @@ impl App {
                     return Vec::new();
                 };
                 self.updating = Some(version.clone());
+                self.update_confirmed = true;
                 self.banner = Some(Banner::Updating(version));
                 vec![Cmd::InstallUpdate]
             }
