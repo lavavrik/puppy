@@ -189,7 +189,11 @@ impl DaemonApi for ClientApi {
                 };
             }
             Cmd::InstallUpdate => {
-                return match client.call(Request::Update { check_only: false }).await {
+                // An install may take minutes (the daemon bounds it): no call timeout.
+                return match client
+                    .call_unbounded(Request::Update { check_only: false })
+                    .await
+                {
                     Ok(ReplyData::Update {
                         status: status @ UpdateStatus::Installed { .. },
                     }) => Ok(Some(Msg::UpdateStatus(status))),

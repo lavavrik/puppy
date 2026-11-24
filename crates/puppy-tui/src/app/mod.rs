@@ -916,6 +916,8 @@ impl App {
     /// ask for a reopen (nothing can be started from here on Windows).
     fn reexec_cmds(&mut self) -> Vec<Cmd> {
         let version = self.updating.take().unwrap_or_default();
+        // That install is done with: a later one is not ours until we confirm it.
+        self.update_confirmed = false;
         if cfg!(windows) {
             self.banner = Some(Banner::Notice(format!(
                 "puppy updated to {version} \u{2014} quit and reopen the dashboard"

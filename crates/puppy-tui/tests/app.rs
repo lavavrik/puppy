@@ -1061,3 +1061,40 @@ fn error_after_installed_event_still_reexecs() {
     );
     reexec_or_notice(&mut a, cmds);
 }
+
+#[test]
+fn install_after_reexec_is_not_ours() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    a.update(ch('U'), now);
+    a.update(
+        Msg::UpdateStatus(UpdateStatus::Installed {
+            version: "0.2.0".into(),
+        }),
+        now,
+    );
+    let reconnect = |version: &str| Msg::Connected {
+        version: version.into(),
+        settings: settings(3),
+        downloads: vec![],
+    };
+    let cmds = a.update(reconnect("0.2.0"), now);
+    reexec_or_notice(&mut a, cmds);
+    // A later install someone else started, which then gives way, leaves no
+    // "updating" banner behind.
+    a.update(reconnect("0.2.0"), now);
+    a.update(
+        Msg::Daemon(Event::Update {
+            status: UpdateStatus::Installing {
+                version: "0.3.0".into(),
+            },
+        }),
+        now,
+    );
+    a.update(available(true), now);
+    assert!(
+        matches!(a.banner, Some(Banner::UpdateAvailable { .. })),
+        "{:?}",
+        a.banner
+    );
+}
