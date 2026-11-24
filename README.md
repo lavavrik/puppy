@@ -142,7 +142,8 @@ to install right away; `puppy update --check` only looks. Your queue, settings
 and downloads are kept, and a notification says "puppy updated to <version>".
 
 - `[update]` in the config turns this off: `check = false` stops the daily
-  check, `auto_install = false` only notifies (see Configuration).
+  check and automatic installs (puppy then only contacts GitHub when you run
+  `puppy update`), `auto_install = false` only notifies (see Configuration).
 - Development builds and `cargo install` builds do not update themselves; only
   the release binaries do.
 - A folder puppy cannot write to (such as an older macOS install in
@@ -371,11 +372,13 @@ Updates are checked on GitHub and installed when puppy is idle:
 
 ```toml
 [update]
-check = true            # false: puppy never contacts GitHub for updates
+check = true            # false: no daily check and no automatic install
 auto_install = true     # install a found release when no download is running
 ```
 
-`check = false` means puppy never contacts GitHub for updates.
+With `check = false` puppy never contacts GitHub by itself, only when you run
+`puppy update`, and never installs an update by itself, whatever `auto_install`
+says.
 
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening

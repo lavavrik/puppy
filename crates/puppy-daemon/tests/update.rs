@@ -597,6 +597,48 @@ mod daemon {
         assert_eq!(env.stop(d).await, RunOutcome::Exited);
     }
 
+    /// `check = false`: an update found by an explicit check is never installed by
+    /// the daemon itself, neither when quiet nor before an idle exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn check_disabled_never_installs_by_itself() {
+        let env = Env::new().await;
+        env.write_config("[update]\ncheck = false\n");
+        let d = env.launch(env.settling()).await;
+        let mut c = env.client().await;
+        let s = reply_status(c.update(true).await);
+        assert!(
+            matches!(
+                &s,
+                UpdateStatus::Available {
+                    can_install: true,
+                    ..
+                }
+            ),
+            "{s:?}"
+        );
+        drop(c);
+        tokio::time::sleep(SETTLE + Duration::from_secs(2)).await;
+        assert!(!d.is_finished(), "the daemon stopped");
+        assert_eq!(env.fake.downloads(), 0, "downloaded the update by itself");
+        assert!(!env.exe_swapped(), "installed by itself");
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+
+        let mut opts = env.opts(true);
+        opts.idle_exit = Some(Duration::from_secs(1));
+        let d = env.launch(opts).await;
+        let mut c = env.client().await;
+        let s = reply_status(c.update(true).await);
+        assert!(matches!(s, UpdateStatus::Available { .. }), "{s:?}");
+        drop(c);
+        assert_eq!(exited(d).await, RunOutcome::Exited);
+        assert_eq!(
+            env.fake.downloads(),
+            0,
+            "downloaded the update before exiting"
+        );
+        assert!(!env.exe_swapped(), "installed before exiting");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_check_waits_a_day() {
         let env = Env::new().await;
@@ -1026,6 +1068,40 @@ mod daemon {
             assert!(Instant::now() < deadline, "the update was never downloaded");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// An automatic install that turns out not to be possible (the folder became
+    /// read-only) marks the release as not installable instead of retrying forever.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_install_not_possible_stops_retrying() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = Env::new().await;
+        let bin = env.exe.parent().unwrap().to_path_buf();
+        let d = env.launch(env.settling()).await;
+        let mut c = env.client().await;
+        c.wait_available().await;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(bin.join("probe")).is_ok() {
+            // Running as root: the folder stays writable, nothing to test.
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(c);
+            env.stop(d).await;
+            return;
+        }
+        drop(c);
+        wait_status(&env, &d, |s| {
+            matches!(
+                s,
+                UpdateStatus::Available { can_install: false, reason: Some(r), .. }
+                    if r.contains("cannot write")
+            )
+        })
+        .await;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(env.fake.downloads(), 0);
+        assert!(!env.exe_swapped());
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
     }
 
     #[cfg(unix)]

@@ -67,6 +67,9 @@ pub struct DaemonOptions {
     pub notifier: Option<Arc<dyn Notifier>>,
     /// Self-update settings. `None`: updates off (the default; only `main` turns them on).
     pub update: Option<UpdateOptions>,
+    /// Why `update` is `None` when updates were wanted but could not be set up (main:
+    /// set before logging starts); logged as a warning once it does.
+    pub update_off_reason: Option<String>,
     /// When another daemon holds the lock, keep trying for this long (every 100 ms)
     /// before reporting `AlreadyRunning`. `None` (the default): report it at once. Set
     /// for a daemon started by an update's restart, whose predecessor is still exiting.
@@ -112,6 +115,7 @@ impl std::fmt::Debug for DaemonOptions {
             .field("torrent_test", &self.torrent_test)
             .field("notifier", &self.notifier.is_some())
             .field("update", &self.update)
+            .field("update_off_reason", &self.update_off_reason)
             .field("lock_wait", &self.lock_wait)
             .finish()
     }
@@ -154,6 +158,9 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         None => Paths::resolve().context("cannot set up the daemon's directories")?,
     };
     init_logging(&paths.log_dir);
+    if let Some(reason) = &opts.update_off_reason {
+        warn!("updates are off: {reason}");
+    }
     if let Some(roots) = puppy_core::tls::bundled_roots_in_use() {
         tracing::warn!(
             "no CA certificates found on this system (install the ca-certificates package); \

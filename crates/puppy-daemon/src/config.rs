@@ -135,9 +135,10 @@ impl Default for NotificationsConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct UpdateConfig {
-    /// Look for new releases on GitHub.
+    /// Look for new releases on GitHub by itself. Off: GitHub is only contacted when
+    /// asked to (`puppy update`, Shift-U), and nothing is installed by itself either.
     pub check: bool,
-    /// Install a found release when the daemon is idle.
+    /// Install a found release when the daemon is idle (only with `check` on).
     pub auto_install: bool,
 }
 

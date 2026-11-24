@@ -362,6 +362,20 @@ async fn daemon_starts_without_system_ca_certificates() {
     assert!(!log.contains("cannot start the torrent engine"), "{log}");
 }
 
+/// A daemon that cannot set updates up says why in its log, not only on a stderr
+/// nobody reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_off_reason_is_logged() {
+    let mut env = Env::new();
+    env.extra
+        .push(("PUPPY_UPDATE_URL", "not a url".to_string()));
+    let c = env.spawn_client().await.unwrap();
+    let log = std::fs::read_to_string(env.paths().log_dir.join("puppyd.log")).unwrap();
+    drop(c);
+    assert!(log.contains("updates are off"), "{log}");
+    assert!(log.contains("PUPPY_UPDATE_URL"), "{log}");
+}
+
 /// An installed update replaces the running daemon in place: the new binary is
 /// exec'd with the daemon's arguments and keeps its pid.
 #[cfg(unix)]

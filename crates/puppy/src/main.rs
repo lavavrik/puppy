@@ -435,6 +435,8 @@ fn restart_into_update(exe: std::io::Result<PathBuf>) -> ExitCode {
             .exec(),
         Err(e) => e,
     };
+    // The daemon's log is still open: leave a trace where a service's stderr is lost.
+    tracing::error!("cannot start the updated puppy: {e}");
     err(format_args!("puppy: cannot start the updated puppy: {e}"));
     ExitCode::FAILURE
 }
@@ -450,6 +452,7 @@ fn restart_into_update(exe: std::io::Result<PathBuf>) -> ExitCode {
     match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            tracing::error!("cannot start the updated puppy: {e}");
             err(format_args!("puppy: cannot start the updated puppy: {e}"));
             ExitCode::FAILURE
         }
@@ -481,17 +484,17 @@ enum DaemonEnd {
     Restart,
 }
 
-/// Self-update settings for the real daemon; `None` (updates off) if the executable's
-/// own path cannot be found.
-fn update_options() -> Option<UpdateOptions> {
+/// Self-update settings for the real daemon; `Err(why)` (updates off) if the
+/// executable's own path cannot be found or `PUPPY_UPDATE_URL` is bad. Runs before the
+/// daemon's logging starts: the reason is printed here and handed to the daemon to log.
+fn update_options() -> Result<UpdateOptions, String> {
+    let off = |why: String| {
+        err(format_args!("puppy: updates are off, {why}"));
+        Err(why)
+    };
     let exe = match std::env::current_exe().and_then(|e| e.canonicalize()) {
         Ok(exe) => exe,
-        Err(e) => {
-            err(format_args!(
-                "puppy: updates are off, cannot find puppy's own executable: {e}"
-            ));
-            return None;
-        }
+        Err(e) => return off(format!("cannot find puppy's own executable: {e}")),
     };
     let api_base = std::env::var("PUPPY_UPDATE_URL")
         .ok()
@@ -499,18 +502,15 @@ fn update_options() -> Option<UpdateOptions> {
         .unwrap_or_else(|| "https://api.github.com".to_string());
     let api_base = match api_base.parse() {
         Ok(url) => url,
-        Err(e) => {
-            err(format_args!(
-                "puppy: updates are off, bad PUPPY_UPDATE_URL {api_base:?}: {e}"
-            ));
-            return None;
-        }
+        Err(e) => return off(format!("bad PUPPY_UPDATE_URL {api_base:?}: {e}")),
     };
-    Some(UpdateOptions {
+    Ok(UpdateOptions {
         api_base,
         exe,
-        // Undocumented, for puppy's own tests: install although this is not a release build.
-        allow_dev: std::env::var_os("PUPPY_UPDATE_ALLOW_DEV").as_deref() == Some("1".as_ref()),
+        // Undocumented, for puppy's own tests (debug builds): install although this is
+        // not a release build. An optimized build never honours it.
+        allow_dev: cfg!(debug_assertions)
+            && std::env::var_os("PUPPY_UPDATE_ALLOW_DEV").as_deref() == Some("1".as_ref()),
         settle: Duration::from_secs(60),
         check_delay: Duration::from_secs(5),
         check_every: Duration::from_secs(24 * 60 * 60),
@@ -540,12 +540,15 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<DaemonEnd> {
             .collect(),
         ..TorrentTestOptions::default()
     });
+    let update = update_options();
+    let update_off_reason = update.as_ref().err().cloned();
     let outcome = run_daemon(DaemonOptions {
         idle_exit: idle_exit.map(Duration::from_secs),
         torrent_test,
         notifier: desktop_wanted(|k| std::env::var(k).ok())
             .then(|| Arc::new(DesktopNotifier::new()) as Arc<dyn Notifier>),
-        update: update_options(),
+        update: update.ok(),
+        update_off_reason,
         // A daemon started by a Windows update hand-off waits for its predecessor.
         lock_wait: (std::env::var_os("PUPPY_UPDATE_HANDOFF").as_deref() == Some("1".as_ref()))
             .then_some(Duration::from_secs(5)),

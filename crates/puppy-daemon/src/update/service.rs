@@ -265,7 +265,8 @@ impl Updater {
     }
 
     /// For a daemon about to idle-exit: installs the update the last check found, if
-    /// `auto_install` is on and it can be installed (true: the binary was swapped).
+    /// automatic installs are on ([`auto`](Self::auto)) and it can be installed (true:
+    /// the binary was swapped).
     /// Unlike [`install_now`](Self::install_now) this does not fire
     /// [`restart_requested`](Self::restart_requested): the daemon exits as planned and
     /// the next client starts the new binary. (An install already running is waited
@@ -273,11 +274,18 @@ impl Updater {
     /// client that appears meanwhile wins: nothing is swapped and the status is back to
     /// `Available`.
     pub async fn install_before_exit(&self) -> bool {
-        if !self.inner.cfg.auto_install || !self.installable() {
+        if !self.auto() || !self.installable() {
             return false;
         }
         info!("installing the update before exiting");
         matches!(self.install(Gate::Idle, false).await, Some(Ok(_)))
+    }
+
+    /// Whether the daemon may install by itself: `[update] check` and `auto_install`
+    /// both on. With `check = false` puppy only contacts GitHub when asked to, so a
+    /// release found by an explicit check is never downloaded on its own.
+    fn auto(&self) -> bool {
+        self.inner.cfg.check && self.inner.cfg.auto_install
     }
 
     /// Whether `gate` still allows swapping the binary in now.
@@ -339,6 +347,16 @@ impl Updater {
     async fn attempt(&self, gate: Gate) -> Option<Result<Version, UpdateError>> {
         let i = &self.inner;
         if let Some(reason) = cannot_install_reason(&i.opts.exe, i.opts.allow_dev) {
+            // The release is known but cannot go in here: say so, which also stops
+            // automatic installs from retrying it.
+            self.change_status(|cur| match cur {
+                UpdateStatus::Available { version, .. } => UpdateStatus::Available {
+                    version: version.clone(),
+                    can_install: false,
+                    reason: Some(reason.clone()),
+                },
+                other => other.clone(),
+            });
             return Some(Err(UpdateError::NotPossible(reason)));
         }
         let cached = i.release.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -462,14 +480,14 @@ impl Updater {
         }
     }
 
-    /// With `[update] auto_install`: once an installable release is known and the
-    /// daemon has been quiet (no download queued, starting, active or waiting for a
-    /// retry; seeding does not count) with no client connected for `settle` without
-    /// a break, installs it. Returns after a successful install; after a failed one
+    /// With automatic installs on ([`auto`](Self::auto)): once an installable release
+    /// is known and the daemon has been quiet (no download queued, starting, active
+    /// or waiting for a retry; seeding does not count) with no client connected for
+    /// `settle` without a break, installs it. Returns after a successful install; after a failed one
     /// it waits for a check to find a release again.
     async fn install_when_quiet(&self, clients: &AtomicUsize) {
         let i = &self.inner;
-        if !i.cfg.auto_install {
+        if !self.auto() {
             return;
         }
         let mut tick = tokio::time::interval(QUIET_CHECK);
@@ -502,9 +520,10 @@ impl Updater {
             .ok()
             .and_then(|b| serde_json::from_slice::<UpdateState>(&b).ok())
             .map(|s| s.last_check);
+        let now = unix_now();
         match last {
-            Some(last) if last <= unix_now() => {
-                every.saturating_sub(Duration::from_secs(unix_now() - last))
+            Some(last) if last <= now => {
+                every.saturating_sub(Duration::from_secs(now.saturating_sub(last)))
             }
             _ => Duration::ZERO,
         }
