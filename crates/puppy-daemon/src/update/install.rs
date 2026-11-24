@@ -116,15 +116,19 @@ async fn download_checksum(
     if body.len() > MAX_CHECKSUM_BYTES {
         return Err(failed(format!("{name} is too large to be a checksum file")));
     }
-    // `<hex>  <name>` or `<hex> *<name>`.
-    let text = String::from_utf8_lossy(&body);
+    parse_checksum(&String::from_utf8_lossy(&body))
+        .map_err(|_| failed(format!("{name} does not hold a SHA-256 checksum")))
+}
+
+/// The lowercase hex digest from a checksum file: `<hex>  <name>` or `<hex> *<name>`.
+fn parse_checksum(text: &str) -> Result<String, UpdateError> {
     let first = text
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     if first.len() != 64 || !first.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(failed(format!("{name} does not hold a SHA-256 checksum")));
+        return Err(failed("not a SHA-256 checksum"));
     }
     Ok(first)
 }
@@ -189,14 +193,37 @@ fn write_binary(from: &mut impl Read, dest: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn is_text_file_busy(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn is_text_file_busy(_: &std::io::Error) -> bool {
+    false
+}
+
 /// Runs `bin --version` (10 s limit); stdout must be exactly `puppy <version>` (trimmed).
 pub async fn sanity_check(bin: &Path, version: &Version) -> Result<(), UpdateError> {
-    let run = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
+    let run = async {
+        let mut tries = 0;
+        loop {
+            let result = tokio::process::Command::new(bin)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await;
+            tries += 1;
+            // A binary just written can still be open for writing elsewhere (ETXTBSY).
+            if tries < 5 && matches!(&result, Err(e) if is_text_file_busy(e)) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            return result;
+        }
+    };
     let out = tokio::time::timeout(Duration::from_secs(10), run)
         .await
         .map_err(|_| failed("the new puppy did not answer --version within 10 seconds"))?
@@ -229,10 +256,15 @@ pub fn replace_exe(new: &Path, exe: &Path) -> Result<(), UpdateError> {
         let staged = dir.join(".puppy-new");
         let result = std::fs::copy(new, &staged)
             .and_then(|_| std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)))
+            .and_then(|_| sync_file(&staged))
             .and_then(|_| std::fs::rename(&staged, exe));
         if let Err(e) = result {
             let _ = std::fs::remove_file(&staged);
             return Err(io_failed("could not install the new puppy", e));
+        }
+        // Make the rename itself durable; failing to is not worth failing the update.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
         }
         Ok(())
     }
@@ -243,7 +275,9 @@ pub fn replace_exe(new: &Path, exe: &Path) -> Result<(), UpdateError> {
         std::fs::rename(exe, &old)
             .map_err(|e| io_failed("could not move the running puppy aside", e))?;
         let staged = dir.join(".puppy-new");
-        let put = std::fs::copy(new, &staged).and_then(|_| std::fs::rename(&staged, exe));
+        let put = std::fs::copy(new, &staged)
+            .and_then(|_| sync_file(&staged))
+            .and_then(|_| std::fs::rename(&staged, exe));
         if let Err(e) = put {
             let _ = std::fs::remove_file(&staged);
             let _ = std::fs::rename(&old, exe);
@@ -251,6 +285,14 @@ pub fn replace_exe(new: &Path, exe: &Path) -> Result<(), UpdateError> {
         }
         Ok(())
     }
+}
+
+/// Flushes a file's contents to disk.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 #[cfg(not(unix))]
@@ -276,10 +318,13 @@ pub fn cannot_install_reason(exe: &Path, allow_dev: bool) -> Option<String> {
     if !super::RELEASE_BUILD && !allow_dev {
         return Some("this build was not made by puppy's release workflow".to_string());
     }
-    let dir = exe.parent()?;
+    let Some(dir) = exe.parent() else {
+        return Some(format!("puppy's location has no folder: {}", exe.display()));
+    };
     let probe = dir.join(format!(".puppy-probe-{}", std::process::id()));
     match std::fs::File::create(&probe) {
-        Ok(_) => {
+        Ok(file) => {
+            drop(file);
             let _ = std::fs::remove_file(&probe);
             None
         }
@@ -304,6 +349,28 @@ mod tests {
         }
         z.finish().unwrap();
         out.into_inner()
+    }
+
+    #[test]
+    fn checksum_files_parse() {
+        let hex = "ab".repeat(32);
+        for text in [
+            format!("{hex}  puppy.tar.gz\n"),
+            format!("{hex} *puppy.tar.gz\n"),
+            format!("{}  puppy.tar.gz\r\n", hex.to_uppercase()),
+            format!("{hex}\r\n"),
+        ] {
+            assert_eq!(parse_checksum(&text).unwrap(), hex, "{text:?}");
+        }
+        for bad in ["", "garbage here", &"ab".repeat(31), &"zz".repeat(32)] {
+            assert!(parse_checksum(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn exe_without_a_folder_cannot_install() {
+        let reason = cannot_install_reason(Path::new("/"), true).unwrap();
+        assert!(reason.contains("no folder"), "{reason}");
     }
 
     #[test]

@@ -134,6 +134,11 @@ impl FakeRelease {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(body.len() as u64);
                 header.set_mode(*mode);
+                assert!(
+                    name.len() <= 100,
+                    "tar entry name too long for the fake ({} bytes): {name}",
+                    name.len()
+                );
                 // Written raw: `set_path` refuses `..` components.
                 let raw = &mut header.as_gnu_mut().unwrap().name;
                 raw[..name.len()].copy_from_slice(name.as_bytes());

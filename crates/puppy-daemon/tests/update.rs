@@ -165,8 +165,10 @@ fn read_only_dir_cannot_install() {
     let exe = dir.path().join("puppy");
     std::fs::write(&exe, b"x").unwrap();
     // Dev builds are refused unless the caller allows them.
-    let reason = cannot_install_reason(&exe, false).unwrap();
-    assert!(reason.contains("release workflow"), "{reason}");
+    if !puppy_daemon::update::RELEASE_BUILD {
+        let reason = cannot_install_reason(&exe, false).unwrap();
+        assert!(reason.contains("release workflow"), "{reason}");
+    }
     assert!(cannot_install_reason(&exe, true).is_none());
 
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
