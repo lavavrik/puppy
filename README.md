@@ -119,25 +119,34 @@ its SHA-256 and install `puppy`:
 | System  | Binary goes to                          | Archive unpacked in (extension, service files) |
 |---------|-----------------------------------------|------------------------------------------------|
 | Linux   | `~/.local/bin/puppy`                    | `~/.local/share/puppy-install/`                |
-| macOS   | `/usr/local/bin/puppy` (asks for sudo)  | `~/.local/share/puppy-install/`                |
+| macOS   | `~/.local/bin/puppy`                    | `~/.local/share/puppy-install/`                |
 | Windows | `%LOCALAPPDATA%\Programs\puppy\puppy.exe`, added to your `PATH` | `%LOCALAPPDATA%\puppy-install\` |
 
-Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux, if
+Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux and macOS, if
 `puppy` is not found afterwards, add `~/.local/bin` to your `PATH`.
 
 **By hand:** download the archive from the release page, check it with
 `shasum -a 256 -c <archive>.sha256`, unpack it and put `puppy` (`puppy.exe`)
 anywhere on your `PATH`. The macOS and Windows binaries are not signed, so
 when the archive comes from a browser, macOS refuses to run it at first (clear
-the flag with `xattr -d com.apple.quarantine /usr/local/bin/puppy`) and
+the flag with `xattr -d com.apple.quarantine ~/.local/bin/puppy`) and
 Windows SmartScreen may warn once. The install scripts download with
 `curl` / PowerShell, which does not trigger either.
 
-### Updating
+### Updates
 
-Run `puppy stop` so the old daemon exits, then run the install command again.
-Your queue, settings and downloads are kept; the next `puppy` command starts
-the new daemon.
+puppy checks GitHub for a new release once a day and installs it by itself when
+nothing is downloading and no dashboard, `puppy watch` or other client is open
+(seeding does not count). Press Shift-U in the dashboard, or run `puppy update`,
+to install right away; `puppy update --check` only looks. Your queue, settings
+and downloads are kept, and a notification says "puppy updated to <version>".
+
+- `[update]` in the config turns this off: `check = false` stops the daily
+  check, `auto_install = false` only notifies (see Configuration).
+- Development builds and `cargo install` builds do not update themselves; only
+  the release binaries do.
+- A folder puppy cannot write to (such as an older macOS install in
+  `/usr/local/bin`) only gets a notification: run the install command again.
 
 ## Build from source
 
@@ -352,6 +361,12 @@ choose_files = true     # torrent waiting for its files to be chosen
 seeding_finished = false
 ```
 
+Several popups of one kind are grouped into one ("3 downloads finished"): it is
+sent after 3 seconds without another such event, and at most 10 seconds after the
+first. Config is read when the daemon starts, so run `puppy stop` and let the next
+command restart it. `PUPPY_NO_NOTIFY=1` turns popups off for a daemon. A headless
+box or SSH session without a notification server simply shows none.
+
 Updates are checked on GitHub and installed when puppy is idle:
 
 ```toml
@@ -361,12 +376,6 @@ auto_install = true     # install a found release when no download is running
 ```
 
 `check = false` means puppy never contacts GitHub for updates.
-
-Several popups of one kind are grouped into one ("3 downloads finished"): it is
-sent after 3 seconds without another such event, and at most 10 seconds after the
-first. Config is read when the daemon starts, so run `puppy stop` and let the next
-command restart it. `PUPPY_NO_NOTIFY=1` turns popups off for a daemon. A headless
-box or SSH session without a notification server simply shows none.
 
 A daemon that `puppy` starts on demand exits after 30 seconds without
 downloads or clients. To keep downloads going across reboots without opening

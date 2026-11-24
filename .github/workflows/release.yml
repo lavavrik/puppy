@@ -78,6 +78,8 @@ jobs:
         with:
           key: dist-${{ matrix.target }}
       - name: Build
+        env:
+          PUPPY_RELEASE_BUILD: "1"
         run: cargo build --locked --profile dist --target ${{ matrix.target }} -p puppy
       - name: Smoke test
         shell: bash

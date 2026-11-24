@@ -4,7 +4,9 @@
   launchd LaunchAgent for the puppy daemon. Install: see docs/service.md
     cp packaging/launchd/dev.puppy.daemon.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.puppy.daemon.plist
-  Adjust the program path if puppy is not installed at /usr/local/bin/puppy.
+  Starts ~/.local/bin/puppy (where the install script puts it). launchd does not
+  expand "~", so a shell expands $HOME; exec keeps the PID for KeepAlive.
+  Edit the command if puppy is installed elsewhere.
 -->
 <plist version="1.0">
 <dict>
@@ -12,8 +14,9 @@
     <string>dev.puppy.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/puppy</string>
-        <string>daemon</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec "$HOME/.local/bin/puppy" daemon</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

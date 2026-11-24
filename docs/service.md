@@ -22,8 +22,8 @@ the data directory:
 | Windows | `%APPDATA%\puppy`                       |
 
 The examples assume the install locations from the README's
-[Install](../README.md#install) section: `~/.local/bin/puppy` on Linux,
-`/usr/local/bin/puppy` on macOS and `%LOCALAPPDATA%\Programs\puppy\puppy.exe` on
+[Install](../README.md#install) section: `~/.local/bin/puppy` on Linux and
+macOS, and `%LOCALAPPDATA%\Programs\puppy\puppy.exe` on
 Windows. If you installed with `cargo install`, the binary is in `~/.cargo/bin`
 instead; adjust the paths.
 
@@ -57,9 +57,11 @@ systemctl --user daemon-reload
 ## macOS (launchd LaunchAgent)
 
 The agent is [`packaging/launchd/dev.puppy.daemon.plist`](../packaging/launchd/dev.puppy.daemon.plist).
-It runs `/usr/local/bin/puppy daemon` at login and restarts it if it exits with
-an error. If puppy lives elsewhere (e.g. `~/.cargo/bin/puppy`), edit the first
-`ProgramArguments` entry; launchd needs an absolute path and does not expand `~`.
+It runs `~/.local/bin/puppy daemon` at login and restarts it if it exits with
+an error. launchd does not expand `~`, so the agent starts a shell
+(`/bin/sh -c 'exec "$HOME/.local/bin/puppy" daemon'`); `exec` keeps the process
+ID that `KeepAlive` watches. If puppy lives elsewhere (e.g. `~/.cargo/bin/puppy`),
+edit the path in that command.
 
 ```sh
 cp packaging/launchd/dev.puppy.daemon.plist ~/Library/LaunchAgents/

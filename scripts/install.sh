@@ -4,10 +4,12 @@
 #   curl -fsSL https://raw.githubusercontent.com/lavavrik/puppy/main/scripts/install.sh | sh
 #
 # Picks the archive for this machine, checks it against its published SHA-256,
-# and installs the binary to ~/.local/bin (Linux) or /usr/local/bin (macOS).
+# and installs the binary to ~/.local/bin (Linux and macOS), a folder puppy can
+# replace itself in when it updates.
 # The unpacked archive, with the browser extension and service files, is kept in
 # ~/.local/share/puppy-install. Set PUPPY_VERSION=0.1.0 to pick a version, or
-# PUPPY_BIN_DIR to install somewhere else.
+# PUPPY_BIN_DIR to install somewhere else (a folder you cannot write
+# to is installed into with sudo, and puppy then only notifies about updates).
 set -eu
 
 repo=lavavrik/puppy
@@ -15,8 +17,8 @@ repo=lavavrik/puppy
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)                target=x86_64-unknown-linux-gnu  bin=$HOME/.local/bin ;;
   Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu bin=$HOME/.local/bin ;;
-  Darwin-x86_64)               target=x86_64-apple-darwin       bin=/usr/local/bin ;;
-  Darwin-arm64)                target=aarch64-apple-darwin      bin=/usr/local/bin ;;
+  Darwin-x86_64)               target=x86_64-apple-darwin       bin=$HOME/.local/bin ;;
+  Darwin-arm64)                target=aarch64-apple-darwin      bin=$HOME/.local/bin ;;
   *) echo "puppy: no prebuilt binary for $(uname -sm); see the README to build from source" >&2; exit 1 ;;
 esac
 bin=${PUPPY_BIN_DIR:-$bin}
