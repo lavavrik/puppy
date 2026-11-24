@@ -949,6 +949,13 @@ fn banner_sits_under_the_title_at_every_size() {
         Banner::NoDaemon("no daemon answered — see its log: /x/puppyd.log".into()),
         Banner::Error("permission denied".into()),
         Banner::Restarting,
+        Banner::UpdateAvailable {
+            version: "0.2.0".into(),
+            can_install: true,
+            reason: None,
+        },
+        Banner::Updating("0.2.0".into()),
+        Banner::UpdateFailed("checksum mismatch".into()),
     ];
     for (w, h) in [(60, 16), (80, 24), (120, 40)] {
         for b in &banners {
@@ -971,6 +978,9 @@ fn banner_sits_under_the_title_at_every_size() {
                 Banner::NoDaemon(_) => "no daemon answered",
                 Banner::Error(_) => "cannot connect to the daemon",
                 Banner::Restarting => "restarting the daemon",
+                Banner::UpdateAvailable { .. } => "puppy 0.2.0 is available",
+                Banner::Updating(_) => "updating to 0.2.0",
+                Banner::UpdateFailed(_) => "update failed",
             };
             assert!(rows[1].contains(want), "{w}x{h}:\n{t}");
             assert!(rows[2].starts_with('╭'), "{w}x{h}:\n{t}");

@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use puppy_core::types::{AddRequest, DownloadId, EngineDetail, SeedPolicy, Selection, TorrentFile};
-use puppy_proto::{DownloadSnapshot, EngineKindTag, Event, Settings, Totals, WireState};
+use puppy_proto::{
+    DownloadSnapshot, EngineKindTag, Event, Settings, Totals, UpdateStatus, WireState,
+};
 use ratatui::layout::{Position, Rect};
 
 pub use forms::{AddField, AddForm, GlobalLimitsForm, LimitForm, SeedForm};
@@ -57,6 +59,16 @@ pub enum Banner {
     Error(String),
     /// `U` was pressed: the old daemon is being stopped and a new one started.
     Restarting,
+    /// A newer puppy exists; `U` installs it when `can_install`, else `reason` says why not.
+    UpdateAvailable {
+        version: String,
+        can_install: bool,
+        reason: Option<String>,
+    },
+    /// The daemon is installing this version (and restarting into it).
+    Updating(String),
+    /// The last install failed (the error).
+    UpdateFailed(String),
 }
 
 impl Banner {
@@ -73,8 +85,37 @@ impl Banner {
             Banner::NoDaemon(hint) => hint.clone(),
             Banner::Error(e) => format!("{}{e}", Self::ERROR_PREFIX),
             Banner::Restarting => Self::RESTARTING.to_string(),
+            Banner::UpdateAvailable {
+                version,
+                can_install: true,
+                ..
+            } => format!("puppy {version} is available \u{2014} press U to update now"),
+            Banner::UpdateAvailable {
+                version, reason, ..
+            } => match reason {
+                Some(r) => format!("puppy {version} is available \u{2014} {r}"),
+                None => format!("puppy {version} is available"),
+            },
+            Banner::Updating(v) => format!("updating to {v}\u{2026}"),
+            Banner::UpdateFailed(e) => format!("update failed: {e}"),
         }
     }
+
+    /// Whether this is one of the update banners (which connection banners outrank).
+    pub fn is_update(&self) -> bool {
+        matches!(
+            self,
+            Banner::UpdateAvailable { .. } | Banner::Updating(_) | Banner::UpdateFailed(_)
+        )
+    }
+}
+
+/// Label of the update command's result, which shows as a banner, not a toast.
+pub const UPDATE_LABEL: &str = "update";
+
+/// Whether two version strings name the same release (a leading `v` is ignored).
+fn same_version(a: &str, b: &str) -> bool {
+    a.trim_start_matches('v') == b.trim_start_matches('v')
 }
 
 /// The first line of `s`, trimmed and safe to draw (a banner is one row).
@@ -204,6 +245,8 @@ pub enum Msg {
     ConnectError(String),
     CmdResult(CmdOutcome),
     Detail(DownloadId, Option<EngineDetail>),
+    /// The daemon's update status (an event, or the answer to [`Cmd::InstallUpdate`]).
+    UpdateStatus(UpdateStatus),
     /// The daemon's settings, fetched again after changing them.
     Settings(Settings),
     /// A torrent's file list ([`Cmd::FetchFiles`]).
@@ -262,6 +305,12 @@ pub enum Cmd {
     /// Stop the incompatible daemon (`U`); the runtime then reconnects, which starts
     /// this version's daemon.
     RestartDaemon,
+    /// Install the available update (`U` on the update banner); answered with
+    /// [`Msg::UpdateStatus`] or an error result labelled `update`.
+    InstallUpdate,
+    /// Leave the dashboard and start the updated puppy in its place: the runtime
+    /// restores the terminal, then executes the new binary with the same arguments.
+    Reexec,
     Quit,
 }
 
@@ -349,6 +398,13 @@ pub struct App {
     pub help_scroll: u16,
     /// A connection problem to show (cleared on connect).
     pub banner: Option<Banner>,
+    /// The daemon's last update status.
+    pub update: UpdateStatus,
+    /// The version being installed (by `U` here, or an event), until the dashboard
+    /// reconnects to it or the install fails.
+    updating: Option<String>,
+    /// Set with [`Cmd::Reexec`]: after quitting, the runtime starts the updated puppy.
+    pub reexec: bool,
     /// The last left click on a list row, for double-click detection.
     last_click: Option<(DownloadId, Instant)>,
     /// When a popup was last submitted (paste burst guard, [`PASTE_BURST`]).
@@ -384,6 +440,9 @@ impl App {
             ticks: 0,
             help_scroll: 0,
             banner: None,
+            update: UpdateStatus::NotChecked,
+            updating: None,
+            reexec: false,
             last_click: None,
             submitted_at: None,
             asked: HashSet::new(),
@@ -584,12 +643,24 @@ impl App {
             } => {
                 self.conn = Conn::Connected;
                 self.banner = None;
+                let reexec = self
+                    .updating
+                    .as_deref()
+                    .is_some_and(|v| same_version(v, &version));
                 self.daemon_version = Some(version);
                 self.settings = Some(settings);
                 self.totals = totals_of(&downloads, self.totals.down_bps, self.totals.up_bps);
                 self.history.prune(&downloads);
                 self.replace_downloads(downloads);
+                if reexec {
+                    return self.reexec_cmds();
+                }
+                self.refresh_update_banner();
                 self.auto_open()
+            }
+            Msg::UpdateStatus(status) => {
+                self.on_update_status(status);
+                Vec::new()
             }
             Msg::Disconnected => {
                 self.conn = match self.conn {
@@ -613,7 +684,14 @@ impl App {
                 Vec::new()
             }
             Msg::CmdResult(outcome) => {
-                if let Err(e) = outcome.result {
+                if outcome.label == UPDATE_LABEL
+                    && let Err(e) = outcome.result
+                {
+                    self.on_update_status(UpdateStatus::Failed {
+                        version: self.updating.clone(),
+                        error: one_line(&e.to_string()),
+                    });
+                } else if let Err(e) = outcome.result {
                     self.cmd_error(&outcome.label, e, now);
                 }
                 Vec::new()
@@ -767,13 +845,67 @@ impl App {
                 let text = format!("{} needs attention", self.name_of(id));
                 self.push_toast(text, ToastKind::Error, now);
             }
+            Event::Update { status } => self.on_update_status(status),
             Event::Added { .. }
             | Event::Removed { .. }
             | Event::SeedingFinished { .. }
             | Event::ChoosingFiles { .. }
-            | Event::Update { .. }
             | Event::Unknown => {}
         }
+    }
+
+    /// Folds in a new update status and redraws the update banner from it.
+    fn on_update_status(&mut self, status: UpdateStatus) {
+        match &status {
+            UpdateStatus::Installing { version } | UpdateStatus::Installed { version } => {
+                self.updating = Some(version.clone());
+            }
+            UpdateStatus::Failed { .. } => self.updating = None,
+            _ => {}
+        }
+        self.update = status;
+        self.refresh_update_banner();
+    }
+
+    /// Shows what the update state calls for, unless a connection banner is up (it
+    /// wins; the update banner returns when it clears) — and removes a stale update
+    /// banner.
+    fn refresh_update_banner(&mut self) {
+        if self.banner.as_ref().is_some_and(|b| !b.is_update()) {
+            return;
+        }
+        self.banner = match (&self.updating, &self.update) {
+            (Some(v), _) => Some(Banner::Updating(v.clone())),
+            (None, UpdateStatus::Failed { error, .. }) => Some(Banner::UpdateFailed(error.clone())),
+            (
+                None,
+                UpdateStatus::Available {
+                    version,
+                    can_install,
+                    reason,
+                },
+            ) => Some(Banner::UpdateAvailable {
+                version: version.clone(),
+                can_install: *can_install,
+                reason: reason.as_deref().map(one_line),
+            }),
+            _ => None,
+        };
+    }
+
+    /// The dashboard reached the updated daemon: hand over to the new puppy (Unix), or
+    /// ask for a reopen (nothing can be started from here on Windows).
+    fn reexec_cmds(&mut self) -> Vec<Cmd> {
+        let version = self.updating.take().unwrap_or_default();
+        if cfg!(windows) {
+            self.banner = Some(Banner::Error(format!(
+                "puppy updated to {version} \u{2014} quit and reopen the dashboard"
+            )));
+            return Vec::new();
+        }
+        self.reexec = true;
+        self.should_quit = true;
+        vec![Cmd::Reexec]
     }
 
     fn name_of(&self, id: DownloadId) -> String {
@@ -903,6 +1035,25 @@ impl App {
             {
                 self.banner = Some(Banner::Restarting);
                 vec![Cmd::RestartDaemon]
+            }
+            Mode::Normal
+                if matches!(
+                    self.banner,
+                    Some(Banner::UpdateAvailable {
+                        can_install: true,
+                        ..
+                    })
+                ) && key.code == KeyCode::Char('U')
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let Some(Banner::UpdateAvailable { version, .. }) = self.banner.take() else {
+                    return Vec::new();
+                };
+                self.updating = Some(version.clone());
+                self.banner = Some(Banner::Updating(version));
+                vec![Cmd::InstallUpdate]
             }
             Mode::Normal => match keys::normal_key(&key) {
                 Some(action) => self.on_action(action, now),

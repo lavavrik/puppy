@@ -58,6 +58,9 @@ pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!(NOT_A_TERMINAL);
     }
+    // Captured now: once the binary is replaced, Linux reports `current_exe` as
+    // "<path> (deleted)".
+    let exe = std::env::current_exe().and_then(|e| e.canonicalize());
     let guard = TerminalGuard::enter().context("cannot set up the terminal")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     terminal.clear()?;
@@ -99,8 +102,33 @@ pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
     match (result, read_error) {
         (Err(e), _) => Err(e),
         (Ok(_), Some(e)) => Err(anyhow::Error::new(e).context("cannot read from the terminal")),
-        (Ok(_), None) => Ok(()),
+        (Ok(app), None) => {
+            if app.reexec {
+                reexec(exe);
+            }
+            Ok(())
+        }
     }
+}
+
+/// Replaces this process by the updated puppy, started with the same arguments (the
+/// terminal is already restored). Returns only on Windows, where [`App`] never asks for
+/// this; on failure it exits.
+fn reexec(exe: std::io::Result<std::path::PathBuf>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = match exe {
+            Ok(exe) => std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .exec(),
+            Err(e) => e,
+        };
+        eprintln!("puppy: cannot start the updated puppy: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    drop(exe);
 }
 
 /// The message for a terminal event; `None` for what the app ignores (key releases,
@@ -242,7 +270,7 @@ async fn run_loop<B: Backend>(
             {
                 continue;
             }
-            if cmd != Cmd::Quit {
+            if !matches!(cmd, Cmd::Quit | Cmd::Reexec) {
                 spawn_cmd(
                     &mut tasks,
                     api.clone(),
@@ -354,6 +382,8 @@ fn label(cmd: &Cmd) -> &'static str {
         Cmd::SetSeed { .. } => "seeding",
         Cmd::FetchSettings => "settings",
         Cmd::RestartDaemon => "restart daemon",
+        Cmd::InstallUpdate => crate::app::UPDATE_LABEL,
+        Cmd::Reexec => "restart puppy",
         Cmd::Quit => "quit",
     }
 }

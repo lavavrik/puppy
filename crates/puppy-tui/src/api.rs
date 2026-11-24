@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use puppy_client::{Client, ClientError, Paths};
-use puppy_proto::{DownloadSnapshot, ErrorCode, Event, ReplyData, Request, Settings};
+use puppy_proto::{DownloadSnapshot, ErrorCode, Event, ReplyData, Request, Settings, UpdateStatus};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::app::{Cmd, CmdError, Msg};
@@ -188,7 +188,19 @@ impl DaemonApi for ClientApi {
                     Err(e) => Err(call_error(e)),
                 };
             }
-            Cmd::RestartDaemon | Cmd::Quit => return Ok(None),
+            Cmd::InstallUpdate => {
+                return match client.call(Request::Update { check_only: false }).await {
+                    Ok(ReplyData::Update {
+                        status: status @ UpdateStatus::Installed { .. },
+                    }) => Ok(Some(Msg::UpdateStatus(status))),
+                    Ok(ReplyData::Update { .. }) => {
+                        Err(CmdError::Failed("puppy is already up to date".into()))
+                    }
+                    Ok(d) => Err(CmdError::Failed(format!("unexpected reply: {d:?}"))),
+                    Err(e) => Err(call_error(e)),
+                };
+            }
+            Cmd::RestartDaemon | Cmd::Reexec | Cmd::Quit => return Ok(None),
         };
         client.call(request).await.map(|_| None).map_err(call_error)
     }

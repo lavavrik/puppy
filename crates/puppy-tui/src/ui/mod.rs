@@ -237,7 +237,9 @@ fn banner(app: &App, buf: &mut Buffer, area: Rect) {
     let (mark, token) = match banner {
         Banner::Incompatible(_) => (" ! ", Token::Warn),
         Banner::NoDaemon(_) | Banner::Error(_) => (" ✗ ", Token::Err),
-        Banner::Restarting => (" ◌ ", Token::Info),
+        Banner::Restarting | Banner::Updating(_) => (" ◌ ", Token::Info),
+        Banner::UpdateAvailable { .. } => (" ↑ ", Token::Info),
+        Banner::UpdateFailed(_) => (" ✗ ", Token::Err),
     };
     let style = t.style(token);
     let text = banner.text();
@@ -245,7 +247,13 @@ fn banner(app: &App, buf: &mut Buffer, area: Rect) {
     let mut parts: Vec<(&str, Style)> = vec![(mark, style)];
     match (banner, text.split_once(&key)) {
         // The key to press stands out.
-        (Banner::Incompatible(_), Some((before, after))) => {
+        (
+            Banner::Incompatible(_)
+            | Banner::UpdateAvailable {
+                can_install: true, ..
+            },
+            Some((before, after)),
+        ) => {
             parts.extend([
                 (before, style),
                 (" ", style),

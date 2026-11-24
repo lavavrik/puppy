@@ -182,6 +182,7 @@ the dashboard only disconnects; the daemon and its downloads keep running.
 | `+` / `-`                         | Raise / lower the number of active downloads |
 | `Shift+↑` / `Shift+↓` (`K` / `J`) | Move in the queue |
 | `/`                               | Filter |
+| `U`                               | Update puppy now (when the update banner shows) |
 | `Esc`                             | Close popup / clear filter |
 | `?`                               | Help |
 | `q` / `Ctrl+C`                    | Quit |

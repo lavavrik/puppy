@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use puppy_core::types::DownloadId;
-use puppy_proto::{DownloadSnapshot, EngineKindTag, Event, Settings, Totals, WireState};
-use puppy_tui::app::{App, Cmd, CmdOutcome, Mode, Msg, Popup, ToastKind};
+use puppy_proto::{
+    DownloadSnapshot, EngineKindTag, Event, Settings, Totals, UpdateStatus, WireState,
+};
+use puppy_tui::app::{App, Banner, Cmd, CmdError, CmdOutcome, Mode, Msg, Popup, ToastKind};
 use puppy_tui::theme::{Theme, ThemeChoice};
 
 fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
@@ -864,4 +866,132 @@ fn quit_message_quits_from_any_mode() {
     a.update(ch('a'), now);
     assert_eq!(a.update(Msg::Quit, now), vec![Cmd::Quit]);
     assert!(a.should_quit);
+}
+
+fn available(can_install: bool) -> Msg {
+    Msg::UpdateStatus(UpdateStatus::Available {
+        version: "0.2.0".into(),
+        can_install,
+        reason: (!can_install).then(|| "installed by a package manager".to_string()),
+    })
+}
+
+fn banner_text(a: &App) -> String {
+    a.banner.as_ref().map(Banner::text).unwrap_or_default()
+}
+
+#[test]
+fn update_banner_on_available() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    assert!(banner_text(&a).contains("press U to update now"));
+    assert!(banner_text(&a).contains("0.2.0"));
+    a.update(available(false), now);
+    assert_eq!(
+        banner_text(&a),
+        "puppy 0.2.0 is available \u{2014} installed by a package manager"
+    );
+    a.update(Msg::UpdateStatus(UpdateStatus::UpToDate), now);
+    assert_eq!(a.banner, None);
+}
+
+#[test]
+fn shift_u_installs() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    let cmds = a.update(ch('U'), now);
+    assert_eq!(cmds, vec![Cmd::InstallUpdate]);
+    assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+    assert_eq!(banner_text(&a), "updating to 0.2.0\u{2026}");
+    // Not again while installing.
+    assert!(a.update(ch('U'), now).is_empty());
+}
+
+#[test]
+fn u_ignored_without_installable_banner() {
+    let (mut a, now) = connected(vec![]);
+    assert!(a.update(ch('U'), now).is_empty());
+    a.update(available(false), now);
+    assert!(!a.update(ch('U'), now).contains(&Cmd::InstallUpdate));
+    assert!(matches!(a.banner, Some(Banner::UpdateAvailable { .. })));
+}
+
+#[test]
+fn reexec_after_reconnect_to_new_version() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    a.update(ch('U'), now);
+    a.update(
+        Msg::UpdateStatus(UpdateStatus::Installed {
+            version: "0.2.0".into(),
+        }),
+        now,
+    );
+    a.update(Msg::Disconnected, now);
+    // The old daemon answering again is not the new version.
+    let reconnect = |version: &str| Msg::Connected {
+        version: version.into(),
+        settings: settings(3),
+        downloads: vec![],
+    };
+    assert!(a.update(reconnect("0.1.0"), now).is_empty());
+    assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+    let cmds = a.update(reconnect("0.2.0"), now);
+    assert_eq!(cmds, vec![Cmd::Reexec]);
+    assert!(a.should_quit);
+}
+
+#[test]
+fn failed_update_shows_error() {
+    let (mut a, now) = connected(vec![]);
+    a.update(available(true), now);
+    a.update(ch('U'), now);
+    a.update(
+        Msg::CmdResult(CmdOutcome {
+            label: "update".into(),
+            result: Err(CmdError::Failed("checksum mismatch".into())),
+        }),
+        now,
+    );
+    assert_eq!(
+        a.banner,
+        Some(Banner::UpdateFailed("checksum mismatch".into()))
+    );
+    assert_eq!(banner_text(&a), "update failed: checksum mismatch");
+}
+
+#[test]
+fn connection_banners_win_over_update_banners() {
+    let (mut a, now) = connected(vec![]);
+    a.update(Msg::Incompatible("old".into()), now);
+    a.update(available(true), now);
+    assert!(matches!(a.banner, Some(Banner::Incompatible(_))));
+    // `U` restarts the daemon, not installs.
+    assert_eq!(a.update(ch('U'), now), vec![Cmd::RestartDaemon]);
+    // Once connected again the update banner returns.
+    a.update(
+        Msg::Connected {
+            version: "0.1.0".into(),
+            settings: settings(3),
+            downloads: vec![],
+        },
+        now,
+    );
+    assert!(matches!(a.banner, Some(Banner::UpdateAvailable { .. })));
+}
+
+#[test]
+fn installing_event_shows_updating_and_clear_keeps_it() {
+    let (mut a, now) = connected(vec![]);
+    a.update(
+        Msg::Daemon(Event::Update {
+            status: UpdateStatus::Installing {
+                version: "0.2.0".into(),
+            },
+        }),
+        now,
+    );
+    assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
+    a.update(Msg::UpdateStatus(UpdateStatus::UpToDate), now);
+    assert_eq!(a.banner, Some(Banner::Updating("0.2.0".into())));
 }
