@@ -5,6 +5,8 @@ use puppy_testserver::github::{FakeGitHub, FakeRelease};
 use semver::Version;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
+/// What `fetch` saves the new binary as on this platform.
+const BIN: &str = if cfg!(windows) { "puppy.exe" } else { "puppy" };
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
@@ -69,7 +71,7 @@ async fn bad_checksum_is_rejected() {
         Err(UpdateError::Failed(msg)) => assert!(msg.contains("checksum"), "{msg}"),
         other => panic!("{other:?}"),
     }
-    assert!(!work.path().join("puppy").exists());
+    assert!(!work.path().join(BIN).exists());
 }
 
 #[tokio::test]
@@ -79,13 +81,13 @@ async fn extracts_only_the_binary() {
     let parent = tempfile::tempdir().unwrap();
     let work = parent.path().join("work");
     let bin = fetch(&client(), &r, &work).await.unwrap();
-    assert_eq!(bin, work.join("puppy"));
+    assert_eq!(bin, work.join(BIN));
     let mut names: Vec<_> = std::fs::read_dir(&work)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    let mut want = vec![r.archive.name.clone(), "puppy".to_string()];
+    let mut want = vec![r.archive.name.clone(), BIN.to_string()];
     want.sort();
     assert_eq!(names, want);
     assert!(!parent.path().join("evil").exists());
