@@ -57,6 +57,8 @@ pub enum ManagerError {
     InvalidState(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Unsupported(String),
     #[error(transparent)]
     Engine(#[from] EngineError),
 }
@@ -67,6 +69,7 @@ impl ManagerError {
             ManagerError::NotFound(_) => ErrorCode::NotFound,
             ManagerError::InvalidState(_) => ErrorCode::InvalidState,
             ManagerError::BadRequest(_) => ErrorCode::BadRequest,
+            ManagerError::Unsupported(_) => ErrorCode::Unsupported,
             ManagerError::Engine(EngineError::Unsupported(_)) => ErrorCode::Unsupported,
             ManagerError::Engine(_) => ErrorCode::Engine,
         }

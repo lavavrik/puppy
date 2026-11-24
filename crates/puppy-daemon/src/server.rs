@@ -29,7 +29,7 @@ use interprocess::local_socket::tokio::{Listener, Stream, prelude::*};
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
 use puppy_proto::{
     CodecError, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request,
-    ServerMsg, parse_request, write_msg,
+    ServerMsg, UpdateStatus, parse_request, write_msg,
 };
 use std::io;
 use std::sync::Arc;
@@ -659,6 +659,14 @@ async fn dispatch(m: &Manager, body: Request) -> Result<ReplyData, ManagerError>
             m.select_files(id, selection).await.map(|()| Done)?
         }
         Request::SetSeed { id, policy } => m.set_seed(id, policy).await.map(|()| Done)?,
+        Request::GetUpdate => ReplyData::Update {
+            status: UpdateStatus::NotChecked,
+        },
+        Request::Update { .. } => {
+            return Err(ManagerError::Unsupported(
+                "updates are not enabled in this daemon".into(),
+            ));
+        }
         Request::Hello { .. }
         | Request::Subscribe { .. }
         | Request::Unsubscribe

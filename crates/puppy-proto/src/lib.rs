@@ -98,6 +98,12 @@ pub enum Request {
     },
     Unsubscribe,
     Shutdown,
+    /// The current update status, from memory; no network.
+    GetUpdate,
+    /// Checks for a newer release now and, unless `check_only`, installs it.
+    Update {
+        check_only: bool,
+    },
 }
 
 /// Client -> server: `Envelope<Request>`.
@@ -165,6 +171,10 @@ pub enum ReplyData {
     Files {
         files: Vec<TorrentFile>,
     },
+    /// The daemon's update status.
+    Update {
+        status: UpdateStatus,
+    },
     /// A kind this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
@@ -223,7 +233,41 @@ pub enum Event {
         id: DownloadId,
         name: String,
     },
+    /// The update status changed.
+    Update {
+        status: UpdateStatus,
+    },
     /// A kind this client does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where the daemon stands on self-updating.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpdateStatus {
+    /// No check has run yet (or updates are off).
+    NotChecked,
+    /// The running version is the latest release.
+    UpToDate,
+    /// A newer release exists.
+    Available {
+        version: String,
+        /// Whether this daemon can install it itself.
+        can_install: bool,
+        /// Why not, when `can_install` is false.
+        reason: Option<String>,
+    },
+    /// Downloading and swapping in `version`.
+    Installing { version: String },
+    /// Swapped in; the daemon is restarting into it.
+    Installed { version: String },
+    /// The last check or install failed.
+    Failed {
+        version: Option<String>,
+        error: String,
+    },
+    /// A state this client does not know (newer daemon).
     #[serde(other)]
     Unknown,
 }
@@ -430,6 +474,70 @@ mod tests {
             note: None,
             seed: None,
         }
+    }
+
+    #[test]
+    fn update_status_round_trips() {
+        let all = [
+            UpdateStatus::NotChecked,
+            UpdateStatus::UpToDate,
+            UpdateStatus::Available {
+                version: "1.2.3".into(),
+                can_install: false,
+                reason: Some("why".into()),
+            },
+            UpdateStatus::Available {
+                version: "1.2.3".into(),
+                can_install: true,
+                reason: None,
+            },
+            UpdateStatus::Installing {
+                version: "1.2.3".into(),
+            },
+            UpdateStatus::Installed {
+                version: "1.2.3".into(),
+            },
+            UpdateStatus::Failed {
+                version: Some("1.2.3".into()),
+                error: "boom".into(),
+            },
+            UpdateStatus::Failed {
+                version: None,
+                error: "boom".into(),
+            },
+        ];
+        for status in all {
+            let s = serde_json::to_string(&status).unwrap();
+            assert_eq!(serde_json::from_str::<UpdateStatus>(&s).unwrap(), status);
+            let ev = Event::Update {
+                status: status.clone(),
+            };
+            let s = serde_json::to_string(&ev).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), ev);
+            let reply = ReplyData::Update { status };
+            let s = serde_json::to_string(&reply).unwrap();
+            assert_eq!(serde_json::from_str::<ReplyData>(&s).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn unknown_update_state_is_unknown() {
+        let s: UpdateStatus = serde_json::from_str(r#"{"state":"from_the_future"}"#).unwrap();
+        assert_eq!(s, UpdateStatus::Unknown);
+    }
+
+    #[test]
+    fn update_request_wire_form() {
+        let e = Envelope {
+            req_id: 4,
+            body: Request::Update { check_only: true },
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(s, r#"{"req_id":4,"method":"update","check_only":true}"#);
+        assert_eq!(serde_json::from_str::<Envelope<Request>>(&s).unwrap(), e);
+        let get: Envelope<Request> =
+            serde_json::from_str(r#"{"req_id":5,"method":"get_update"}"#).unwrap();
+        assert_eq!(get.body, Request::GetUpdate);
     }
 
     #[test]

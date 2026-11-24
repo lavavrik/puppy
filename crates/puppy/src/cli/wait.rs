@@ -464,7 +464,7 @@ pub async fn watch(ctx: &Ctx) -> Result<(), CliError> {
                     }
                     choosing_line(id, &name(&names, id))
                 }
-                Event::Unknown => continue,
+                Event::Update { .. } | Event::Unknown => continue,
             };
             out(format_args!("{} {line}", timestamp()));
         }
