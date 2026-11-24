@@ -753,8 +753,10 @@ mod daemon {
     }
 
     /// The HTTP engine, except that a finished download seeds (like a torrent would).
+    #[cfg(unix)]
     struct Seeder(puppy_core::http::engine::HttpEngine);
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl puppy_core::engine::Engine for Seeder {
         fn kind(&self) -> puppy_core::engine::EngineKind {
@@ -868,8 +870,13 @@ mod daemon {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_during_settle_resets_it() {
+        // Longer than `SETTLE`: the second client must arrive well within it, however
+        // slow the machine.
+        let settle = Duration::from_secs(3);
         let env = Env::new().await;
-        let d = env.launch(env.settling()).await;
+        let mut opts = env.settling();
+        opts.update.as_mut().unwrap().settle = settle;
+        let d = env.launch(opts).await;
         let mut c = env.client().await;
         c.wait_available().await;
         drop(c);
@@ -887,7 +894,7 @@ mod daemon {
             .unwrap();
         assert_eq!(outcome, RunOutcome::Restart);
         assert!(
-            quiet_from.elapsed() >= SETTLE,
+            quiet_from.elapsed() >= settle,
             "installed {:?} after the client left",
             quiet_from.elapsed()
         );
@@ -997,6 +1004,7 @@ mod daemon {
     }
 
     /// Polls the update status with short-lived clients until `want` holds.
+    #[cfg(unix)]
     async fn wait_status(env: &Env, d: &Daemon, want: impl Fn(&UpdateStatus) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -1011,6 +1019,7 @@ mod daemon {
     }
 
     /// Waits until the fake has been asked for the release archive.
+    #[cfg(unix)]
     async fn archive_requested(fake: &FakeGitHub) {
         let deadline = Instant::now() + TIMEOUT;
         while fake.downloads() == 0 {
@@ -1023,7 +1032,9 @@ mod daemon {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn auto_install_aborts_when_download_starts_during_fetch() {
         let env = Env::new().await;
-        env.fake.set_download_delay(Duration::from_secs(2));
+        // Long enough for the download below to be added and become active while the
+        // update is still being fetched, however slow the machine.
+        env.fake.set_download_delay(Duration::from_secs(5));
         let s = server(|c| {
             c.len = 8192 * KIB;
             c.bytes_per_sec = Some(64 * KIB);

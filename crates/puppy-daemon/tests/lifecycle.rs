@@ -312,12 +312,16 @@ async fn lock_wait_takes_over_a_departing_daemon() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     shutdown(&env, d).await;
     // The waiting daemon now runs; stop it.
-    let mut c = loop {
-        if let Some(c) = env.try_connect().await {
-            break c;
+    let mut c = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let Some(c) = env.try_connect().await {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    })
+    .await
+    .expect("the waiting daemon never took over");
     let _ = c
         .request(Request::Hello {
             client: "test".into(),

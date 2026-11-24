@@ -1444,7 +1444,11 @@ async fn update_refused_in_dev_build() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_mentions_update() {
     let github = puppy_testserver::github::FakeGitHub::start(fake_release()).await;
-    let env = update_env(&github);
+    let mut env = update_env(&github);
+    // `status` reads what the daemon `update --check` talked to learnt: it must not
+    // idle-exit in between (a new one starts `NotChecked` and has no check due).
+    // Env's drop stops it.
+    env.extra.push(("PUPPY_IDLE_EXIT", "30".to_string()));
     let (status, _, err) = env.run(&["update", "--check"]);
     assert!(status.success(), "{err}");
     let (status, out, err) = env.run(&["status"]);
@@ -1503,4 +1507,39 @@ async fn update_reports_missing_comeback() {
         err.contains("puppy: the daemon did not come back as 0.2.0"),
         "{err}"
     );
+}
+
+/// A test daemon that was not pointed at a fake release server still checks for
+/// updates (main turns them on), but only ever at a dead local address: tests never
+/// contact GitHub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_daemons_stay_off_github() {
+    let env = Env::new();
+    let url = env
+        .vars()
+        .into_iter()
+        .rev()
+        .find(|(k, _)| *k == "PUPPY_UPDATE_URL")
+        .map(|(_, v)| v);
+    assert_eq!(url.as_deref(), Some("http://127.0.0.1:9"));
+    // Connected, so the daemon stays up past its first check (5 s after start).
+    let client = env.spawn_client().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        let s = client.get_update().await.unwrap();
+        if s != puppy_proto::UpdateStatus::NotChecked {
+            break s;
+        }
+        assert!(std::time::Instant::now() < deadline, "no update check ran");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    match status {
+        puppy_proto::UpdateStatus::Failed { error, .. } => {
+            assert!(
+                error.contains("could not reach the release server"),
+                "{error}"
+            );
+        }
+        s => panic!("the check reached a release server: {s:?}"),
+    }
 }

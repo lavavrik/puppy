@@ -72,6 +72,9 @@ impl Env {
             ("PUPPY_TORRENT_TEST_MODE", "1".to_string()),
             // Never pop real desktop notifications from tests.
             ("PUPPY_NO_NOTIFY", "1".to_string()),
+            // Update checks go to a dead local address, never GitHub. Update tests
+            // point this at their fake through `extra` (set later, so it wins).
+            ("PUPPY_UPDATE_URL", "http://127.0.0.1:9".to_string()),
         ];
         vars.extend(self.extra.iter().cloned());
         vars
