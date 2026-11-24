@@ -409,7 +409,7 @@ async fn daemon_execs_the_new_binary() {
     for (k, v) in env.vars() {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().unwrap();
+    let mut child = spawn_retrying(&mut cmd);
     let pid = child.id();
 
     let paths = env.paths();

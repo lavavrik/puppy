@@ -1487,11 +1487,9 @@ async fn update_reports_missing_comeback() {
     for (k, v) in env.vars() {
         cmd.env(k, v);
     }
-    let child = cmd
-        .stdout(std::fs::File::create(&out_path).unwrap())
-        .stderr(std::fs::File::create(&err_path).unwrap())
-        .spawn()
-        .unwrap();
+    cmd.stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap());
+    let child = spawn_retrying(&mut cmd);
     let pid = env.daemon_pid();
     let status = wait_exit(child, std::time::Duration::from_secs(60));
     let out = std::fs::read_to_string(&out_path).unwrap();

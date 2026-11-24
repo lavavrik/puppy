@@ -29,6 +29,25 @@ pub fn socket_name() -> SocketName {
     }
 }
 
+/// `cmd.spawn()`, retried while the executable is "busy" (ETXTBSY): a binary this
+/// test just copied can still be open for writing in a child another test thread
+/// forked meanwhile, until that child execs.
+pub fn spawn_retrying(cmd: &mut Command) -> Child {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("cannot start {:?}: {e}", cmd.get_program()),
+        }
+    }
+}
+
 pub struct Env {
     pub home: tempfile::TempDir,
     pub socket: SocketName,
