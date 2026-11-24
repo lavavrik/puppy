@@ -347,6 +347,16 @@ choose_files = true     # torrent waiting for its files to be chosen
 seeding_finished = false
 ```
 
+Updates are checked on GitHub and installed when puppy is idle:
+
+```toml
+[update]
+check = true            # false: puppy never contacts GitHub for updates
+auto_install = true     # install a found release when no download is running
+```
+
+`check = false` means puppy never contacts GitHub for updates.
+
 Several popups of one kind are grouped into one ("3 downloads finished"): it is
 sent after 3 seconds without another such event, and at most 10 seconds after the
 first. Config is read when the daemon starts, so run `puppy stop` and let the next

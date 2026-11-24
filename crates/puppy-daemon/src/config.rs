@@ -131,6 +131,25 @@ impl Default for NotificationsConfig {
     }
 }
 
+/// Self-update settings (`[update]`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Look for new releases on GitHub.
+    pub check: bool,
+    /// Install a found release when the daemon is idle.
+    pub auto_install: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            auto_install: true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -143,6 +162,7 @@ pub struct Config {
     pub proxy: Option<url::Url>,
     pub torrent: TorrentConfig,
     pub notifications: NotificationsConfig,
+    pub update: UpdateConfig,
     /// First delay before a transiently failed download is retried automatically;
     /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
     /// the file.
@@ -171,6 +191,7 @@ impl Default for Config {
             proxy: None,
             torrent: TorrentConfig::default(),
             notifications: NotificationsConfig::default(),
+            update: UpdateConfig::default(),
             retry_base: Duration::from_secs(30),
             shutdown_pause_timeout: Duration::from_secs(10),
         }
@@ -227,6 +248,26 @@ mod tests {
     /// tests change.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn update_section_defaults() {
+        let _env = env_lock();
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        std::fs::write(&p, "").unwrap();
+        let u = Config::load(&p).unwrap().update;
+        assert!(u.check && u.auto_install);
+    }
+
+    #[test]
+    fn update_section_parses() {
+        let _env = env_lock();
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        std::fs::write(&p, "[update]\ncheck = false\n").unwrap();
+        let u = Config::load(&p).unwrap().update;
+        assert!(!u.check && u.auto_install);
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub struct Paths {
     pub pid_file: PathBuf,
     pub state_file: PathBuf,
     pub log_dir: PathBuf,
+    /// Where a downloaded update is staged.
+    pub update_dir: PathBuf,
+    /// Persisted self-update bookkeeping.
+    pub update_state: PathBuf,
 }
 
 impl Paths {
@@ -84,6 +88,8 @@ impl Paths {
             lock_file: data_dir.join("puppy.lock"),
             pid_file: data_dir.join("puppyd.pid"),
             state_file: data_dir.join("state.json"),
+            update_dir: data_dir.join("update"),
+            update_state: data_dir.join("update.json"),
             log_dir,
             data_dir,
             config_dir,
@@ -266,6 +272,8 @@ mod tests {
         assert_eq!(p.lock_file, d.path().join("data/puppy.lock"));
         assert_eq!(p.state_file, d.path().join("data/state.json"));
         assert_eq!(p.log_dir, d.path().join("data/logs"));
+        assert_eq!(p.update_dir, d.path().join("data/update"));
+        assert_eq!(p.update_state, d.path().join("data/update.json"));
         assert!(p.data_dir.is_dir() && p.config_dir.is_dir() && p.log_dir.is_dir());
         #[cfg(unix)]
         {

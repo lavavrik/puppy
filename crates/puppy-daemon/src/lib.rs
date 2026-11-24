@@ -9,6 +9,7 @@ pub mod notify;
 pub mod paths;
 pub mod server;
 pub mod store;
+pub mod update;
 
 pub use config::{Config, ConfigError, NotificationsConfig, TorrentConfig};
 pub use manager::{Manager, ManagerError};
