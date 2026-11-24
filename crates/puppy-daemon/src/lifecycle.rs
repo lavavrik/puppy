@@ -258,36 +258,47 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     let updater_task = updater
         .clone()
         .map(|u| tokio::spawn(u.run(clients.clone(), stop.clone())));
-    let reason = tokio::select! {
-        _ = shutdown_requested.cancelled() => "shutdown requested",
-        _ = restart.cancelled() => {
-            // Let the `update` request that installed it send its reply first.
-            replies_queued(&in_flight, REPLY_GRACE).await;
-            UPDATE_INSTALLED
-        }
-        signal = signals.recv() => signal,
-        _ = idle(opts.idle_exit, &manager, &clients) => IDLE,
-        r = &mut server_task => {
-            server_done = true;
-            if let Err(e) = r {
-                warn!("the server task failed: {e}");
+    let reason = loop {
+        let reason = tokio::select! {
+            _ = shutdown_requested.cancelled() => "shutdown requested",
+            _ = restart.cancelled() => {
+                // Let the `update` request that installed it send its reply first.
+                replies_queued(&in_flight, REPLY_GRACE).await;
+                UPDATE_INSTALLED
             }
-            "server stopped"
+            signal = signals.recv() => signal,
+            _ = idle(opts.idle_exit, &manager, &clients) => IDLE,
+            r = &mut server_task => {
+                server_done = true;
+                if let Err(e) = r {
+                    warn!("the server task failed: {e}");
+                }
+                "server stopped"
+            }
+        };
+        if reason == IDLE
+            && let Some(u) = &updater
+        {
+            // An on-demand daemon never stays quiet long enough to install by itself:
+            // its idle exit is the quiet moment. It exits afterwards (no restart); the
+            // next client starts the new binary. A download or client that appears
+            // meanwhile stops the install and keeps the daemon running; a signal or a
+            // shutdown request cuts the wait short.
+            tokio::select! {
+                swapped = u.install_before_exit() => {
+                    if swapped {
+                        info!("update installed; the next start runs it");
+                    } else if !manager.is_idle() || clients.load(Ordering::SeqCst) > 0 {
+                        info!("no longer idle; staying up");
+                        continue;
+                    }
+                }
+                _ = shutdown_requested.cancelled() => break "shutdown requested",
+                signal = signals.recv() => break signal,
+            }
         }
+        break reason;
     };
-    if reason == IDLE
-        && let Some(u) = &updater
-    {
-        // An on-demand daemon never stays quiet long enough to install by itself: its
-        // idle exit is the quiet moment. It exits afterwards (no restart); the next
-        // client starts the new binary. A signal cuts the wait short.
-        tokio::select! {
-            swapped = u.install_before_exit() => if swapped {
-                info!("update installed; the next start runs it");
-            },
-            signal = signals.recv() => warn!(signal, "not waiting for the update to install"),
-        }
-    }
     info!(reason, "shutting down");
 
     let graceful = async {

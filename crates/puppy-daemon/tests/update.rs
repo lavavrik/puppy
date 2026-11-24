@@ -995,4 +995,106 @@ mod daemon {
         drop(c);
         assert_eq!(env.stop(d).await, RunOutcome::Exited);
     }
+
+    /// Polls the update status with short-lived clients until `want` holds.
+    async fn wait_status(env: &Env, d: &Daemon, want: impl Fn(&UpdateStatus) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            assert!(!d.is_finished(), "the daemon stopped");
+            let s = env.client().await.get_update().await;
+            if want(&s) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "status never reached: {s:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until the fake has been asked for the release archive.
+    async fn archive_requested(fake: &FakeGitHub) {
+        let deadline = Instant::now() + TIMEOUT;
+        while fake.downloads() == 0 {
+            assert!(Instant::now() < deadline, "the update was never downloaded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_install_aborts_when_download_starts_during_fetch() {
+        let env = Env::new().await;
+        env.fake.set_download_delay(Duration::from_secs(2));
+        let s = server(|c| {
+            c.len = 8192 * KIB;
+            c.bytes_per_sec = Some(64 * KIB);
+        })
+        .await;
+        let d = env.launch(env.settling()).await;
+        archive_requested(&env.fake).await;
+        let id = {
+            let mut c = env.client().await;
+            let id = c.add(env.req(&s, "a.bin")).await;
+            c.wait_download(id, |st, _| *st == WireState::Active).await;
+            id
+        };
+        // The fetch finishes, the binary checks out, then the install gives way.
+        wait_status(&env, &d, |s| matches!(s, UpdateStatus::Installing { .. })).await;
+        wait_status(&env, &d, |s| {
+            matches!(
+                s,
+                UpdateStatus::Available {
+                    can_install: true,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(!env.exe_swapped(), "swapped during a download");
+        let mut c = env.client().await;
+        let (st, _) = c.get(id).await;
+        assert_eq!(st, WireState::Active, "the download was disturbed");
+
+        // Once the download stops and the daemon settles, the staged binary goes in.
+        c.request(Request::Pause { id }).await;
+        drop(c);
+        assert_eq!(exited(d).await, RunOutcome::Restart);
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(env.fake.downloads(), 1, "downloaded the update again");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_exit_install_aborts_when_client_connects() {
+        let env = Env::new().await;
+        env.fake.set_download_delay(Duration::from_secs(2));
+        let mut opts = env.opts(true);
+        opts.idle_exit = Some(Duration::from_secs(1));
+        let d = env.launch(opts).await;
+        let mut c = env.client().await;
+        c.wait_available().await;
+        drop(c);
+        archive_requested(&env.fake).await;
+        let mut c = env.client().await;
+        // The install gives way and the daemon keeps serving.
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let s = c.get_update().await;
+            if matches!(s, UpdateStatus::Available { .. }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the install never gave way: {s:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!d.is_finished(), "exited with a client connected");
+        assert!(!env.exe_swapped(), "swapped with a client connected");
+        assert!(matches!(c.request(Request::List).await, Reply::Ok { .. }));
+        // Idle again: it installs (without downloading again) and exits.
+        drop(c);
+        assert_eq!(exited(d).await, RunOutcome::Exited);
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(env.fake.downloads(), 1, "downloaded the update again");
+    }
 }

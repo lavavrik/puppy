@@ -12,7 +12,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -91,6 +91,22 @@ struct Inner {
     /// Finished lookups, so a check that waited for a running one takes its result.
     checks: AtomicU64,
     restart: CancellationToken,
+    /// The daemon's connected-client count, given to [`Updater::run`].
+    clients: OnceLock<Arc<AtomicUsize>>,
+    /// A downloaded, verified binary an automatic install gave way with, kept so the
+    /// next attempt at the same version skips the download.
+    staged: Mutex<Option<(Version, PathBuf)>>,
+}
+
+/// What must still hold just before an install swaps the binary in.
+#[derive(Clone, Copy, Debug)]
+enum Gate {
+    /// Asked for explicitly: nothing.
+    Forced,
+    /// Automatic: [`Manager::is_quiet`] and no client.
+    Quiet,
+    /// Before an idle exit: [`Manager::is_idle`] and no client.
+    Idle,
 }
 
 /// A finished install attempt, shareable among the callers that waited for it.
@@ -152,6 +168,8 @@ impl Updater {
                 check: tokio::sync::Mutex::new(()),
                 checks: AtomicU64::new(0),
                 restart: CancellationToken::new(),
+                clients: OnceLock::new(),
+                staged: Mutex::new(None),
             }),
         }
     }
@@ -241,7 +259,9 @@ impl Updater {
     /// A call made while another runs waits for it and returns its outcome. Nothing
     /// newer is `Failed`.
     pub async fn install_now(&self) -> Result<semver::Version, UpdateError> {
-        self.install(true).await
+        self.install(Gate::Forced, true)
+            .await
+            .expect("a forced install never gives way")
     }
 
     /// For a daemon about to idle-exit: installs the update the last check found, if
@@ -249,13 +269,30 @@ impl Updater {
     /// Unlike [`install_now`](Self::install_now) this does not fire
     /// [`restart_requested`](Self::restart_requested): the daemon exits as planned and
     /// the next client starts the new binary. (An install already running is waited
-    /// for and may fire it, but by then the daemon has chosen to exit.)
+    /// for and may fire it, but by then the daemon has chosen to exit.) A download or a
+    /// client that appears meanwhile wins: nothing is swapped and the status is back to
+    /// `Available`.
     pub async fn install_before_exit(&self) -> bool {
         if !self.inner.cfg.auto_install || !self.installable() {
             return false;
         }
         info!("installing the update before exiting");
-        self.install(false).await.is_ok()
+        matches!(self.install(Gate::Idle, false).await, Some(Ok(_)))
+    }
+
+    /// Whether `gate` still allows swapping the binary in now.
+    fn gate_open(&self, gate: Gate) -> bool {
+        let i = &self.inner;
+        let no_clients = || {
+            i.clients
+                .get()
+                .is_none_or(|c| c.load(Ordering::SeqCst) == 0)
+        };
+        match gate {
+            Gate::Forced => true,
+            Gate::Quiet => i.manager.is_quiet() && no_clients(),
+            Gate::Idle => i.manager.is_idle() && no_clients(),
+        }
     }
 
     /// Whether the last check found a release this binary can install.
@@ -269,8 +306,10 @@ impl Updater {
         )
     }
 
-    /// [`install_now`](Self::install_now); `restart`: fire the restart token on success.
-    async fn install(&self, restart: bool) -> Result<Version, UpdateError> {
+    /// [`install_now`](Self::install_now) behind `gate`; `restart`: fire the restart token
+    /// on success. `None`: the gate closed before the swap (the attempt gave way and
+    /// counts as none: callers that waited for it make their own).
+    async fn install(&self, gate: Gate, restart: bool) -> Option<Result<Version, UpdateError>> {
         let i = &self.inner;
         let seen = i.attempts.load(Ordering::SeqCst);
         let mut last = i.install.lock().await;
@@ -278,56 +317,73 @@ impl Updater {
             && let Some(outcome) = last.clone()
         {
             // An attempt finished while this call waited: it was this call's too.
-            return outcome.into();
+            return Some(outcome.into());
         }
         if let UpdateStatus::Installed { version } = self.status()
             && let Ok(v) = Version::parse(&version)
         {
-            return Ok(v);
+            return Some(Ok(v));
         }
-        let result = self.attempt().await;
+        let result = self.attempt(gate).await?;
         *last = Some(Outcome::from(&result));
         i.attempts.fetch_add(1, Ordering::SeqCst);
         drop(last);
         if restart && result.is_ok() {
             i.restart.cancel();
         }
-        result
+        Some(result)
     }
 
-    /// One install attempt; the caller holds the install lock.
-    async fn attempt(&self) -> Result<Version, UpdateError> {
+    /// One install attempt; the caller holds the install lock. `None`: `gate` closed
+    /// after the new binary was verified; it stays staged and the status is restored.
+    async fn attempt(&self, gate: Gate) -> Option<Result<Version, UpdateError>> {
         let i = &self.inner;
         if let Some(reason) = cannot_install_reason(&i.opts.exe, i.opts.allow_dev) {
-            return Err(UpdateError::NotPossible(reason));
+            return Some(Err(UpdateError::NotPossible(reason)));
         }
         let cached = i.release.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let release = match cached {
             Some(r) => r,
             None => {
                 if let UpdateStatus::Failed { error, .. } = self.check_now().await {
-                    return Err(UpdateError::Failed(error));
+                    return Some(Err(UpdateError::Failed(error)));
                 }
-                i.release
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-                    .ok_or_else(|| {
-                        UpdateError::Failed(format!(
+                let found = i.release.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match found {
+                    Some(r) => r,
+                    None => {
+                        return Some(Err(UpdateError::Failed(format!(
                             "puppy {} is the latest release; nothing to install",
                             i.current
-                        ))
-                    })?
+                        ))));
+                    }
+                }
             }
         };
         let version = release.version.clone();
+        let before = self.status();
         self.set_status(UpdateStatus::Installing {
             version: version.to_string(),
         });
         info!(from = %i.current, to = %version, "installing an update");
+        // Taken: kept again only if this attempt gives way too.
+        let staged = i
+            .staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .filter(|(v, bin)| *v == version && bin.is_file());
         let steps = async {
-            let bin = fetch(&i.http, &release, &i.work_dir).await?;
+            let bin = match staged {
+                Some((_, bin)) => bin,
+                // Empties the work dir first, so a binary staged for another version goes.
+                None => fetch(&i.http, &release, &i.work_dir).await?,
+            };
             sanity_check(&bin, &version).await?;
+            if !self.gate_open(gate) {
+                *i.staged.lock().unwrap_or_else(|e| e.into_inner()) = Some((version.clone(), bin));
+                return Ok(false);
+            }
             // Tells the next daemon what it was updated from; only a notice, so failing
             // to write it is only logged.
             let marker = i.work_dir.join(UPDATED_FROM);
@@ -342,7 +398,7 @@ impl Updater {
             if swapped.is_err() {
                 let _ = std::fs::remove_file(&marker);
             }
-            swapped
+            swapped.map(|()| true)
         };
         let result = tokio::time::timeout(INSTALL_TIMEOUT, steps)
             .await
@@ -352,8 +408,13 @@ impl Updater {
                     INSTALL_TIMEOUT.as_secs() / 60
                 )))
             });
-        match result {
-            Ok(()) => {
+        Some(match result {
+            Ok(false) => {
+                info!(version = %version, "work or a client appeared; the update waits");
+                self.set_status(before);
+                return None;
+            }
+            Ok(true) => {
                 info!(version = %version, "update installed");
                 self.set_status(UpdateStatus::Installed {
                     version: version.to_string(),
@@ -368,12 +429,13 @@ impl Updater {
                 });
                 Err(e)
             }
-        }
+        })
     }
 
     /// Runs until `stop`: checks for releases on schedule, and installs an update by
     /// itself once the daemon has been quiet long enough.
     pub async fn run(self, clients: Arc<AtomicUsize>, stop: CancellationToken) {
+        let _ = self.inner.clients.set(clients.clone());
         tokio::select! {
             _ = stop.cancelled() => {}
             _ = async { tokio::join!(self.check_on_schedule(), self.install_when_quiet(&clients)) } => {}
@@ -424,9 +486,10 @@ impl Updater {
                 continue;
             }
             info!(settle = ?i.opts.settle, "quiet: installing the update");
-            if self.install_now().await.is_ok() {
+            if let Some(Ok(_)) = self.install(Gate::Quiet, true).await {
                 return;
             }
+            // Failed (waits for a new check), or gave way to new work (waits for quiet).
             quiet_since = None;
         }
     }

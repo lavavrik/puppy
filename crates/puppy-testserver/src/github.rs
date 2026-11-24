@@ -155,6 +155,9 @@ struct Shared {
     status: AtomicU16,
     hits: AtomicUsize,
     delay_ms: AtomicU64,
+    /// Archive downloads: how many started, and how long each takes to answer.
+    downloads: AtomicUsize,
+    download_delay_ms: AtomicU64,
     json: String,
     assets: HashMap<String, Vec<u8>>,
 }
@@ -202,6 +205,8 @@ impl FakeGitHub {
             status: AtomicU16::new(200),
             hits: AtomicUsize::new(0),
             delay_ms: AtomicU64::new(0),
+            downloads: AtomicUsize::new(0),
+            download_delay_ms: AtomicU64::new(0),
             json,
             assets,
         });
@@ -238,6 +243,20 @@ impl FakeGitHub {
     }
 }
 
+impl FakeGitHub {
+    /// How many downloads of the release archive (not its checksum) have started.
+    pub fn downloads(&self) -> usize {
+        self.shared.downloads.load(Ordering::SeqCst)
+    }
+
+    /// Makes archive downloads answer only after `delay` (counted at once).
+    pub fn set_download_delay(&self, delay: Duration) {
+        self.shared
+            .download_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+}
+
 impl Drop for FakeGitHub {
     fn drop(&mut self) {
         self.task.abort();
@@ -266,6 +285,13 @@ async fn latest(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response {
 }
 
 async fn download(State(s): State<Arc<Shared>>, Path(name): Path<String>) -> Response {
+    if !name.ends_with(".sha256") {
+        s.downloads.fetch_add(1, Ordering::SeqCst);
+        let delay = s.download_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
     match s.assets.get(&name) {
         Some(body) => body.clone().into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
