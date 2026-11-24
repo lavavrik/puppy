@@ -58,3 +58,16 @@ case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "Note: $bin is not on your PATH yet; add it in your shell's startup file." ;;
 esac
+
+# Earlier macOS installs went to /usr/local/bin, where puppy cannot update itself.
+# Left in place (it may be another install the user wants); only pointed out.
+old=/usr/local/bin/puppy
+if [ "$(uname -s)" = Darwin ] && [ -e "$old" ] && [ "$old" != "$bin/puppy" ]; then
+  echo
+  echo "Note: an older puppy is still installed at $old. That copy will not update"
+  echo "itself, and it may come first on your PATH. Remove it with:"
+  echo "  sudo rm $old"
+  echo "If you installed the launchd LaunchAgent, copy the new one over it and load it"
+  echo "again (see docs/service.md); it starts $HOME/.local/bin/puppy:"
+  echo "  cp $work/$name/packaging/launchd/dev.puppy.daemon.plist ~/Library/LaunchAgents/"
+fi
