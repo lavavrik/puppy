@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "puppy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2983,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "puppy-core",
  "serde",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-testserver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "flate2",
@@ -3096,7 +3096,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-torrent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "puppy-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

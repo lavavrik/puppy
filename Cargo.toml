@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/puppy-core", "crates/puppy-proto", "crates/puppy-testserver", "crates/puppy-daemon", "crates/puppy-torrent", "crates/puppy-client", "crates/puppy-tui", "crates/puppy"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lavavrik/puppy"

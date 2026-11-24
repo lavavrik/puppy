@@ -9,7 +9,7 @@ and Windows, on x86_64 and aarch64.
 
 ## Status
 
-Early development (v0.1.0). What works today:
+Early development (v0.1.1). What works today:
 
 - **HTTP(S) engine**: segmented multi-connection downloads (8 connections by
   default) with robust resume. A resumed file is revalidated against the
