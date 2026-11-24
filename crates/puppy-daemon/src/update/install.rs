@@ -129,7 +129,8 @@ async fn download_checksum(
     Ok(first)
 }
 
-/// Writes the one expected binary from the archive to `dest`. Any other entry is refused.
+/// Writes the one expected binary from the archive to `dest`. Every other entry is
+/// skipped, and an entry's own path is never used as a destination.
 fn extract(archive: &Path, archive_name: &str, dest: &Path) -> Result<(), UpdateError> {
     let (stem, zip) = match archive_name.strip_suffix(".tar.gz") {
         Some(s) => (s, false),
@@ -142,7 +143,6 @@ fn extract(archive: &Path, archive_name: &str, dest: &Path) -> Result<(), Update
     let wanted = format!("{stem}/{bin}");
     let file =
         std::fs::File::open(archive).map_err(|e| io_failed("could not open the download", e))?;
-    let mut found = false;
 
     if zip {
         let mut z = zip::ZipArchive::new(file).map_err(|e| failed(format!("bad archive: {e}")))?;
@@ -150,15 +150,10 @@ fn extract(archive: &Path, archive_name: &str, dest: &Path) -> Result<(), Update
             let mut entry = z
                 .by_index(i)
                 .map_err(|e| failed(format!("bad archive: {e}")))?;
-            if entry.is_dir() {
+            if entry.is_dir() || entry.name().map(|n| n != wanted.as_str()).unwrap_or(true) {
                 continue;
             }
-            let name = entry.name().map(|n| n.into_owned()).unwrap_or_default();
-            if name != wanted {
-                return Err(failed(format!("unexpected file in the archive: {name}")));
-            }
-            write_binary(&mut entry, dest)?;
-            found = true;
+            return write_binary(&mut entry, dest);
         }
     } else {
         let mut t = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -167,27 +162,15 @@ fn extract(archive: &Path, archive_name: &str, dest: &Path) -> Result<(), Update
             .map_err(|e| failed(format!("bad archive: {e}")))?
         {
             let mut entry = entry.map_err(|e| failed(format!("bad archive: {e}")))?;
-            if entry.header().entry_type().is_dir() {
+            if !entry.header().entry_type().is_file()
+                || entry.path_bytes().as_ref() != wanted.as_bytes()
+            {
                 continue;
             }
-            let path = entry
-                .path()
-                .map_err(|e| failed(format!("bad archive: {e}")))?;
-            if path.to_str() != Some(wanted.as_str()) || !entry.header().entry_type().is_file() {
-                return Err(failed(format!(
-                    "unexpected file in the archive: {}",
-                    path.display()
-                )));
-            }
-            write_binary(&mut entry, dest)?;
-            found = true;
+            return write_binary(&mut entry, dest);
         }
     }
-    if found {
-        Ok(())
-    } else {
-        Err(failed(format!("{wanted} is missing from the archive")))
-    }
+    Err(failed(format!("{wanted} is missing from the archive")))
 }
 
 fn write_binary(from: &mut impl Read, dest: &Path) -> Result<(), UpdateError> {
@@ -338,14 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn zip_with_other_paths_is_refused() {
+    fn zip_without_the_binary_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("a.zip");
         let name = "puppy-1.0.0-t-windows.zip";
         std::fs::write(&archive, zip_with(&[("../evil", b"x")])).unwrap();
         let dest = dir.path().join("out");
         let err = extract(&archive, name, &dest).unwrap_err();
-        assert!(err.to_string().contains("unexpected"), "{err}");
+        assert!(err.to_string().contains("missing"), "{err}");
         assert!(!dest.exists());
     }
 }

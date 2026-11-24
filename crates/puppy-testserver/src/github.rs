@@ -18,6 +18,7 @@ pub struct FakeRelease {
     target: String,
     checksum: Checksum,
     prints: Option<String>,
+    no_binary: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,7 +37,14 @@ impl FakeRelease {
             target: target.to_string(),
             checksum: Checksum::Good,
             prints: None,
+            no_binary: false,
         }
+    }
+
+    /// The archive holds everything but the `puppy` binary.
+    pub fn without_binary(mut self) -> Self {
+        self.no_binary = true;
+        self
     }
 
     /// Publishes no `.sha256` asset.
@@ -80,27 +88,58 @@ impl FakeRelease {
         }
     }
 
+    /// Files beside the binary, like the real packages, plus one hostile path.
+    fn extras(&self) -> Vec<(&'static str, &'static [u8], bool)> {
+        // (path relative to the release folder, body, hostile: path escapes the folder)
+        vec![
+            ("README.md", b"readme", false),
+            ("LICENSE-MIT", b"license", false),
+            ("extension/manifest.json", b"{}", false),
+            ("packaging/systemd/puppy.service", b"[Service]", false),
+            ("../evil", b"evil", true),
+        ]
+    }
+
     fn archive(&self) -> Vec<u8> {
         let dir = format!("puppy-{}-{}", self.version, self.target);
         let bin = self.binary();
+        let mut files: Vec<(String, Vec<u8>, u32)> = Vec::new();
+        for (path, body, hostile) in self.extras() {
+            let full = if hostile {
+                path.to_string()
+            } else {
+                format!("{dir}/{path}")
+            };
+            files.push((full, body.to_vec(), 0o644));
+        }
+        if !self.no_binary {
+            let name = if self.is_zip() { "puppy.exe" } else { "puppy" };
+            files.insert(0, (format!("{dir}/{name}"), bin, 0o755));
+        }
         if self.is_zip() {
             let mut out = std::io::Cursor::new(Vec::new());
             let mut zip = zip::ZipWriter::new(&mut out);
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            zip.start_file(format!("{dir}/puppy.exe"), opts).unwrap();
-            zip.write_all(&bin).unwrap();
+            for (name, body, _) in &files {
+                zip.start_file(name.as_str(), opts).unwrap();
+                zip.write_all(body).unwrap();
+            }
             zip.finish().unwrap();
             out.into_inner()
         } else {
             let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             let mut tar = tar::Builder::new(gz);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bin.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            tar.append_data(&mut header, format!("{dir}/puppy"), bin.as_slice())
-                .unwrap();
+            for (name, body, mode) in &files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(*mode);
+                // Written raw: `set_path` refuses `..` components.
+                let raw = &mut header.as_gnu_mut().unwrap().name;
+                raw[..name.len()].copy_from_slice(name.as_bytes());
+                header.set_cksum();
+                tar.append(&header, body.as_slice()).unwrap();
+            }
             tar.into_inner().unwrap().finish().unwrap()
         }
     }

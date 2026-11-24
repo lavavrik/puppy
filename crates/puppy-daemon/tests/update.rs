@@ -73,6 +73,37 @@ async fn bad_checksum_is_rejected() {
 }
 
 #[tokio::test]
+async fn extracts_only_the_binary() {
+    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let work = parent.path().join("work");
+    let bin = fetch(&client(), &r, &work).await.unwrap();
+    assert_eq!(bin, work.join("puppy"));
+    let mut names: Vec<_> = std::fs::read_dir(&work)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let mut want = vec![r.archive.name.clone(), "puppy".to_string()];
+    want.sort();
+    assert_eq!(names, want);
+    assert!(!parent.path().join("evil").exists());
+    assert!(!parent.path().parent().unwrap().join("evil").exists());
+}
+
+#[tokio::test]
+async fn missing_binary_is_failed() {
+    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET).without_binary()).await;
+    let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    match fetch(&client(), &r, work.path()).await {
+        Err(UpdateError::Failed(msg)) => assert!(msg.contains("missing"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn fetch_empties_the_work_dir_first() {
     let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
