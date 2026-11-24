@@ -749,29 +749,56 @@ async fn unsafe_file_names_are_refused_on_every_os() {
     assert!(!env.dir.path().join("C:evil").exists());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fresh_adds_never_overwrite_existing_files() {
-    let single = Seeder::start(&[("one.iso", 100 * KIB)]).await;
-    let multi = Seeder::start(MULTI).await;
-    let env = Env::new(vec![single.addr, multi.addr]).await;
-    std::fs::create_dir_all(env.out().join(MULTI_NAME).join("sub")).unwrap();
-    let user = |p: &Path| std::fs::write(p, b"the user's own data").unwrap();
-    user(&env.out().join("one.iso"));
-    user(&env.out().join(MULTI_NAME).join("a.bin"));
-    user(&env.out().join(MULTI_NAME).join("sub/b.bin"));
-    // A magnet's folder name taken by a user's file.
-    let hash = &multi.info_hash_hex;
-    user(&env.out().join(hash));
+/// Asserts each path still holds the user's own data.
+fn assert_untouched(paths: &[PathBuf]) {
+    for p in paths {
+        assert_eq!(
+            std::fs::read(p).unwrap(),
+            b"the user's own data",
+            "{} was touched",
+            p.display()
+        );
+    }
+}
 
-    // Single-file: its own fresh folder, since `out/one.iso` is taken.
+fn user_file(p: &Path) {
+    std::fs::write(p, b"the user's own data").unwrap();
+}
+
+// One seeder per engine: with several, each torrent also dials the wrong seeder, and
+// librqbit 9.1's listener can then sit on the right handshake until its next accept
+// (a failed check disables `futs.next()` in its `select!`), stalling the download
+// past the test timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_single_file_add_never_overwrites_existing_files() {
+    let single = Seeder::start(&[("one.iso", 100 * KIB)]).await;
+    let env = Env::new(vec![single.addr]).await;
+    std::fs::create_dir_all(env.out()).unwrap();
+    user_file(&env.out().join("one.iso"));
+
+    // Its own fresh folder, since `out/one.iso` is taken.
     let added = env.add(1, env.torrent_req(&single)).await.unwrap();
     assert_eq!(added.path, env.out().join("one.iso (1)").join("one.iso"));
-    // Multi-file: a fresh folder next to the existing one.
+    env.wait_state(1, DownloadState::Completed).await;
+    assert_files(&env.out().join("one.iso (1)"), &[("one.iso", 100 * KIB)]);
+    assert_untouched(&[env.out().join("one.iso")]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_multi_file_adds_never_overwrite_existing_files() {
+    let multi = Seeder::start(MULTI).await;
+    let env = Env::new(vec![multi.addr]).await;
+    std::fs::create_dir_all(env.out().join(MULTI_NAME).join("sub")).unwrap();
+    user_file(&env.out().join(MULTI_NAME).join("a.bin"));
+    user_file(&env.out().join(MULTI_NAME).join("sub/b.bin"));
+    // A magnet's folder name taken by a user's file.
+    let hash = &multi.info_hash_hex;
+    user_file(&env.out().join(hash));
+
+    // A fresh folder next to the existing one.
     let added = env.add(2, env.torrent_req(&multi)).await.unwrap();
     assert_eq!(added.path, env.out().join(format!("{MULTI_NAME} (1)")));
-    env.wait_state(1, DownloadState::Completed).await;
     env.wait_state(2, DownloadState::Completed).await;
-    assert_files(&env.out().join("one.iso (1)"), &[("one.iso", 100 * KIB)]);
     assert_files(&env.out().join(format!("{MULTI_NAME} (1)")), MULTI);
     env.engine.remove(2, true).await.unwrap();
 
@@ -788,19 +815,11 @@ async fn fresh_adds_never_overwrite_existing_files() {
     env.wait_state(3, DownloadState::Completed).await;
     assert_files(&env.out().join(format!("{hash} (1)")), MULTI);
 
-    for p in [
-        env.out().join("one.iso"),
+    assert_untouched(&[
         env.out().join(MULTI_NAME).join("a.bin"),
         env.out().join(MULTI_NAME).join("sub/b.bin"),
         env.out().join(hash),
-    ] {
-        assert_eq!(
-            std::fs::read(&p).unwrap(),
-            b"the user's own data",
-            "{} was touched",
-            p.display()
-        );
-    }
+    ]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
