@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// What a fake release contains. Built with [`FakeRelease::new`] and the builder options.
 #[derive(Debug, Clone)]
@@ -153,6 +154,7 @@ impl FakeRelease {
 struct Shared {
     status: AtomicU16,
     hits: AtomicUsize,
+    delay_ms: AtomicU64,
     json: String,
     assets: HashMap<String, Vec<u8>>,
 }
@@ -199,6 +201,7 @@ impl FakeGitHub {
         let shared = Arc::new(Shared {
             status: AtomicU16::new(200),
             hits: AtomicUsize::new(0),
+            delay_ms: AtomicU64::new(0),
             json,
             assets,
         });
@@ -226,6 +229,13 @@ impl FakeGitHub {
     pub fn set_status(&self, status: u16) {
         self.shared.status.store(status, Ordering::SeqCst);
     }
+
+    /// Makes the release lookup answer only after `delay` (counted as a hit at once).
+    pub fn set_delay(&self, delay: Duration) {
+        self.shared
+            .delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
 }
 
 impl Drop for FakeGitHub {
@@ -240,6 +250,10 @@ fn hex(bytes: &[u8]) -> String {
 
 async fn latest(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     s.hits.fetch_add(1, Ordering::SeqCst);
+    let delay = s.delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     // GitHub rejects requests without a User-Agent.
     if !headers.contains_key(header::USER_AGENT) {
         return StatusCode::FORBIDDEN.into_response();

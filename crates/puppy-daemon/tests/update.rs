@@ -474,6 +474,49 @@ mod daemon {
         assert_eq!(env.stop(d).await, RunOutcome::Exited);
     }
 
+    /// Waits until the scheduled lookup has reached the (slow) fake.
+    async fn scheduled_lookup_in_flight(fake: &FakeGitHub) {
+        let deadline = Instant::now() + TIMEOUT;
+        while fake.hits() == 0 {
+            assert!(Instant::now() < deadline, "no scheduled lookup");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn check_during_scheduled_check_gets_its_result() {
+        let env = Env::new().await;
+        env.fake.set_delay(Duration::from_millis(1500));
+        let d = env.start(true).await;
+        scheduled_lookup_in_flight(&env.fake).await;
+        let mut c = env.client().await;
+        let s = reply_status(c.update(true).await);
+        assert!(
+            matches!(&s, UpdateStatus::Available { version, .. } if version == "0.2.0"),
+            "{s:?}"
+        );
+        assert_eq!(
+            env.fake.hits(),
+            1,
+            "the waiting check shares the running one"
+        );
+        drop(c);
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn install_during_scheduled_check_with_nothing_newer_is_up_to_date() {
+        let env = Env::with(FakeRelease::new("0.1.0", puppy_daemon::update::TARGET)).await;
+        env.fake.set_delay(Duration::from_millis(1500));
+        let d = env.start(true).await;
+        scheduled_lookup_in_flight(&env.fake).await;
+        let mut c = env.client().await;
+        assert_eq!(reply_status(c.update(false).await), UpdateStatus::UpToDate);
+        assert_eq!(std::fs::read(&env.exe).unwrap(), b"old");
+        drop(c);
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn not_due_means_no_request() {
         let env = Env::new().await;

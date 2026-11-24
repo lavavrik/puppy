@@ -70,6 +70,10 @@ struct Inner {
     install: tokio::sync::Mutex<Option<Outcome>>,
     /// Finished install attempts.
     attempts: AtomicU64,
+    /// Held for a whole release lookup.
+    check: tokio::sync::Mutex<()>,
+    /// Finished lookups, so a check that waited for a running one takes its result.
+    checks: AtomicU64,
     restart: CancellationToken,
 }
 
@@ -129,6 +133,8 @@ impl Updater {
                 release: Mutex::new(None),
                 install: tokio::sync::Mutex::new(None),
                 attempts: AtomicU64::new(0),
+                check: tokio::sync::Mutex::new(()),
+                checks: AtomicU64::new(0),
                 restart: CancellationToken::new(),
             }),
         }
@@ -150,17 +156,26 @@ impl Updater {
     }
 
     /// Looks up the latest release now (whether or not one is due) and records the time
-    /// of the check in `update.json`. While an install runs or after one finished, it
-    /// only returns the status.
+    /// of the check in `update.json`. A check already running is waited for and its
+    /// result returned. While an install runs or after one finished, it only returns
+    /// the status.
     pub async fn check_now(&self) -> UpdateStatus {
-        // Holding the install lock keeps a check from overwriting `Installing`.
-        let Ok(_installing) = self.inner.install.try_lock() else {
-            return self.status();
-        };
-        if matches!(self.status(), UpdateStatus::Installed { .. }) {
+        let i = &self.inner;
+        let seen = i.checks.load(Ordering::SeqCst);
+        if matches!(
+            self.status(),
+            UpdateStatus::Installing { .. } | UpdateStatus::Installed { .. }
+        ) {
             return self.status();
         }
-        self.lookup().await
+        let _checking = i.check.lock().await;
+        if i.checks.load(Ordering::SeqCst) != seen {
+            // A lookup finished while this call waited: its result is this call's too.
+            return self.status();
+        }
+        let status = self.lookup().await;
+        i.checks.fetch_add(1, Ordering::SeqCst);
+        status
     }
 
     async fn lookup(&self) -> UpdateStatus {
@@ -201,8 +216,7 @@ impl Updater {
                 }
             }
         };
-        self.set_status(status.clone());
-        status
+        self.set_checked(status)
     }
 
     /// Installs the newer release now: looks it up unless the last check found one,
@@ -245,7 +259,7 @@ impl Updater {
         let release = match cached {
             Some(r) => r,
             None => {
-                if let UpdateStatus::Failed { error, .. } = self.lookup().await {
+                if let UpdateStatus::Failed { error, .. } = self.check_now().await {
                     return Err(UpdateError::Failed(error));
                 }
                 i.release
@@ -357,14 +371,37 @@ impl Updater {
         }
     }
 
+    /// Sets the result of a lookup and returns it, unless an install has started or
+    /// finished meanwhile: then that status stays and is returned.
+    fn set_checked(&self, status: UpdateStatus) -> UpdateStatus {
+        self.change_status(|cur| {
+            if matches!(
+                cur,
+                UpdateStatus::Installing { .. } | UpdateStatus::Installed { .. }
+            ) {
+                cur.clone()
+            } else {
+                status
+            }
+        })
+    }
+
     /// Changes the status and tells subscribers (only when it really changed).
     fn set_status(&self, status: UpdateStatus) {
+        self.change_status(|_| status);
+    }
+
+    /// Replaces the status with `next(current)` and returns it. Subscribers hear of a
+    /// change while the status is locked, so they see changes in order.
+    fn change_status(&self, next: impl FnOnce(&UpdateStatus) -> UpdateStatus) -> UpdateStatus {
         let mut cur = self.inner.status.lock().unwrap_or_else(|e| e.into_inner());
-        if *cur == status {
-            return;
+        let status = next(&cur);
+        if *cur != status {
+            *cur = status.clone();
+            self.inner.manager.publish(Event::Update {
+                status: status.clone(),
+            });
         }
-        *cur = status.clone();
-        drop(cur);
-        self.inner.manager.publish(Event::Update { status });
+        status
     }
 }
