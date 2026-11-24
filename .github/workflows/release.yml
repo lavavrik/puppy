@@ -4,6 +4,9 @@ name: Release
 # GitHub release, which you review and publish by hand. Runs when a version tag
 # (v0.1.0) is pushed; it can also be started from the Actions tab to build the
 # archives only (they appear as run artifacts, no release is made).
+#
+# Every release carries written notes: docs/releases/<tag>.md must exist in the
+# tagged commit, or the run stops before building anything.
 on:
   push:
     tags: ["v[0-9]*"]
@@ -35,6 +38,14 @@ jobs:
           version=${id##*#}; version=${version##*@}
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: The release notes exist
+        if: github.ref_type == 'tag'
+        run: |
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::missing release notes: write $notes and tag again"
             exit 1
           fi
 
@@ -88,6 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -96,9 +108,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes="$PWD/docs/releases/$GITHUB_REF_NAME.md"
           cd dist
           cat ./*.sha256 > SHA256SUMS
+          # The written notes come first; --generate-notes appends GitHub's
+          # list of merged pull requests and the full-changelog link.
           gh release create "$GITHUB_REF_NAME" ./* \
             --repo "$GITHUB_REPOSITORY" \
-            --draft --verify-tag --generate-notes \
+            --draft --verify-tag \
+            --notes-file "$notes" --generate-notes \
             --title "puppy ${GITHUB_REF_NAME#v}"
