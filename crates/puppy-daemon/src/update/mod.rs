@@ -1,4 +1,10 @@
-//! Self-update: facts about this build.
+//! Self-update: facts about this build, finding a release, and swapping it in.
+
+mod install;
+mod release;
+
+pub use install::{cannot_install_reason, fetch, remove_old_exe, replace_exe, sanity_check};
+pub use release::{Asset, Release, UpdateError, archive_name, latest};
 
 /// The target triple this binary was built for (names its release asset).
 pub const TARGET: &str = env!("PUPPY_TARGET");

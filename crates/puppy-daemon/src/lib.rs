@@ -11,7 +11,7 @@ pub mod server;
 pub mod store;
 pub mod update;
 
-pub use config::{Config, ConfigError, NotificationsConfig, TorrentConfig};
+pub use config::{Config, ConfigError, NotificationsConfig, TorrentConfig, UpdateConfig};
 pub use manager::{Manager, ManagerError};
 pub use paths::{Paths, SocketName};
 pub use store::{PersistedState, RuntimeSettings, Store, StoreError, StoredDownload, StoredState};

@@ -44,6 +44,11 @@ globset = "0.4"
 base64 = "0.22"
 webpki-root-certs = "1"
 rustls-native-certs = "0.8"
+semver = "1"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Release binaries (GitHub releases): `cargo build --profile dist`. Kept separate so
 # everyday `--release` builds stay quick.

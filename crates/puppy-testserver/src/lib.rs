@@ -1,5 +1,7 @@
 //! Configurable axum test server shared by HTTP-engine integration tests.
 
+pub mod github;
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
