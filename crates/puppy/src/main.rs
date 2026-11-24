@@ -79,6 +79,12 @@ enum Command {
     },
     /// Print a one-line summary (`N downloads, X active`), starting a daemon if needed.
     Status,
+    /// Look for a newer puppy and install it.
+    Update {
+        /// Only say whether a newer version exists.
+        #[arg(long)]
+        check: bool,
+    },
     /// Add downloads from URLs, magnet links or .torrent files (`-` reads them from stdin).
     Add {
         /// URLs, magnet links, .torrent paths; `-` reads one per line from stdin.
@@ -302,6 +308,9 @@ fn main() -> ExitCode {
                 Err(e) => Err(e.into()),
             },
             Some(Command::Status) => cli::list::status(&Ctx::from_env(cli.json)?).await,
+            Some(Command::Update { check }) => {
+                cli::update::update(&Ctx::from_env(cli.json)?, check).await
+            }
             Some(Command::Add {
                 sources,
                 output_dir,

@@ -221,6 +221,8 @@ puppy limit --global --down 5M --up 1M      # global limits; `limit --global` sh
 puppy max-active 2                          # run at most 2 downloads at once
 puppy wait 3 4                              # wait until they complete, fail or need attention
 puppy watch                                 # print events as they happen, until Ctrl-C
+puppy update --check                        # is a newer puppy out? (no install)
+puppy update                                # install it; the daemon restarts into it
 puppy stop                                  # stop the daemon
 ```
 
@@ -229,7 +231,8 @@ The text formats are for people and may change; scripts should use `--json`
 JSON value (`watch` excepted):
 
 - `ls`: an array of download snapshots; `info`: `{"download":…,"detail":…}`;
-  `limit --global`: the settings; `status`: `{"downloads":N,"active":N}`.
+  `limit --global`: the settings; `status`: `{"downloads":N,"active":N,"update":…}`;
+  `update`: `{"status":…}` (the final update status).
 - `add`: `{"added":[{"id","source"}…],"failed":[{"source","error","code"}…]}`;
   with `--wait` also `"final"` (the snapshots once done) and `"missing"`
   (ids that no longer exist).
@@ -303,6 +306,7 @@ Exit codes (with several ids, the highest wins):
 | `3`  | unknown id |
 | `4`  | waited download failed |
 | `5`  | waited download needs attention |
+| `6`  | update not possible here (not a release build, or a folder puppy cannot write) |
 
 ### Configuration
 

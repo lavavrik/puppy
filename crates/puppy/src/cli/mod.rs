@@ -8,6 +8,7 @@ pub mod files;
 pub mod list;
 pub mod output;
 pub mod seed;
+pub mod update;
 pub mod wait;
 
 use anyhow::Context;
@@ -49,6 +50,9 @@ pub enum CliError {
     /// download failed, 5 when one needs attention, 130 after Ctrl-C).
     #[error("")]
     Reported(u8),
+    /// An update that cannot happen here (exit 6); the text is why.
+    #[error("cannot update: {0}")]
+    NotPossible(String),
     /// Anything else: daemon or operation errors (exit 1).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -84,6 +88,7 @@ impl CliError {
             CliError::Other(_) => 1,
             CliError::Usage(_) => 2,
             CliError::UnknownId(_) => 3,
+            CliError::NotPossible(_) => 6,
             CliError::Reported(c) => *c,
         }
     }
@@ -111,6 +116,7 @@ mod tests {
     fn exit_codes() {
         assert_eq!(CliError::Usage("x".into()).exit_code(), 2);
         assert_eq!(CliError::UnknownId("x".into()).exit_code(), 3);
+        assert_eq!(CliError::NotPossible("x".into()).exit_code(), 6);
         assert_eq!(CliError::Reported(5).exit_code(), 5);
         assert_eq!(CliError::Other(anyhow::anyhow!("x")).exit_code(), 1);
     }

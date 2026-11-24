@@ -7,7 +7,7 @@ use crate::cli::ClientError;
 use clap::ValueEnum;
 use puppy_core::types::EngineDetail;
 use puppy_proto::WireState;
-use puppy_proto::{DownloadSnapshot, ErrorCode, ReplyData, Request, WireAttention};
+use puppy_proto::{DownloadSnapshot, ErrorCode, ReplyData, Request, UpdateStatus, WireAttention};
 use puppy_tui::format::{bytes, eta, speed};
 use puppy_tui::format::{display_safe, percent};
 use serde::Serialize;
@@ -16,11 +16,15 @@ use serde::Serialize;
 struct Summary {
     downloads: usize,
     active: usize,
+    update: UpdateStatus,
 }
 
 /// `N downloads, X active` (`1 download, …`), or `{"downloads":N,"active":X}`.
 pub async fn status(ctx: &Ctx) -> Result<(), CliError> {
-    let downloads = ctx.client().await?.list().await?;
+    let client = ctx.client().await?;
+    let downloads = client.list().await?;
+    // What the daemon already knows; a daemon without the request still has a summary.
+    let update = client.get_update().await.unwrap_or(UpdateStatus::Unknown);
     let active = downloads
         .iter()
         .filter(|d| matches!(d.state, WireState::Starting | WireState::Active))
@@ -30,10 +34,16 @@ pub async fn status(ctx: &Ctx) -> Result<(), CliError> {
         json(&Summary {
             downloads: n,
             active,
+            update,
         });
     } else {
         let noun = if n == 1 { "download" } else { "downloads" };
         out(format_args!("{n} {noun}, {active} active"));
+        if let UpdateStatus::Available { version, .. } = update {
+            out(format_args!(
+                "update available: puppy {version} (puppy update)"
+            ));
+        }
     }
     Ok(())
 }

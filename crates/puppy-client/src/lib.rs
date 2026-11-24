@@ -19,7 +19,7 @@ use interprocess::local_socket::{GenericFilePath, GenericNamespaced};
 use puppy_core::types::{AddRequest, DownloadId};
 use puppy_proto::{
     CodecError, DownloadSnapshot, Envelope, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply,
-    ReplyData, Request, ServerMsg, write_msg,
+    ReplyData, Request, ServerMsg, UpdateStatus, write_msg,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -410,6 +410,24 @@ impl Client {
     pub async fn list(&self) -> Result<Vec<DownloadSnapshot>, ClientError> {
         match self.call(Request::List).await? {
             ReplyData::Downloads { downloads } => Ok(downloads),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// What the daemon knows about updates; no network.
+    pub async fn get_update(&self) -> Result<UpdateStatus, ClientError> {
+        match self.call(Request::GetUpdate).await? {
+            ReplyData::Update { status } => Ok(status),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Looks for a newer release now; unless `check_only`, installs it. An install
+    /// that succeeds answers `Installed` (the daemon then restarts), and may be cut
+    /// off by that restart instead.
+    pub async fn update(&self, check_only: bool) -> Result<UpdateStatus, ClientError> {
+        match self.call(Request::Update { check_only }).await? {
+            ReplyData::Update { status } => Ok(status),
             other => Err(unexpected(other)),
         }
     }

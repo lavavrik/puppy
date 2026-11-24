@@ -1404,3 +1404,103 @@ async fn ls_new_states() {
     let s = row(&seeding);
     assert!(s.contains("seeding") && s.contains("100%"), "{out}");
 }
+
+fn update_env(github: &puppy_testserver::github::FakeGitHub) -> Env {
+    let mut env = Env::new();
+    env.extra
+        .push(("PUPPY_UPDATE_URL", github.api_base().to_string()));
+    env
+}
+
+fn fake_release() -> puppy_testserver::github::FakeRelease {
+    puppy_testserver::github::FakeRelease::new("0.2.0", puppy_daemon::update::TARGET)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_check_reports_available() {
+    let github = puppy_testserver::github::FakeGitHub::start(fake_release()).await;
+    let env = update_env(&github);
+    let (status, out, err) = env.run(&["update", "--check"]);
+    assert!(status.success(), "{status:?}: {err}");
+    assert_eq!(out.trim(), "puppy 0.2.0 is available", "{err}");
+
+    let (status, out, err) = env.run(&["update", "--check", "--json"]);
+    assert!(status.success(), "{status:?}: {err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"]["state"], "available", "{out}");
+    assert_eq!(v["status"]["version"], "0.2.0", "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_refused_in_dev_build() {
+    let github = puppy_testserver::github::FakeGitHub::start(fake_release()).await;
+    let env = update_env(&github);
+    let (status, out, err) = env.run(&["update"]);
+    assert_eq!(status.code(), Some(6), "{out} {err}");
+    assert!(err.contains("puppy: cannot update: "), "{err}");
+    assert!(err.contains("release workflow"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_mentions_update() {
+    let github = puppy_testserver::github::FakeGitHub::start(fake_release()).await;
+    let env = update_env(&github);
+    let (status, _, err) = env.run(&["update", "--check"]);
+    assert!(status.success(), "{err}");
+    let (status, out, err) = env.run(&["status"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        out.contains("update available: puppy 0.2.0 (puppy update)"),
+        "{out}"
+    );
+    let (status, out, err) = env.run(&["status", "--json"]);
+    assert!(status.success(), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["update"]["state"], "available", "{out}");
+    assert_eq!(v["downloads"], 0, "{out}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_reports_missing_comeback() {
+    // A stand-in that answers `--version` and otherwise sleeps instead of serving.
+    let release = fake_release().binary_script(
+        "if [ \"$1\" = \"--version\" ]; then echo 'puppy 0.2.0'; exit 0; fi\nexec sleep 30",
+    );
+    let github = puppy_testserver::github::FakeGitHub::start(release).await;
+    let mut env = update_env(&github);
+    env.extra.push(("PUPPY_UPDATE_ALLOW_DEV", "1".to_string()));
+
+    // A copy of the real binary the update may overwrite.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let exe = bin_dir.path().join("puppy");
+    std::fs::copy(BIN, &exe).unwrap();
+
+    let out_path = env.home.path().join("update-out");
+    let err_path = env.home.path().join("update-err");
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("update").stdin(Stdio::null());
+    for (k, v) in env.vars() {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .unwrap();
+    let pid = env.daemon_pid();
+    let status = wait_exit(child, std::time::Duration::from_secs(60));
+    let out = std::fs::read_to_string(&out_path).unwrap();
+    let err = std::fs::read_to_string(&err_path).unwrap();
+    // The stand-in keeps the daemon's pid and sleeps; do not leave it behind.
+    if let Some(p) = env.daemon_pid().or(pid) {
+        unsafe { libc::kill(p as i32, libc::SIGKILL) };
+    }
+    assert_eq!(status.code(), Some(1), "{out} {err}");
+    assert!(out.contains("updating puppy "), "{out}");
+    assert!(out.contains("\u{2192} 0.2.0\u{2026}"), "{out}");
+    assert!(
+        err.contains("puppy: the daemon did not come back as 0.2.0"),
+        "{err}"
+    );
+}
