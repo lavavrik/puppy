@@ -10,7 +10,7 @@ use puppy_daemon::server::{InFlightStats, QUEUE_CAP, Server};
 use puppy_daemon::{Config, Manager, SocketName, Store};
 use puppy_proto::{
     Envelope, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request, ServerMsg,
-    write_msg,
+    UpdateStatus, write_msg,
 };
 use puppy_testserver::{ServerCfg, TestServer};
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ impl Harness {
             .await
             .unwrap();
         let name = socket_name();
-        let server = Server::bind(&name, manager.clone()).await.unwrap();
+        let server = Server::bind(&name, manager.clone(), None).await.unwrap();
         #[cfg(unix)]
         if let SocketName::Path(p) = &name {
             use std::os::unix::fs::PermissionsExt;
@@ -508,6 +508,15 @@ async fn subscribe_receives_snapshots() {
         c.request(Request::Subscribe { interval_ms: 250 }).await,
         done()
     );
+    // Right after the reply: the update status (updates are off in this server).
+    assert_eq!(
+        c.recv().await,
+        Some(ServerMsg::Event {
+            event: Event::Update {
+                status: UpdateStatus::NotChecked
+            }
+        })
+    );
     let start = Instant::now();
     let mut snapshots = 0;
     while start.elapsed() < Duration::from_secs(1) {
@@ -700,7 +709,11 @@ async fn shutdown_reply_survives_an_immediate_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bind_fails_if_name_in_use() {
     let h = Harness::new().await;
-    assert!(Server::bind(&h.name, h.manager.clone()).await.is_err());
+    assert!(
+        Server::bind(&h.name, h.manager.clone(), None)
+            .await
+            .is_err()
+    );
     // The first server is unaffected.
     let mut c = h.greeted().await;
     assert!(matches!(c.request(Request::List).await, Reply::Ok { .. }));

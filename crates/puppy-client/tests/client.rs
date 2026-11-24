@@ -77,6 +77,7 @@ impl Env {
             engine: None,
             torrent_test: Some(Default::default()),
             notifier: None,
+            update: None,
         }
     }
 

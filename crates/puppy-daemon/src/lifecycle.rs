@@ -8,6 +8,7 @@ use crate::notify::{self, Notifier};
 use crate::paths::{Paths, SocketName};
 use crate::server::Server;
 use crate::store::Store;
+use crate::update::{self, UpdateOptions, Updater};
 use anyhow::Context;
 use puppy_core::config::HttpConfig;
 use puppy_core::engine::Engine;
@@ -33,6 +34,11 @@ const TORRENT_SHUTDOWN: Duration = Duration::from_millis(1500);
 /// How long the notifier may take to hand its last popups to the system at shutdown.
 /// Taken from the manager's pause phase like [`TORRENT_SHUTDOWN`].
 const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
+/// After an update was installed, how long requests in flight (the `update` request's
+/// own reply among them) may take to queue their replies before shutting down.
+const REPLY_GRACE: Duration = Duration::from_secs(2);
+/// The shutdown reason after an update was installed.
+const UPDATE_INSTALLED: &str = "update installed";
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -57,6 +63,8 @@ pub struct DaemonOptions {
     pub torrent_test: Option<TorrentTestOptions>,
     /// Where desktop notifications go. `None`: no notifications (the default; tests).
     pub notifier: Option<Arc<dyn Notifier>>,
+    /// Self-update settings. `None`: updates off (the default; only `main` turns them on).
+    pub update: Option<UpdateOptions>,
 }
 
 /// See [`DaemonOptions::torrent_test`].
@@ -97,6 +105,7 @@ impl std::fmt::Debug for DaemonOptions {
             .field("engine", &self.engine.as_ref().map(|e| e.kind()))
             .field("torrent_test", &self.torrent_test)
             .field("notifier", &self.notifier.is_some())
+            .field("update", &self.update)
             .finish()
     }
 }
@@ -110,6 +119,8 @@ pub enum RunOutcome {
     /// A second signal cut the graceful shutdown short: the state was saved on a best
     /// effort basis, and downloads may resume from an earlier point.
     Forced,
+    /// A new binary was installed; the caller should start it with the same arguments.
+    Restart,
 }
 
 /// Resolves the paths (unless given), sets up logging to `log_dir/puppyd.log` (plus
@@ -121,7 +132,8 @@ pub enum RunOutcome {
 /// daemon runs without torrents), manager and server, and runs until a `Shutdown`
 /// request, a signal (Ctrl-C/SIGINT, SIGTERM, SIGHUP on Unix; Ctrl-C, console close,
 /// logoff and system shutdown on Windows) or — with `idle_exit` — that long without
-/// work or clients. Then it stops the server (removing the socket file), shuts the
+/// work or clients, or — with `update` — an installed update (then it returns
+/// [`RunOutcome::Restart`] after the shutdown below). Then it stops the server (removing the socket file), shuts the
 /// manager down (pausing downloads, then persisting state), stops the torrent session
 /// (about 1 s) and releases the lock. Pausing plus stopping the session take at most
 /// 10 s together: the session's 1.5 s (and the notifier's 1 s, when notifications are on)
@@ -171,6 +183,16 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         // The last popups are flushed after that, within the same overall bound too.
         cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(NOTIFY_FLUSH);
     }
+    let update_setup = match opts.update {
+        Some(u) => match puppy_core::http::probe::build_client(&cfg.http_config()) {
+            Ok(client) => Some((u, cfg.update.clone(), client)),
+            Err(e) => {
+                warn!("cannot create the update client, updates are off: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     let store = Store::new(paths.state_file.clone());
     let notifications = cfg.notifications.clone();
     let manager = match Manager::start(engines, store, cfg).await {
@@ -192,7 +214,11 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         }
         _ => None,
     };
-    let server = match Server::bind(&paths.socket, manager.clone()).await {
+    let updater = update_setup.map(|(u, update_cfg, client)| {
+        update::remove_old_exe(&u.exe);
+        Updater::new(u, update_cfg, client, &paths, manager.clone())
+    });
+    let server = match Server::bind(&paths.socket, manager.clone(), updater.clone()).await {
         Ok(s) => s,
         Err(e) => {
             manager.shutdown().await;
@@ -212,10 +238,21 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     let clients = server.client_count();
     let shutdown_requested = server.shutdown_requested();
     let stop = CancellationToken::new();
+    let in_flight = server.in_flight_stats();
     let mut server_task = tokio::spawn(server.run(stop.clone()));
     let mut server_done = false;
+    // Never cancelled without an updater.
+    let restart = updater
+        .as_ref()
+        .map_or_else(CancellationToken::new, Updater::restart_requested);
+    let updater_task = updater.map(|u| tokio::spawn(u.run(clients.clone(), stop.clone())));
     let reason = tokio::select! {
         _ = shutdown_requested.cancelled() => "shutdown requested",
+        _ = restart.cancelled() => {
+            // Let the `update` request that installed it send its reply first.
+            replies_queued(&in_flight, REPLY_GRACE).await;
+            UPDATE_INSTALLED
+        }
         signal = signals.recv() => signal,
         _ = idle(opts.idle_exit, &manager, &clients) => "idle",
         r = &mut server_task => {
@@ -234,6 +271,12 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         stop.cancel();
         if !server_done && let Err(e) = (&mut server_task).await {
             warn!("the server task failed: {e}");
+        }
+        // Ends at once on `stop`.
+        if let Some(t) = updater_task
+            && let Err(e) = t.await
+        {
+            warn!("the updater task failed: {e}");
         }
         manager.shutdown().await;
         // After the manager paused its torrents: stops the session (listener, DHT).
@@ -255,7 +298,20 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         }
     }
     info!("daemon stopped");
+    if reason == UPDATE_INSTALLED {
+        return Ok(RunOutcome::Restart);
+    }
     Ok(RunOutcome::Exited)
+}
+
+/// Waits until no request is in flight (their replies are queued), at most `limit`.
+async fn replies_queued(in_flight: &crate::server::InFlightStats, limit: Duration) {
+    let wait = async {
+        while in_flight.current() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let _ = tokio::time::timeout(limit, wait).await;
 }
 
 /// Starts the torrent engine from the `[torrent]` config (network-free with

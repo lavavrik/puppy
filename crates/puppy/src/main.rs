@@ -449,7 +449,8 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
     })
     .await?;
     match outcome {
-        RunOutcome::Exited => Ok(()),
+        // Task 6 starts the new binary on `Restart`; until then it just exits.
+        RunOutcome::Exited | RunOutcome::Restart => Ok(()),
         RunOutcome::AlreadyRunning => {
             err("puppy: a daemon is already running; nothing to do");
             Ok(())

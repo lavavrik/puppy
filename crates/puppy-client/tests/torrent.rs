@@ -112,6 +112,7 @@ impl Env {
                 probe: self.probe.clone(),
             }),
             notifier: None,
+            update: None,
         }
     }
 

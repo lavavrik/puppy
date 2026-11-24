@@ -59,6 +59,9 @@ pub enum ManagerError {
     BadRequest(String),
     #[error("{0}")]
     Unsupported(String),
+    /// A self-update failed (reported with the `engine` code).
+    #[error("{0}")]
+    UpdateFailed(String),
     #[error(transparent)]
     Engine(#[from] EngineError),
 }
@@ -70,6 +73,7 @@ impl ManagerError {
             ManagerError::InvalidState(_) => ErrorCode::InvalidState,
             ManagerError::BadRequest(_) => ErrorCode::BadRequest,
             ManagerError::Unsupported(_) => ErrorCode::Unsupported,
+            ManagerError::UpdateFailed(_) => ErrorCode::Engine,
             ManagerError::Engine(EngineError::Unsupported(_)) => ErrorCode::Unsupported,
             ManagerError::Engine(_) => ErrorCode::Engine,
         }
@@ -373,18 +377,31 @@ impl Manager {
         self.inner.events.subscribe()
     }
 
+    /// Sends `ev` to every subscriber (e.g. the updater's status changes).
+    pub fn publish(&self, ev: Event) {
+        self.inner.emit(ev);
+    }
+
     /// No download is active, starting, queued, seeding or waiting for an automatic
     /// retry (a torrent choosing files waits for the user, not for the daemon).
     pub fn is_idle(&self) -> bool {
+        self.no_work(true)
+    }
+
+    /// Like [`is_idle`](Self::is_idle), but seeding torrents do not count as busy: they
+    /// can be stopped and resumed without losing anything.
+    pub fn is_quiet(&self) -> bool {
+        self.no_work(false)
+    }
+
+    fn no_work(&self, seeding_is_work: bool) -> bool {
         self.inner.lock().entries.values().all(|e| {
             e.retry.is_none()
-                && !matches!(
-                    e.state,
-                    DownloadState::Queued
-                        | DownloadState::Starting
-                        | DownloadState::Active
-                        | DownloadState::Seeding { .. }
-                )
+                && !match e.state {
+                    DownloadState::Queued | DownloadState::Starting | DownloadState::Active => true,
+                    DownloadState::Seeding { .. } => seeding_is_work,
+                    _ => false,
+                }
         })
     }
 
@@ -884,6 +901,31 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Unsupported);
         let e = ManagerError::Engine(EngineError::Invalid("x".into()));
         assert_eq!(e.code(), ErrorCode::Engine);
+    }
+
+    #[tokio::test]
+    async fn seeding_is_quiet_but_active_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("state.json"));
+        let m = Manager::start(Vec::new(), store, Config::default())
+            .await
+            .unwrap();
+        assert!(m.is_quiet());
+        m.inner.lock().entries.insert(1, entry(seeding(0)));
+        assert!(m.is_quiet(), "seeding does not block quiet");
+        assert!(!m.is_idle(), "but it still counts against idle");
+        m.inner
+            .lock()
+            .entries
+            .insert(1, entry(DownloadState::Active));
+        assert!(!m.is_quiet());
+        m.inner
+            .lock()
+            .entries
+            .insert(1, entry(DownloadState::Queued));
+        assert!(!m.is_quiet());
+        m.inner.lock().entries.clear();
+        m.shutdown().await;
     }
 
     #[test]

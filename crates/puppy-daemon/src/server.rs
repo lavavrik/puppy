@@ -25,6 +25,7 @@
 
 use crate::manager::{Manager, ManagerError};
 use crate::paths::SocketName;
+use crate::update::{UpdateError, Updater};
 use interprocess::local_socket::tokio::{Listener, Stream, prelude::*};
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
 use puppy_proto::{
@@ -65,6 +66,7 @@ const MAX_INTERVAL_MS: u64 = 1000;
 pub struct Server {
     listener: Listener,
     manager: Arc<Manager>,
+    updater: Option<Updater>,
     clients: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     in_flight: Arc<InFlightStats>,
@@ -107,8 +109,12 @@ impl Server {
     /// Binds the local socket. Fails if the name is in use (stale sockets are the
     /// caller's business). On Unix the socket file is mode 0600 (see the module docs)
     /// and removed again when the server is dropped (i.e. when [`run`](Self::run)
-    /// returns).
-    pub async fn bind(name: &SocketName, manager: Arc<Manager>) -> io::Result<Self> {
+    /// returns). Without an `updater`, update requests report that updates are off.
+    pub async fn bind(
+        name: &SocketName,
+        manager: Arc<Manager>,
+        updater: Option<Updater>,
+    ) -> io::Result<Self> {
         let sock_name = match name {
             SocketName::Path(p) => p.as_path().to_fs_name::<GenericFilePath>()?,
             SocketName::Pipe(n) => n.as_str().to_ns_name::<GenericNamespaced>()?,
@@ -120,6 +126,7 @@ impl Server {
         Ok(Self {
             listener,
             manager,
+            updater,
             clients: Arc::new(AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
             in_flight: Arc::default(),
@@ -156,6 +163,7 @@ impl Server {
                         let conn = serve(
                             stream,
                             self.manager.clone(),
+                            self.updater.clone(),
                             self.shutdown.clone(),
                             self.in_flight.clone(),
                             conns.child_token(),
@@ -398,6 +406,7 @@ fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(Se
 async fn serve(
     stream: Stream,
     manager: Arc<Manager>,
+    updater: Option<Updater>,
     shutdown: CancellationToken,
     in_flight: Arc<InFlightStats>,
     cancel: CancellationToken,
@@ -450,6 +459,7 @@ async fn serve(
     let mut writer = tokio::spawn(writer_task(wr, rx, snaps.clone(), cancel.clone()));
     let mut conn = Conn {
         manager,
+        updater,
         shutdown,
         cancel: cancel.clone(),
         in_flight,
@@ -533,6 +543,7 @@ async fn mismatch_shutdown<R, W>(
 /// Per-connection state owned by the reader loop.
 struct Conn {
     manager: Arc<Manager>,
+    updater: Option<Updater>,
     shutdown: CancellationToken,
     cancel: CancellationToken,
     in_flight: Arc<InFlightStats>,
@@ -567,12 +578,20 @@ impl Conn {
             }
             Request::Subscribe { interval_ms } => {
                 self.unsubscribe().await;
-                // Queued before the first snapshot exists, so the reply comes first.
+                // Before the status is read, so no later change is missed.
+                let events = self.manager.events();
+                // Queued before the first snapshot exists, so the reply comes first,
+                // then the current update status.
                 self.respond(req_id, ok(ReplyData::Done)).await;
+                let event = Event::Update {
+                    status: update_status(self.updater.as_ref()),
+                };
+                send_response(&self.tx, &self.cancel, ServerMsg::Event { event }).await;
                 let every =
                     Duration::from_millis(interval_ms.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS));
                 self.sub = Some(tokio::spawn(subscription(
                     self.manager.clone(),
+                    events,
                     every,
                     self.tx.clone(),
                     self.snaps.clone(),
@@ -592,6 +611,7 @@ impl Conn {
                     p = self.permits.clone().acquire_owned() => p.expect("semaphore never closed"),
                 };
                 let manager = self.manager.clone();
+                let updater = self.updater.clone();
                 let tx = self.tx.clone();
                 let cancel = self.cancel.clone();
                 let counted = self.in_flight.enter();
@@ -599,7 +619,7 @@ impl Conn {
                 // wanted; if the client is gone the reply is simply discarded.
                 tokio::spawn(async move {
                     let _held = (permit, counted);
-                    let result = match dispatch(&manager, body).await {
+                    let result = match dispatch(&manager, updater.as_ref(), body).await {
                         Ok(data) => ok(data),
                         Err(e) => err(e.code(), e.to_string()),
                     };
@@ -620,8 +640,43 @@ impl Conn {
     }
 }
 
-/// Runs a manager request (connection-level methods are handled by [`Conn`]).
-async fn dispatch(m: &Manager, body: Request) -> Result<ReplyData, ManagerError> {
+/// The update status to report: `NotChecked` when updates are off.
+fn update_status(updater: Option<&Updater>) -> UpdateStatus {
+    updater.map_or(UpdateStatus::NotChecked, Updater::status)
+}
+
+/// `Update`: checks now and, unless `check_only`, installs what it found.
+async fn update(updater: Option<&Updater>, check_only: bool) -> Result<UpdateStatus, ManagerError> {
+    let Some(u) = updater else {
+        return Err(ManagerError::Unsupported(
+            "updates are not enabled in this daemon".into(),
+        ));
+    };
+    let status = u.check_now().await;
+    if check_only {
+        return Ok(status);
+    }
+    match status {
+        UpdateStatus::UpToDate => return Ok(status),
+        UpdateStatus::Failed { error, .. } => return Err(ManagerError::UpdateFailed(error)),
+        _ => {}
+    }
+    match u.install_now().await {
+        Ok(version) => Ok(UpdateStatus::Installed {
+            version: version.to_string(),
+        }),
+        Err(UpdateError::NotPossible(reason)) => Err(ManagerError::Unsupported(reason)),
+        Err(UpdateError::Failed(msg)) => Err(ManagerError::UpdateFailed(msg)),
+    }
+}
+
+/// Runs a manager or updater request (connection-level methods are handled by
+/// [`Conn`]).
+async fn dispatch(
+    m: &Manager,
+    updater: Option<&Updater>,
+    body: Request,
+) -> Result<ReplyData, ManagerError> {
     use ReplyData::Done;
     Ok(match body {
         Request::Add {
@@ -660,13 +715,11 @@ async fn dispatch(m: &Manager, body: Request) -> Result<ReplyData, ManagerError>
         }
         Request::SetSeed { id, policy } => m.set_seed(id, policy).await.map(|()| Done)?,
         Request::GetUpdate => ReplyData::Update {
-            status: UpdateStatus::NotChecked,
+            status: update_status(updater),
         },
-        Request::Update { .. } => {
-            return Err(ManagerError::Unsupported(
-                "updates are not enabled in this daemon".into(),
-            ));
-        }
+        Request::Update { check_only } => ReplyData::Update {
+            status: update(updater, check_only).await?,
+        },
         Request::Hello { .. }
         | Request::Subscribe { .. }
         | Request::Unsubscribe
@@ -694,11 +747,11 @@ async fn send_response(tx: &mpsc::Sender<ServerMsg>, cancel: &CancellationToken,
 /// manager's discrete events into the queue, dropping them when it is full.
 async fn subscription(
     manager: Arc<Manager>,
+    mut events: broadcast::Receiver<Event>,
     every: Duration,
     tx: mpsc::Sender<ServerMsg>,
     snaps: Arc<SnapshotSlot>,
 ) {
-    let mut events = manager.events();
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut dropped = 0u64;
