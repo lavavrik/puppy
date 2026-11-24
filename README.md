@@ -7,6 +7,11 @@ owns every download and the queue, so downloads keep going when no client is
 open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/hero-light.png">
+  <img alt="The puppy dashboard: a list of nine downloads on the left (active, torrent, queued, completed, retrying, needs attention, paused, seeding, choosing files) and, on the right, details for an HTTP download over seven connections with its speed graph, segment map and per-connection bars." src="docs/hero-dark.png">
+</picture>
+
 ## Status
 
 Early development (v0.1.1). What works today:
@@ -37,46 +42,15 @@ Windows, but they have seen little real use yet: reports are welcome.
 
 ## Demo
 
-A text render of the dashboard (120x32, dark theme, sample data):
+Adding two downloads, moving between them, pausing and resuming, the help screen, and
+deleting:
 
-```text
- puppy                                                                                      daemon v0.1.0   ● connected
-╭ Downloads 7 ──────────────────────────────────────────────────────╮╭ Details ────────────────────────────────────────╮
-│▌ ▶ 1 ubuntu-24.04.3-desktop-amd64.iso   █████████             45% ││ ubuntu-24.04.3-desktop-amd64.iso                │
-│▌     11.4 MiB/s · 0:41 · 461.0 MiB / 1.0 GiB · limit 20.0 MiB/s   ││ /home/me/Downloads                              │
-│  ▶ 2 debian-13.2.0-amd64-DVD-1.iso [T]  █████████             45% ││                                                 │
-│      ↓ 11.4 MiB/s  ↑ 400.0 KiB/s · 0:41 · 461.0 MiB / 1.0 GiB     ││ Downloaded 461.0 MiB / 1.0 GiB (45%)            │
-│  … 3 archlinux-2026.11.01-x86_64.iso    █████                 25% ││ Speed      11.4 MiB/s                           │
-│      queued #1 · 256.0 MiB / 1.0 GiB                              ││ ETA        0:41                                 │
-│  ✓ 4 Big Buck Bunny 4K.mkv              ████████████████████ 100% ││ State      ▶ active                             │
-│      completed · 1.0 GiB                                          ││ Limit      20.0 MiB/s                           │
-│  ↻ 5 big-dataset.tar.zst                █████                 25% ││ Source     https://exa…4.04.3-desktop-amd64.iso │
-│      retry in 1:23 · connection reset by peer                     ││                                                 │
-│  ! 6 photos.zip                         █████                 25% ││ speed · last 60 s               peak 17.0 MiB/s │
-│      remote file changed · R restarts                             ││ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    ▂ ▃ ▅ ▆ █    │
-│  ⏸ 7 notes.pdf                          █████                 25% ││ █▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ █▁█▃█▄█▆█▇ █ │
-│      paused · 256.0 MiB / 1.0 GiB                                 ││ ██████▇████████████▇████████████▇████████████▇█ │
-│                                                                   ││                                                 │
-│                                                                   ││ Segments              2 connections · resumable │
-│                                                                   ││ █████████████████████████████▒░░░░░░░░░░░░░░░░░ │
-│                                                                   ││                                                 │
-│                                                                   ││ conn 1 ███████▌                       3.0 MiB/s │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-│                                                                   ││                                                 │
-╰───────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────╯
- ↓ 14.0 MiB/s  ↑ 400.0 KiB/s · 2 active · 1 queued · 1 paused · 1 done · 2 failed · limit: none · max 3   ▆▆▇▇█▄▄▅▅▆▆▇▇
- a add  p pause  d delete  l limit  / filter  ? help  q quit
-```
+![Recording of the puppy dashboard: adding two HTTP downloads, pausing and resuming one, opening the help screen, then deleting both](docs/demo.gif)
 
-Animated demo: run `vhs docs/demo.tape` (needs [vhs](https://github.com/charmbracelet/vhs),
-`python3` and `puppy` on your `PATH`). It runs in throwaway directories and writes
-`docs/demo.gif`.
+Both are generated, not hand-made. `scripts/hero.sh` renders the screenshot above from
+fixed sample data (needs cargo, [vhs](https://github.com/charmbracelet/vhs) and ffmpeg).
+`vhs docs/demo.tape` records the GIF against a local throttled server (needs vhs,
+`python3` and `puppy` on your `PATH`); it runs in throwaway directories.
 
 ## Install
 
