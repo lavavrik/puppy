@@ -536,12 +536,14 @@ so no network port is opened. Firefox is not supported yet.
 
 1. Bump `version` in the root `Cargo.toml`.
 2. Write the release notes in `docs/releases/v0.2.0.md` (what changed, how to
-   install, known issues; [v0.1.0](docs/releases/v0.1.0.md) is the model).
+   install, known issues; [v0.1.1](docs/releases/v0.1.1.md) is the model).
    The release workflow refuses to run without this file. Commit both.
 3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 4. The [Release workflow](.github/workflows/release.yml) runs the tests on
-   every platform, builds the six archives and creates a **draft** release
-   with them, `SHA256SUMS` and the notes. Check it and publish.
+   every platform, builds the six archives and **publishes** the release with
+   them, `SHA256SUMS` and the notes. Installs pick it up within a day. If any
+   test or build fails, nothing is released: fix it and move the tag. A tag
+   like `v0.2.0-rc.1` is published as a pre-release, which installs ignore.
 
 The archives are built by `cargo build --profile dist` and
 [`scripts/package.sh`](scripts/package.sh), which also run locally. The
