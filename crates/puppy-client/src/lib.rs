@@ -424,9 +424,11 @@ impl Client {
 
     /// Looks for a newer release now; unless `check_only`, installs it. An install
     /// that succeeds answers `Installed` (the daemon then restarts), and may be cut
-    /// off by that restart instead.
+    /// off by that restart instead. Waits however long the daemon takes (it bounds
+    /// the lookup and the install itself): an install is never cut short by
+    /// [`CALL_TIMEOUT`].
     pub async fn update(&self, check_only: bool) -> Result<UpdateStatus, ClientError> {
-        match self.call(Request::Update { check_only }).await? {
+        match self.call_unbounded(Request::Update { check_only }).await? {
             ReplyData::Update { status } => Ok(status),
             other => Err(unexpected(other)),
         }
