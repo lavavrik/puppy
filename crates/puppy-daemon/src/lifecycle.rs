@@ -4,7 +4,7 @@
 
 use crate::config::Config;
 use crate::manager::Manager;
-use crate::notify::{self, Notifier};
+use crate::notify::{self, Notification, Notifier};
 use crate::paths::{Paths, SocketName};
 use crate::server::Server;
 use crate::store::Store;
@@ -39,6 +39,8 @@ const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
 const REPLY_GRACE: Duration = Duration::from_secs(2);
 /// The shutdown reason after an update was installed.
 const UPDATE_INSTALLED: &str = "update installed";
+/// The shutdown reason after `idle_exit` without work or clients.
+const IDLE: &str = "idle";
 /// How often the idle-exit condition is checked.
 const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// How long a probe of an existing Unix socket may take before whatever listens there
@@ -202,8 +204,16 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
             return Err(e).context("refusing to start");
         }
     };
+    // Left by the daemon that installed this binary just before it swapped it in.
+    let updated_from = update::take_updated_marker(&paths.update_dir);
+    if let Some(from) = &updated_from {
+        info!("updated from {from} to {}", env!("CARGO_PKG_VERSION"));
+    }
     let notify_task = match opts.notifier {
         Some(sink) if notifications.enabled => {
+            if updated_from.is_some() {
+                sink.notify(&Notification::updated(env!("CARGO_PKG_VERSION")));
+            }
             let weak = Arc::downgrade(&manager);
             Some(notify::spawn(
                 manager.events(),
@@ -245,7 +255,9 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     let restart = updater
         .as_ref()
         .map_or_else(CancellationToken::new, Updater::restart_requested);
-    let updater_task = updater.map(|u| tokio::spawn(u.run(clients.clone(), stop.clone())));
+    let updater_task = updater
+        .clone()
+        .map(|u| tokio::spawn(u.run(clients.clone(), stop.clone())));
     let reason = tokio::select! {
         _ = shutdown_requested.cancelled() => "shutdown requested",
         _ = restart.cancelled() => {
@@ -254,7 +266,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
             UPDATE_INSTALLED
         }
         signal = signals.recv() => signal,
-        _ = idle(opts.idle_exit, &manager, &clients) => "idle",
+        _ = idle(opts.idle_exit, &manager, &clients) => IDLE,
         r = &mut server_task => {
             server_done = true;
             if let Err(e) = r {
@@ -263,6 +275,19 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
             "server stopped"
         }
     };
+    if reason == IDLE
+        && let Some(u) = &updater
+    {
+        // An on-demand daemon never stays quiet long enough to install by itself: its
+        // idle exit is the quiet moment. It exits afterwards (no restart); the next
+        // client starts the new binary. A signal cuts the wait short.
+        tokio::select! {
+            swapped = u.install_before_exit() => if swapped {
+                info!("update installed; the next start runs it");
+            },
+            signal = signals.recv() => warn!(signal, "not waiting for the update to install"),
+        }
+    }
     info!(reason, "shutting down");
 
     let graceful = async {

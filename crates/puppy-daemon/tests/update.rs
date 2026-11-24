@@ -202,15 +202,21 @@ fn replace_exe_moves_old_aside() {
 mod daemon {
     use interprocess::local_socket::tokio::{Stream, prelude::*};
     use interprocess::local_socket::{GenericFilePath, GenericNamespaced};
+    use puppy_core::config::HttpConfig;
+    use puppy_core::types::{AddRequest, DownloadId, RequestContext, Source};
     use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, run_daemon};
+    use puppy_daemon::notify::{Notification, NotifyKind, RecordingNotifier};
     use puppy_daemon::update::UpdateOptions;
     use puppy_daemon::{Paths, SocketName};
+    use puppy_proto::WireState;
     use puppy_proto::{
         Envelope, ErrorCode, Event, MsgReader, PROTOCOL_VERSION, Reply, ReplyData, Request,
         ServerMsg, UpdateStatus, write_msg,
     };
     use puppy_testserver::github::{FakeGitHub, FakeRelease};
+    use puppy_testserver::{ServerCfg, TestServer};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tokio::io::{BufReader, ReadHalf, WriteHalf};
@@ -218,6 +224,9 @@ mod daemon {
 
     const TIMEOUT: Duration = Duration::from_secs(20);
     const DAY: Duration = Duration::from_secs(24 * 3600);
+    /// The quiet time before an automatic install, in the tests that want one.
+    const SETTLE: Duration = Duration::from_secs(1);
+    const KIB: u64 = 1024;
 
     type Daemon = JoinHandle<anyhow::Result<RunOutcome>>;
 
@@ -286,13 +295,59 @@ mod daemon {
             std::fs::write(p, text).unwrap();
         }
 
-        async fn start(&self, allow_dev: bool) -> Daemon {
-            let d = tokio::spawn(run_daemon(DaemonOptions {
+        fn opts(&self, allow_dev: bool) -> DaemonOptions {
+            DaemonOptions {
                 paths: Some(self.paths()),
                 torrent_test: Some(Default::default()),
                 update: Some(self.update_opts(allow_dev)),
                 ..DaemonOptions::default()
-            }));
+            }
+        }
+
+        fn dl_dir(&self) -> PathBuf {
+            self.home.path().join("dl")
+        }
+
+        /// Like `opts(true)`, settling after `SETTLE` and downloading into `dl_dir`.
+        fn settling(&self) -> DaemonOptions {
+            let mut o = self.opts(true);
+            o.update.as_mut().unwrap().settle = SETTLE;
+            o.http = Some(HttpConfig {
+                backoff_base_ms: 10,
+                backoff_max_ms: 100,
+                flush_interval_ms: 100,
+                read_timeout_ms: 2_000,
+                validate_timeout_ms: 1_500,
+                default_dir: self.dl_dir(),
+                ..HttpConfig::default()
+            });
+            o
+        }
+
+        fn req(&self, s: &TestServer, name: &str) -> AddRequest {
+            AddRequest {
+                source: Source::Http {
+                    url: s.url("/file.bin"),
+                },
+                output_dir: Some(self.dl_dir()),
+                filename: Some(name.into()),
+                context: RequestContext::default(),
+                files: Default::default(),
+                seed: None,
+            }
+        }
+
+        fn exe_swapped(&self) -> bool {
+            std::fs::read(&self.exe).unwrap() != b"old"
+        }
+
+        async fn start(&self, allow_dev: bool) -> Daemon {
+            self.launch(self.opts(allow_dev)).await
+        }
+
+        /// Starts a daemon with `opts` and waits until it accepts connections.
+        async fn launch(&self, opts: DaemonOptions) -> Daemon {
+            let d = tokio::spawn(run_daemon(opts));
             let deadline = Instant::now() + TIMEOUT;
             loop {
                 assert!(!d.is_finished(), "daemon exited early: {:?}", d.await);
@@ -598,6 +653,345 @@ mod daemon {
             r => panic!("{r:?}"),
         }
         assert_eq!(std::fs::read(&env.exe).unwrap(), b"old");
+        drop(c);
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+    }
+
+    // ---- Automatic installs ----
+
+    impl Client {
+        async fn add(&mut self, req: AddRequest) -> DownloadId {
+            match self
+                .request(Request::Add {
+                    request: req,
+                    start_paused: false,
+                    limit: None,
+                })
+                .await
+            {
+                Reply::Ok {
+                    data: ReplyData::Added { id },
+                } => id,
+                r => panic!("add failed: {r:?}"),
+            }
+        }
+
+        async fn get(&mut self, id: DownloadId) -> (WireState, u64) {
+            match self.request(Request::Get { id }).await {
+                Reply::Ok {
+                    data: ReplyData::Download { download, .. },
+                } => (download.state, download.done_bytes),
+                r => panic!("get failed: {r:?}"),
+            }
+        }
+
+        /// Polls download `id` until `want` holds; returns its done bytes then.
+        async fn wait_download(
+            &mut self,
+            id: DownloadId,
+            want: impl Fn(&WireState, u64) -> bool,
+        ) -> u64 {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let (st, done) = self.get(id).await;
+                if want(&st, done) {
+                    return done;
+                }
+                assert!(Instant::now() < deadline, "never reached: {st:?} {done}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Polls the update status until an installable release is known.
+        async fn wait_available(&mut self) {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let s = self.get_update().await;
+                if matches!(
+                    s,
+                    UpdateStatus::Available {
+                        can_install: true,
+                        ..
+                    }
+                ) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "no update found: {s:?}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    async fn server(f: impl FnOnce(&mut ServerCfg)) -> TestServer {
+        let mut c = ServerCfg::default();
+        f(&mut c);
+        TestServer::start(c).await
+    }
+
+    /// The version the new binary reports.
+    #[cfg(unix)]
+    fn exe_version(env: &Env) -> String {
+        let out = std::process::Command::new(&env.exe)
+            .arg("--version")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiet_daemon_installs_by_itself() {
+        let env = Env::new().await;
+        let d = env.launch(env.settling()).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), d)
+            .await
+            .expect("no automatic install within 10 s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Restart);
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+    }
+
+    /// The HTTP engine, except that a finished download seeds (like a torrent would).
+    struct Seeder(puppy_core::http::engine::HttpEngine);
+
+    #[async_trait::async_trait]
+    impl puppy_core::engine::Engine for Seeder {
+        fn kind(&self) -> puppy_core::engine::EngineKind {
+            self.0.kind()
+        }
+        fn accepts(&self, source: &Source) -> bool {
+            self.0.accepts(source)
+        }
+        async fn add(
+            &self,
+            id: DownloadId,
+            req: AddRequest,
+            mode: puppy_core::engine::StartMode,
+            opts: puppy_core::engine::AddOptions,
+        ) -> Result<puppy_core::engine::Added, puppy_core::engine::EngineError> {
+            self.0.add(id, req, mode, opts).await
+        }
+        async fn pause(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+            self.0.pause(id).await
+        }
+        async fn resume(&self, id: DownloadId) -> Result<(), puppy_core::engine::EngineError> {
+            self.0.resume(id).await
+        }
+        async fn remove(
+            &self,
+            id: DownloadId,
+            delete_files: bool,
+        ) -> Result<(), puppy_core::engine::EngineError> {
+            self.0.remove(id, delete_files).await
+        }
+        fn status(&self, id: DownloadId) -> Option<puppy_core::types::DownloadStatus> {
+            use puppy_core::types::DownloadState;
+            self.0.status(id).map(|mut s| {
+                if s.state == DownloadState::Completed {
+                    s.state = DownloadState::Seeding {
+                        uploaded: 0,
+                        ratio: 0.0,
+                        seeded_secs: 0,
+                        ratio_target: None,
+                        time_target_secs: None,
+                    };
+                }
+                s
+            })
+        }
+        fn detail(&self, id: DownloadId) -> Option<puppy_core::types::EngineDetail> {
+            self.0.detail(id)
+        }
+        fn set_download_limit(
+            &self,
+            id: DownloadId,
+            bps: Option<u64>,
+        ) -> Result<(), puppy_core::engine::EngineError> {
+            self.0.set_download_limit(id, bps)
+        }
+        fn set_global_download_budget(&self, bps: Option<u64>) {
+            self.0.set_global_download_budget(bps)
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<puppy_core::engine::EngineEvent> {
+            self.0.subscribe()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seeding_does_not_block() {
+        let env = Env::new().await;
+        let s = server(|c| c.len = 16 * KIB).await;
+        let mut opts = env.settling();
+        let http = opts.http.clone().unwrap();
+        opts.engine = Some(Arc::new(Seeder(
+            puppy_core::http::engine::HttpEngine::new(http).unwrap(),
+        )));
+        let d = env.launch(opts).await;
+        let mut c = env.client().await;
+        let id = c.add(env.req(&s, "a.bin")).await;
+        c.wait_download(id, |st, _| matches!(st, WireState::Seeding { .. }))
+            .await;
+        c.wait_available().await;
+        drop(c);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), d)
+            .await
+            .expect("seeding blocked the automatic install")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Restart);
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn active_download_blocks() {
+        let env = Env::new().await;
+        let s = server(|c| {
+            c.len = 2048 * KIB;
+            c.bytes_per_sec = Some(32 * KIB);
+        })
+        .await;
+        let d = env.launch(env.settling()).await;
+        let mut c = env.client().await;
+        let id = c.add(env.req(&s, "a.bin")).await;
+        c.wait_download(id, |st, _| *st == WireState::Active).await;
+        c.wait_available().await;
+        drop(c);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(env.fake.hits() >= 1, "no check ran");
+        assert!(!d.is_finished(), "the daemon stopped");
+        assert!(!env.exe_swapped(), "installed during a download");
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_during_settle_resets_it() {
+        let env = Env::new().await;
+        let d = env.launch(env.settling()).await;
+        let mut c = env.client().await;
+        c.wait_available().await;
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let c = env.client().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!d.is_finished(), "installed while a client was connected");
+        assert!(!env.exe_swapped(), "installed while a client was connected");
+        drop(c);
+        let quiet_from = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), d)
+            .await
+            .expect("no automatic install after the client left")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Restart);
+        assert!(
+            quiet_from.elapsed() >= SETTLE,
+            "installed {:?} after the client left",
+            quiet_from.elapsed()
+        );
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forced_install_restarts_with_state_saved() {
+        let env = Env::new().await;
+        let s = server(|c| {
+            c.len = 8192 * KIB;
+            c.bytes_per_sec = Some(128 * KIB);
+        })
+        .await;
+        let d = env.launch(env.settling()).await;
+        let mut c = env.client().await;
+        let id = c.add(env.req(&s, "a.bin")).await;
+        let before = c
+            .wait_download(id, |st, done| *st == WireState::Active && done >= 128 * KIB)
+            .await;
+        let s2 = reply_status(c.update(false).await);
+        assert!(matches!(s2, UpdateStatus::Installed { .. }), "{s2:?}");
+        assert_eq!(exited(d).await, RunOutcome::Restart);
+        assert!(env.exe_swapped());
+        let marker = env.paths().update_dir.join("updated-from");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+
+        // The restarted daemon picks the download up where it was paused.
+        let mut opts = env.settling();
+        opts.update.as_mut().unwrap().settle = Duration::from_secs(60);
+        let d = env.launch(opts).await;
+        assert!(!marker.exists(), "the restarted daemon takes the marker");
+        let mut c = env.client().await;
+        let (st, done) = c.get(id).await;
+        assert!(
+            done >= before,
+            "restarted from {done} bytes, had {before} ({st:?})"
+        );
+        drop(c);
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_exit_installs_first() {
+        let env = Env::new().await;
+        let mut opts = env.opts(true);
+        opts.idle_exit = Some(Duration::from_secs(1));
+        let d = env.launch(opts).await;
+        // Kept busy until the check has found the release.
+        let mut c = env.client().await;
+        c.wait_available().await;
+        drop(c);
+        assert_eq!(exited(d).await, RunOutcome::Exited);
+        assert_eq!(exe_version(&env), "puppy 0.2.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn updated_marker_notifies_once() {
+        let env = Env::new().await;
+        let marker = env.paths().update_dir.join("updated-from");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "0.0.1").unwrap();
+        let rec = RecordingNotifier::default();
+        let notifying = || DaemonOptions {
+            notifier: Some(Arc::new(rec.clone())),
+            ..env.opts(true)
+        };
+        let d = env.launch(notifying()).await;
+        assert!(!marker.exists(), "the marker was not removed");
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+        assert_eq!(
+            rec.take(),
+            [Notification {
+                kind: NotifyKind::Updated,
+                title: "puppy updated".into(),
+                body: format!("puppy updated to {}", env!("CARGO_PKG_VERSION")),
+            }]
+        );
+        // Once only.
+        let d = env.launch(notifying()).await;
+        assert_eq!(env.stop(d).await, RunOutcome::Exited);
+        assert!(rec.take().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_install_leaves_no_marker() {
+        let env = Env::with(
+            FakeRelease::new("0.2.0", puppy_daemon::update::TARGET).binary_prints("puppy 9.9.8"),
+        )
+        .await;
+        let d = env.start(true).await;
+        let mut c = env.client().await;
+        match c.update(false).await {
+            Reply::Err { message, .. } => assert!(message.contains("9.9.8"), "{message}"),
+            r => panic!("{r:?}"),
+        }
+        assert!(!env.paths().update_dir.join("updated-from").exists());
+        assert!(!env.exe_swapped());
         drop(c);
         assert_eq!(env.stop(d).await, RunOutcome::Exited);
     }

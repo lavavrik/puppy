@@ -32,6 +32,8 @@ pub enum NotifyKind {
     Failed,
     ChooseFiles,
     SeedingFinished,
+    /// The daemon now runs a newer puppy (sent once, at start).
+    Updated,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +48,17 @@ pub struct Notification {
     pub kind: NotifyKind,
     pub title: String,
     pub body: String,
+}
+
+impl Notification {
+    /// "puppy updated to `version`": the daemon started a newly installed binary.
+    pub fn updated(version: &str) -> Self {
+        Notification {
+            kind: NotifyKind::Updated,
+            title: "puppy updated".to_string(),
+            body: format!("puppy updated to {version}"),
+        }
+    }
 }
 
 /// Decides whether `ev` notifies. The returned item's name may be empty (the caller
@@ -108,6 +121,10 @@ fn short_reason(s: &str) -> String {
 
 /// The popup for a group of `items` of one kind (`items` must not be empty).
 pub fn render(kind: NotifyKind, items: &[Item]) -> Notification {
+    if kind == NotifyKind::Updated {
+        // Never grouped (no event is classified as it); the name is the version.
+        return Notification::updated(&items[items.len() - 1].name);
+    }
     let body = if let [it] = items {
         match kind {
             NotifyKind::Completed => format!("Finished: {}", it.name),
@@ -120,6 +137,7 @@ pub fn render(kind: NotifyKind, items: &[Item]) -> Notification {
                 it.name, it.id
             ),
             NotifyKind::SeedingFinished => format!("Seeding finished: {}", it.name),
+            NotifyKind::Updated => unreachable!("rendered above"),
         }
     } else {
         let n = items.len();
@@ -130,6 +148,7 @@ pub fn render(kind: NotifyKind, items: &[Item]) -> Notification {
                 format!("{n} torrents waiting for files — run puppy ls or press c in the dashboard")
             }
             NotifyKind::SeedingFinished => format!("{n} torrents finished seeding"),
+            NotifyKind::Updated => unreachable!("rendered above"),
         }
     };
     Notification {

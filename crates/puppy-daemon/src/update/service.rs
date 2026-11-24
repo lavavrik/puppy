@@ -10,7 +10,7 @@ use crate::paths::Paths;
 use puppy_proto::{Event, UpdateStatus};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,22 @@ use url::Url;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a whole install attempt (download, verify, sanity check, swap) may take.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How often the conditions for an automatic install are looked at.
+const QUIET_CHECK: Duration = Duration::from_millis(250);
+/// In the update work dir: the version that installed an update, written just before
+/// the swap and taken by the next daemon at start ([`take_updated_marker`]).
+const UPDATED_FROM: &str = "updated-from";
+
+/// Reads and removes the marker an install left in `update_dir`: the version the
+/// update was installed from. `None` when there is none (or it cannot be read).
+pub fn take_updated_marker(update_dir: &Path) -> Option<String> {
+    let path = update_dir.join(UPDATED_FROM);
+    let text = std::fs::read_to_string(&path).ok()?;
+    if let Err(e) = std::fs::remove_file(&path) {
+        warn!(path = %path.display(), "cannot remove the update marker: {e}");
+    }
+    Some(text.trim().to_string())
+}
 
 /// How the daemon updates itself. `DaemonOptions::update`; `None` there turns updates off.
 #[derive(Debug, Clone)]
@@ -225,6 +241,36 @@ impl Updater {
     /// A call made while another runs waits for it and returns its outcome. Nothing
     /// newer is `Failed`.
     pub async fn install_now(&self) -> Result<semver::Version, UpdateError> {
+        self.install(true).await
+    }
+
+    /// For a daemon about to idle-exit: installs the update the last check found, if
+    /// `auto_install` is on and it can be installed (true: the binary was swapped).
+    /// Unlike [`install_now`](Self::install_now) this does not fire
+    /// [`restart_requested`](Self::restart_requested): the daemon exits as planned and
+    /// the next client starts the new binary. (An install already running is waited
+    /// for and may fire it, but by then the daemon has chosen to exit.)
+    pub async fn install_before_exit(&self) -> bool {
+        if !self.inner.cfg.auto_install || !self.installable() {
+            return false;
+        }
+        info!("installing the update before exiting");
+        self.install(false).await.is_ok()
+    }
+
+    /// Whether the last check found a release this binary can install.
+    fn installable(&self) -> bool {
+        matches!(
+            self.status(),
+            UpdateStatus::Available {
+                can_install: true,
+                ..
+            }
+        )
+    }
+
+    /// [`install_now`](Self::install_now); `restart`: fire the restart token on success.
+    async fn install(&self, restart: bool) -> Result<Version, UpdateError> {
         let i = &self.inner;
         let seen = i.attempts.load(Ordering::SeqCst);
         let mut last = i.install.lock().await;
@@ -243,7 +289,7 @@ impl Updater {
         *last = Some(Outcome::from(&result));
         i.attempts.fetch_add(1, Ordering::SeqCst);
         drop(last);
-        if result.is_ok() {
+        if restart && result.is_ok() {
             i.restart.cancel();
         }
         result
@@ -282,10 +328,21 @@ impl Updater {
         let steps = async {
             let bin = fetch(&i.http, &release, &i.work_dir).await?;
             sanity_check(&bin, &version).await?;
+            // Tells the next daemon what it was updated from; only a notice, so failing
+            // to write it is only logged.
+            let marker = i.work_dir.join(UPDATED_FROM);
+            if let Err(e) = std::fs::write(&marker, i.current.to_string()) {
+                warn!(path = %marker.display(), "cannot write the update marker: {e}");
+            }
             let (bin, exe) = (bin, i.opts.exe.clone());
-            tokio::task::spawn_blocking(move || replace_exe(&bin, &exe))
+            let swapped = tokio::task::spawn_blocking(move || replace_exe(&bin, &exe))
                 .await
-                .map_err(|e| UpdateError::Failed(format!("the swap did not finish: {e}")))?
+                .map_err(|e| UpdateError::Failed(format!("the swap did not finish: {e}")))
+                .and_then(|r| r);
+            if swapped.is_err() {
+                let _ = std::fs::remove_file(&marker);
+            }
+            swapped
         };
         let result = tokio::time::timeout(INSTALL_TIMEOUT, steps)
             .await
@@ -314,32 +371,63 @@ impl Updater {
         }
     }
 
-    /// Checks for releases until `stop`: first `check_delay` after start if one is due,
-    /// then whenever the last check is `check_every` old. Nothing at all with
+    /// Runs until `stop`: checks for releases on schedule, and installs an update by
+    /// itself once the daemon has been quiet long enough.
+    pub async fn run(self, clients: Arc<AtomicUsize>, stop: CancellationToken) {
+        tokio::select! {
+            _ = stop.cancelled() => {}
+            _ = async { tokio::join!(self.check_on_schedule(), self.install_when_quiet(&clients)) } => {}
+        }
+    }
+
+    /// Checks for releases: first `check_delay` after start if one is due, then
+    /// whenever the last check is `check_every` old. Nothing at all with
     /// `[update] check = false`.
-    pub async fn run(self, _clients: Arc<AtomicUsize>, stop: CancellationToken) {
+    async fn check_on_schedule(&self) {
         if !self.inner.cfg.check {
             return;
         }
         let mut wait = self.inner.opts.check_delay;
         loop {
-            tokio::select! {
-                _ = stop.cancelled() => return,
-                _ = tokio::time::sleep(wait) => {}
-            }
+            tokio::time::sleep(wait).await;
             let until_due = self.until_due();
             if until_due.is_zero() {
-                tokio::select! {
-                    _ = stop.cancelled() => return,
-                    _ = self.check_now() => {}
-                }
-                // TASK 5: the automatic install goes here (when `auto_install`, the
-                // release can be installed, and `is_quiet` with no `_clients` has held
-                // for `settle`).
+                self.check_now().await;
                 wait = self.inner.opts.check_every;
             } else {
                 wait = until_due;
             }
+        }
+    }
+
+    /// With `[update] auto_install`: once an installable release is known and the
+    /// daemon has been quiet (no download queued, starting, active or waiting for a
+    /// retry; seeding does not count) with no client connected for `settle` without
+    /// a break, installs it. Returns after a successful install; after a failed one
+    /// it waits for a check to find a release again.
+    async fn install_when_quiet(&self, clients: &AtomicUsize) {
+        let i = &self.inner;
+        if !i.cfg.auto_install {
+            return;
+        }
+        let mut tick = tokio::time::interval(QUIET_CHECK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut quiet_since: Option<tokio::time::Instant> = None;
+        loop {
+            let now = tick.tick().await;
+            if !(self.installable() && i.manager.is_quiet() && clients.load(Ordering::SeqCst) == 0)
+            {
+                quiet_since = None;
+                continue;
+            }
+            if now.duration_since(*quiet_since.get_or_insert(now)) < i.opts.settle {
+                continue;
+            }
+            info!(settle = ?i.opts.settle, "quiet: installing the update");
+            if self.install_now().await.is_ok() {
+                return;
+            }
+            quiet_since = None;
         }
     }
 
