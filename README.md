@@ -100,22 +100,44 @@ container without `ca-certificates`), the daemon falls back to Mozilla's root
 list built into puppy and says so in its log.
 `SHA256SUMS` in the release lists every archive's checksum.
 
-**Linux and macOS:** put the binary on your `PATH`, e.g.
+**Linux and macOS:**
 
 ```sh
-tar xzf puppy-*.tar.gz
-install -m 755 puppy-*/puppy ~/.local/bin/        # Linux
-sudo install -m 755 puppy-*/puppy /usr/local/bin/ # macOS
+curl -fsSL https://raw.githubusercontent.com/lavavrik/puppy/main/scripts/install.sh | sh
 ```
 
-The macOS binaries are not signed. If the archive was downloaded with a browser,
-macOS refuses to run it at first; clear the quarantine flag with
-`xattr -d com.apple.quarantine /usr/local/bin/puppy`.
+**Windows** (PowerShell):
 
-**Windows:** unzip it and move `puppy.exe` to
-`%LOCALAPPDATA%\Programs\puppy\`, then add that folder to your user `PATH`
-(Settings → System → About → Advanced system settings → Environment
-Variables). The binary is not signed, so SmartScreen may warn the first time.
+```powershell
+irm https://raw.githubusercontent.com/lavavrik/puppy/main/scripts/install.ps1 | iex
+```
+
+The scripts ([install.sh](scripts/install.sh), [install.ps1](scripts/install.ps1))
+pick the archive for your machine from the latest release, check it against
+its SHA-256 and install `puppy`:
+
+| System  | Binary goes to                          | Archive unpacked in (extension, service files) |
+|---------|-----------------------------------------|------------------------------------------------|
+| Linux   | `~/.local/bin/puppy`                    | `~/.local/share/puppy-install/`                |
+| macOS   | `/usr/local/bin/puppy` (asks for sudo)  | `~/.local/share/puppy-install/`                |
+| Windows | `%LOCALAPPDATA%\Programs\puppy\puppy.exe`, added to your `PATH` | `%LOCALAPPDATA%\puppy-install\` |
+
+Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux, if
+`puppy` is not found afterwards, add `~/.local/bin` to your `PATH`.
+
+**By hand:** download the archive from the release page, check it with
+`shasum -a 256 -c <archive>.sha256`, unpack it and put `puppy` (`puppy.exe`)
+anywhere on your `PATH`. The macOS and Windows binaries are not signed, so
+when the archive comes from a browser, macOS refuses to run it at first (clear
+the flag with `xattr -d com.apple.quarantine /usr/local/bin/puppy`) and
+Windows SmartScreen may warn once. The install scripts download with
+`curl` / PowerShell, which does not trigger either.
+
+### Updating
+
+Run `puppy stop` so the old daemon exits, then run the install command again.
+Your queue, settings and downloads are kept; the next `puppy` command starts
+the new daemon.
 
 ## Build from source
 
@@ -485,11 +507,14 @@ so no network port is opened. Firefox is not supported yet.
 
 ## Releasing
 
-1. Bump `version` in the root `Cargo.toml` and commit.
-2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
-3. The [Release workflow](.github/workflows/release.yml) runs the tests on
+1. Bump `version` in the root `Cargo.toml`.
+2. Write the release notes in `docs/releases/v0.2.0.md` (what changed, how to
+   install, known issues; [v0.1.0](docs/releases/v0.1.0.md) is the model).
+   The release workflow refuses to run without this file. Commit both.
+3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+4. The [Release workflow](.github/workflows/release.yml) runs the tests on
    every platform, builds the six archives and creates a **draft** release
-   with them and `SHA256SUMS`. Check it, edit the notes, and publish.
+   with them, `SHA256SUMS` and the notes. Check it and publish.
 
 The archives are built by `cargo build --profile dist` and
 [`scripts/package.sh`](scripts/package.sh), which also run locally. The
