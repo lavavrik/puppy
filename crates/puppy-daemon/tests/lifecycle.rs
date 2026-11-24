@@ -77,6 +77,7 @@ impl Env {
             torrent_test: Some(Default::default()),
             notifier: None,
             update: None,
+            lock_wait: None,
         }
     }
 
@@ -291,6 +292,44 @@ async fn second_daemon_exits_when_locked() {
     // Once the first one is gone, a new daemon starts.
     let d = env.start(None).await;
     shutdown(&env, d).await;
+}
+
+/// With `lock_wait`, a daemon whose predecessor is still exiting takes over once the
+/// lock is released, and gives up after the wait otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_wait_takes_over_a_departing_daemon() {
+    let env = Env::new();
+    let d = env.start(None).await;
+    let mut opts = env.opts(None);
+    opts.lock_wait = Some(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    assert_eq!(run_daemon(opts).await.unwrap(), RunOutcome::AlreadyRunning);
+    assert!(started.elapsed() >= Duration::from_millis(250));
+
+    let mut opts = env.opts(None);
+    opts.lock_wait = Some(Duration::from_secs(10));
+    let second = tokio::spawn(run_daemon(opts));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown(&env, d).await;
+    // The waiting daemon now runs; stop it.
+    let mut c = loop {
+        if let Some(c) = env.try_connect().await {
+            break c;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = c
+        .request(Request::Hello {
+            client: "test".into(),
+            protocol: PROTOCOL_VERSION,
+        })
+        .await;
+    let _ = c.request(Request::Shutdown).await;
+    let outcome = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.unwrap(), RunOutcome::Exited);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

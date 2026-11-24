@@ -819,6 +819,7 @@ mod real {
             torrent_test: Some(Default::default()),
             notifier: None,
             update: None,
+            lock_wait: None,
         }));
         let server = TestServer::start(ServerCfg {
             len: 256 * 1024,

@@ -67,6 +67,10 @@ pub struct DaemonOptions {
     pub notifier: Option<Arc<dyn Notifier>>,
     /// Self-update settings. `None`: updates off (the default; only `main` turns them on).
     pub update: Option<UpdateOptions>,
+    /// When another daemon holds the lock, keep trying for this long (every 100 ms)
+    /// before reporting `AlreadyRunning`. `None` (the default): report it at once. Set
+    /// for a daemon started by an update's restart, whose predecessor is still exiting.
+    pub lock_wait: Option<Duration>,
 }
 
 /// See [`DaemonOptions::torrent_test`].
@@ -108,6 +112,7 @@ impl std::fmt::Debug for DaemonOptions {
             .field("torrent_test", &self.torrent_test)
             .field("notifier", &self.notifier.is_some())
             .field("update", &self.update)
+            .field("lock_wait", &self.lock_wait)
             .finish()
     }
 }
@@ -158,7 +163,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     }
 
     // Held (open) until this function returns; closing it releases the lock.
-    let Some(_lock) = acquire_lock(&paths.lock_file)? else {
+    let Some(_lock) = acquire_lock_waiting(&paths.lock_file, opts.lock_wait).await? else {
         info!(lock = %paths.lock_file.display(), "another daemon is running");
         return Ok(RunOutcome::AlreadyRunning);
     };
@@ -432,6 +437,20 @@ impl Drop for PidFile {
         {
             warn!(path = %p.display(), "cannot remove the pid file: {e}");
         }
+    }
+}
+
+/// [`acquire_lock`], retrying every 100 ms for up to `wait` while another process holds it.
+async fn acquire_lock_waiting(path: &Path, wait: Option<Duration>) -> anyhow::Result<Option<File>> {
+    let deadline = tokio::time::Instant::now() + wait.unwrap_or_default();
+    loop {
+        if let Some(lock) = acquire_lock(path)? {
+            return Ok(Some(lock));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

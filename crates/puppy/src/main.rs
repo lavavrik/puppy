@@ -25,6 +25,7 @@ use puppy_client::Paths;
 use puppy_daemon::Config;
 use puppy_daemon::lifecycle::{DaemonOptions, RunOutcome, TorrentTestOptions, run_daemon};
 use puppy_daemon::notify::{DesktopNotifier, Notifier, desktop_wanted};
+use puppy_daemon::update::UpdateOptions;
 use puppy_tui::api::ClientApi;
 use puppy_tui::theme::{Theme, ThemeChoice};
 use std::io::IsTerminal;
@@ -286,9 +287,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Looked up now: once an update replaces the file, Linux reports this process's
+    // executable as "<path> (deleted)".
+    let own_exe = std::env::current_exe().and_then(|e| e.canonicalize());
+    let mut restart = false;
     let result = rt.block_on(async {
         match cli.command {
-            Some(Command::Daemon { idle_exit }) => daemon(idle_exit).await.map_err(Into::into),
+            Some(Command::Daemon { idle_exit }) => match daemon(idle_exit).await {
+                Ok(DaemonEnd::Done) => Ok(()),
+                Ok(DaemonEnd::Restart) => {
+                    restart = true;
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            },
             Some(Command::Status) => cli::list::status(&Ctx::from_env(cli.json)?).await,
             Some(Command::Add {
                 sources,
@@ -390,11 +402,47 @@ fn main() -> ExitCode {
         }
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
+    if restart {
+        // The daemon has shut down and released its lock and the runtime is gone.
+        return restart_into_update(own_exe);
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             cli::report_error(&e);
             ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+/// Starts the freshly installed binary in place of this daemon, with the same arguments.
+/// On Unix `exec` keeps the process (and its pid); it only returns on failure.
+#[cfg(unix)]
+fn restart_into_update(exe: std::io::Result<PathBuf>) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let e = match exe {
+        Ok(exe) => std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec(),
+        Err(e) => e,
+    };
+    err(format_args!("puppy: cannot start the updated puppy: {e}"));
+    ExitCode::FAILURE
+}
+
+/// Windows cannot replace a process image: start the new binary detached, which waits
+/// for this daemon's lock (`PUPPY_UPDATE_HANDOFF`), and exit.
+#[cfg(windows)]
+fn restart_into_update(exe: std::io::Result<PathBuf>) -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let started = exe.and_then(|exe| {
+        puppy_client::respawn_detached(&exe, &args, &[("PUPPY_UPDATE_HANDOFF", "1")])
+    });
+    match started {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            err(format_args!("puppy: cannot start the updated puppy: {e}"));
+            ExitCode::FAILURE
         }
     }
 }
@@ -417,7 +465,50 @@ fn bundled_roots_for_daemon() {
     }
 }
 
-async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
+/// How the daemon ended, when it did not fail.
+enum DaemonEnd {
+    Done,
+    /// An update was installed: start the new binary.
+    Restart,
+}
+
+/// Self-update settings for the real daemon; `None` (updates off) if the executable's
+/// own path cannot be found.
+fn update_options() -> Option<UpdateOptions> {
+    let exe = match std::env::current_exe().and_then(|e| e.canonicalize()) {
+        Ok(exe) => exe,
+        Err(e) => {
+            err(format_args!(
+                "puppy: updates are off, cannot find puppy's own executable: {e}"
+            ));
+            return None;
+        }
+    };
+    let api_base = std::env::var("PUPPY_UPDATE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string());
+    let api_base = match api_base.parse() {
+        Ok(url) => url,
+        Err(e) => {
+            err(format_args!(
+                "puppy: updates are off, bad PUPPY_UPDATE_URL {api_base:?}: {e}"
+            ));
+            return None;
+        }
+    };
+    Some(UpdateOptions {
+        api_base,
+        exe,
+        // Undocumented, for puppy's own tests: install although this is not a release build.
+        allow_dev: std::env::var_os("PUPPY_UPDATE_ALLOW_DEV").as_deref() == Some("1".as_ref()),
+        settle: Duration::from_secs(60),
+        check_delay: Duration::from_secs(5),
+        check_every: Duration::from_secs(24 * 60 * 60),
+    })
+}
+
+async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<DaemonEnd> {
     // Undocumented, for puppy's own tests of the real binary: the torrent engine stays
     // off the network (no DHT, trackers, LSD or UPnP; listening on 127.0.0.1).
     // `PUPPY_TORRENT_TEST_PEERS` (comma-separated `ip:port`) are handed to every torrent.
@@ -445,15 +536,19 @@ async fn daemon(idle_exit: Option<u64>) -> anyhow::Result<()> {
         torrent_test,
         notifier: desktop_wanted(|k| std::env::var(k).ok())
             .then(|| Arc::new(DesktopNotifier::new()) as Arc<dyn Notifier>),
+        update: update_options(),
+        // A daemon started by a Windows update hand-off waits for its predecessor.
+        lock_wait: (std::env::var_os("PUPPY_UPDATE_HANDOFF").as_deref() == Some("1".as_ref()))
+            .then_some(Duration::from_secs(5)),
         ..DaemonOptions::default()
     })
     .await?;
     match outcome {
-        // Task 6 starts the new binary on `Restart`; until then it just exits.
-        RunOutcome::Exited | RunOutcome::Restart => Ok(()),
+        RunOutcome::Exited => Ok(DaemonEnd::Done),
+        RunOutcome::Restart => Ok(DaemonEnd::Restart),
         RunOutcome::AlreadyRunning => {
             err("puppy: a daemon is already running; nothing to do");
-            Ok(())
+            Ok(DaemonEnd::Done)
         }
         RunOutcome::Forced => {
             anyhow::bail!("shutdown interrupted: some downloads may resume from an earlier point")

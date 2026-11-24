@@ -12,7 +12,7 @@ mod peer;
 mod spawn;
 
 pub use puppy_daemon::{Paths, SocketName};
-pub use spawn::spawn_daemon_detached;
+pub use spawn::{respawn_detached, spawn_daemon_detached};
 
 use interprocess::local_socket::tokio::{Stream, prelude::*};
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced};

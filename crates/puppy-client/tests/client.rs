@@ -78,6 +78,7 @@ impl Env {
             torrent_test: Some(Default::default()),
             notifier: None,
             update: None,
+            lock_wait: None,
         }
     }
 

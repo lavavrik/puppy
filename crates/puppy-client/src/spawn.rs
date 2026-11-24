@@ -50,6 +50,27 @@ pub fn spawn_daemon_detached(
     Ok(())
 }
 
+/// Starts `exe args...` detached like [`spawn_daemon_detached`], inheriting this
+/// process's environment plus `extra_env`, in this process's working directory. Used to
+/// restart the daemon into an updated binary where `exec` does not exist (Windows).
+pub fn respawn_detached(
+    exe: &Path,
+    args: &[std::ffi::OsString],
+    extra_env: &[(&str, &str)],
+) -> io::Result<()> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = spawn_detached(&mut cmd)?;
+    reap(child);
+    Ok(())
+}
+
 fn idle_exit_secs(var: Option<&str>) -> u64 {
     var.and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_IDLE_EXIT_SECS)

@@ -19,6 +19,7 @@ pub struct FakeRelease {
     target: String,
     checksum: Checksum,
     prints: Option<String>,
+    script: Option<String>,
     no_binary: bool,
 }
 
@@ -38,6 +39,7 @@ impl FakeRelease {
             target: target.to_string(),
             checksum: Checksum::Good,
             prints: None,
+            script: None,
             no_binary: false,
         }
     }
@@ -66,6 +68,13 @@ impl FakeRelease {
         self
     }
 
+    /// The stand-in binary is a shell script with exactly this body (Unix targets; the
+    /// `#!/bin/sh` line is added). It must answer `--version` itself.
+    pub fn binary_script(mut self, body: &str) -> Self {
+        self.script = Some(body.to_string());
+        self
+    }
+
     /// Whether this target gets a zip (Windows) rather than a tar.gz.
     fn is_zip(&self) -> bool {
         self.target.contains("windows")
@@ -81,7 +90,9 @@ impl FakeRelease {
             .prints
             .clone()
             .unwrap_or_else(|| format!("puppy {}", self.version));
-        if self.is_zip() {
+        if let Some(body) = &self.script {
+            format!("#!/bin/sh\n{body}\n").into_bytes()
+        } else if self.is_zip() {
             // Not runnable; Windows tests needing a runnable stand-in are unix-only.
             format!("MZ {text}").into_bytes()
         } else {

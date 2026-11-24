@@ -113,6 +113,7 @@ impl Env {
             }),
             notifier: None,
             update: None,
+            lock_wait: None,
         }
     }
 

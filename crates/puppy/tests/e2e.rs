@@ -361,3 +361,80 @@ async fn daemon_starts_without_system_ca_certificates() {
     assert!(log.contains("no CA certificates"), "{log}");
     assert!(!log.contains("cannot start the torrent engine"), "{log}");
 }
+
+/// An installed update replaces the running daemon in place: the new binary is
+/// exec'd with the daemon's arguments and keeps its pid.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_execs_the_new_binary() {
+    use puppy_testserver::github::{FakeGitHub, FakeRelease};
+
+    let release = FakeRelease::new("9.9.9", puppy_daemon::update::TARGET).binary_script(
+        "if [ \"$1\" = \"--version\" ]; then echo 'puppy 9.9.9'; exit 0; fi\n\
+         { echo $$; echo \"$@\"; } > \"$PUPPY_HOME/execd.tmp\"\n\
+         mv \"$PUPPY_HOME/execd.tmp\" \"$PUPPY_HOME/execd\"\n\
+         exec sleep 30",
+    );
+    let github = FakeGitHub::start(release).await;
+
+    let mut env = Env::new();
+    env.extra
+        .push(("PUPPY_UPDATE_URL", github.api_base().to_string()));
+    env.extra.push(("PUPPY_UPDATE_ALLOW_DEV", "1".to_string()));
+
+    // A copy of the real binary the update may overwrite.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let exe = bin_dir.path().join("puppy");
+    std::fs::copy(BIN, &exe).unwrap();
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in env.vars() {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let pid = child.id();
+
+    let paths = env.paths();
+    let client = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let Ok(c) = Client::connect(&paths.socket, "e2e").await {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("daemon did not start");
+    let before: u32 = std::fs::read_to_string(&paths.pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(before, pid);
+
+    // The reply may or may not arrive before the daemon shuts down.
+    let _ = client.call(Request::Update { check_only: false }).await;
+    drop(client);
+
+    let execd = env.home.path().join("execd");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !execd.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let text = std::fs::read_to_string(&execd);
+    // Clean up before asserting: the stand-in sleeps 30 s.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let _ = child.wait();
+    let text = text.expect("the new binary was not started");
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next().unwrap().parse::<u32>().unwrap(),
+        before,
+        "same pid"
+    );
+    assert!(lines.next().unwrap().contains("daemon"), "{text}");
+}
