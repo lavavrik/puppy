@@ -89,8 +89,13 @@ async fn engine_rejects_magnet_and_duplicates() {
         uri: "magnet:?xt=urn:btih:abc".into(),
     };
     assert!(!e.accepts(&magnet));
+    for url in ["ftp://x/y", "ftps://x/y", "ftpes://x/y"] {
+        assert!(e.accepts(&Source::Http {
+            url: url.parse().unwrap()
+        }));
+    }
     assert!(!e.accepts(&Source::Http {
-        url: "ftp://x/y".parse().unwrap()
+        url: "sftp://x/y".parse().unwrap()
     }));
     let mut req = request(&s, dir.path());
     req.source = magnet;

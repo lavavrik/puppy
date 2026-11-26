@@ -95,6 +95,9 @@ pub struct WorkerCtx {
     pub failover: bool,
     /// Bytes received from this location (shared by its workers).
     pub got: Arc<AtomicU64>,
+    /// The location is an FTP(S) one: segments go through [`crate::ftp::worker`], and
+    /// `client`, `context` and `if_range` are unused.
+    pub ftp: Option<crate::ftp::FtpTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

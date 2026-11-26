@@ -198,19 +198,29 @@ impl Pool {
         let mut ctx = (*self.ctxs[mirror]).clone();
         ctx.cancel = token;
         self.set.spawn(async move {
-            let exit = if single {
-                run_single(&ctx, e.shared.clone()).await
-            } else {
-                match check {
-                    Some(c) => match pre_check(&ctx, &c).await {
-                        None => run_segment(&ctx, e.start, e.shared.clone()).await,
-                        Some(exit) => exit,
-                    },
-                    None => run_segment(&ctx, e.start, e.shared.clone()).await,
-                }
+            let exit = match check.filter(|_| !single) {
+                Some(c) => match pre_check(&ctx, &c).await {
+                    None => run_worker(&ctx, e.start, e.shared.clone(), false).await,
+                    Some(exit) => exit,
+                },
+                None => run_worker(&ctx, e.start, e.shared.clone(), single).await,
             };
             (e.shared, mirror, exit)
         });
+    }
+}
+
+/// One worker over the location's protocol.
+async fn run_worker(
+    ctx: &WorkerCtx,
+    start: u64,
+    seg: Arc<SegmentShared>,
+    single: bool,
+) -> WorkerExit {
+    match &ctx.ftp {
+        Some(ftp) => crate::ftp::worker::run(ctx, ftp, start, seg, single).await,
+        None if single => run_single(ctx, seg).await,
+        None => run_segment(ctx, start, seg).await,
     }
 }
 
@@ -218,16 +228,27 @@ impl Pool {
 /// `None` if it matches (go on downloading), otherwise how the worker ends.
 async fn pre_check(ctx: &WorkerCtx, c: &PreCheck) -> Option<WorkerExit> {
     let (start, end) = c.window;
-    let check = spot_check(
-        &ctx.client,
-        &ctx.context,
-        &ctx.url,
-        c.total,
-        start,
-        end,
-        &c.part,
-        &ctx.cfg,
-    );
+    let check = async {
+        match &ctx.ftp {
+            Some(ftp) => {
+                crate::ftp::validate::spot_check(&ftp.site, c.total, start, end, &c.part, &ctx.cfg)
+                    .await
+            }
+            None => {
+                spot_check(
+                    &ctx.client,
+                    &ctx.context,
+                    &ctx.url,
+                    c.total,
+                    start,
+                    end,
+                    &c.part,
+                    &ctx.cfg,
+                )
+                .await
+            }
+        }
+    };
     let result = tokio::select! {
         _ = ctx.cancel.cancelled() => return Some(WorkerExit::Cancelled),
         r = check => r,
@@ -292,6 +313,9 @@ async fn transfer(inner: &Arc<Inner>, cancel: &CancellationToken) -> Outcome {
     for m in &mut inner.lock().mirrors {
         m.active = 0;
         m.busy = false;
+        if let Some(site) = &m.ftp {
+            site.reset();
+        }
     }
     if !matches!(outcome, Outcome::Complete | Outcome::RangeUnsupported) {
         inner.flush(&file).await;
@@ -472,6 +496,10 @@ impl Inner {
             cancel,
             failover,
             got: m.got.clone(),
+            ftp: m.ftp.clone().map(|site| crate::ftp::FtpTarget {
+                site,
+                mdtm: m.v.last_modified.clone(),
+            }),
         }
     }
 

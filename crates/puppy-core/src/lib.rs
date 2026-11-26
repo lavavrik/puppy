@@ -2,6 +2,7 @@ pub mod checksum;
 pub mod config;
 pub mod engine;
 pub mod fsutil;
+pub mod ftp;
 pub mod http;
 pub mod limiter;
 pub mod meter;

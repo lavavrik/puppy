@@ -10,17 +10,16 @@
 use crate::config::HttpConfig;
 use crate::engine::{AddOptions, Added, EngineError, EngineEvent};
 use crate::http::probe::RemoteInfo;
-use crate::http::probe::probe;
 use crate::http::resume::{
     HttpResumeState, VERSION, context_hash, part_path, sidecar_path, without_context,
 };
 use crate::http::segments::{Segment, plan_segments};
-use crate::http::validate::{Validation, validate_remote};
+use crate::http::validate::Validation;
 use crate::http::worker::{SegmentShared, is_url_rejected};
 use crate::limiter::TokenBucket;
 use crate::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
-    SegmentView, Source,
+    SegmentView, Source, without_password,
 };
 use files::{blocking, open_part, prepare};
 use mirrors::{DropKind, Health, MirrorRt, Validators};
@@ -39,6 +38,7 @@ mod files;
 mod mirrors;
 mod restore;
 mod transfer;
+mod transport;
 mod verify;
 
 const SPEED_SAMPLE: Duration = Duration::from_millis(250);
@@ -549,11 +549,8 @@ impl Inner {
         state: &HttpResumeState,
         part: &Path,
     ) -> Result<Validation, EngineError> {
-        let (ctx, origin) = {
-            let st = self.lock();
-            (st.mirrors[0].context.clone(), st.mirrors[0].url.clone())
-        };
-        match validate_remote(&self.client, &ctx, &origin, state, part, &self.cfg).await {
+        let remote = self.lock().mirrors[0].remote();
+        match remote.validate(&self.client, state, part, &self.cfg).await {
             Err(EngineError::Http { status }) if is_url_rejected(status) => {
                 Ok(match self.reresolve(0, true).await? {
                     true => Validation::Ok,
@@ -637,15 +634,14 @@ impl Inner {
     /// probed (same size and range support, as for a fresh start) and the bytes already
     /// downloaded are compared against it, whichever location they came from.
     async fn check_mirror(&self, i: usize, base: &HttpResumeState, part: &Path) -> Check {
-        let (url, ctx, v) = {
+        let (url, remote, v) = {
             let st = self.lock();
             let m = &st.mirrors[i];
-            (m.url.clone(), m.context.clone(), m.v.clone())
+            (m.url.clone(), m.remote(), m.v.clone())
         };
         let mut learned = None;
         let state = if v.is_empty() {
-            let read_timeout = Duration::from_millis(self.cfg.read_timeout_ms);
-            let info = match probe(&self.client, &url, &ctx, read_timeout).await {
+            let info = match remote.probe(&self.client, &self.cfg).await {
                 Ok(info) => info,
                 Err(e) => return Check::Failed(e),
             };
@@ -662,10 +658,10 @@ impl Inner {
         } else {
             state_with(base, &v)
         };
-        let result = validate_remote(&self.client, &ctx, &url, &state, part, &self.cfg).await;
+        let result = remote.validate(&self.client, &state, part, &self.cfg).await;
         let result = match result {
             Err(EngineError::Http { status })
-                if is_url_rejected(status) && state.final_url != url =>
+                if is_url_rejected(status) && state.final_url != url && !remote.is_ftp() =>
             {
                 match self.reresolve(i, false).await {
                     Ok(true) => {
@@ -697,13 +693,12 @@ impl Inner {
     /// total and the same strong ETag, or (no strong ETag) the bytes already downloaded
     /// check out. `Ok(false)`: it now serves a different file. `Err`: the probe failed.
     async fn reresolve(&self, i: usize, persist: bool) -> Result<bool, EngineError> {
-        let (url, ctx, v) = {
+        let (remote, v) = {
             let st = self.lock();
             let m = &st.mirrors[i];
-            (m.url.clone(), m.context.clone(), m.v.clone())
+            (m.remote(), m.v.clone())
         };
-        let read_timeout = Duration::from_millis(self.cfg.read_timeout_ms);
-        let info = probe(&self.client, &url, &ctx, read_timeout).await?;
+        let info = remote.probe(&self.client, &self.cfg).await?;
         if info.total != self.remote.total {
             return Ok(false);
         }
@@ -717,7 +712,9 @@ impl Inner {
             let mut state = state_with(&self.resume_state(), &v);
             state.final_url = info.final_url.clone();
             let part = part_path(&self.final_path);
-            if validate_remote(&self.client, &ctx, &url, &state, &part, &self.cfg).await?
+            if remote
+                .validate(&self.client, &state, &part, &self.cfg)
+                .await?
                 != Validation::Ok
             {
                 return Ok(false);
@@ -803,7 +800,7 @@ impl Inner {
             version: VERSION,
             request: without_context(&self.request),
             context_hash: context_hash(&self.request.context),
-            final_url: primary.final_url,
+            final_url: without_password(&primary.final_url),
             total: self.remote.total,
             etag: primary.etag,
             etag_strong: primary.etag_strong,

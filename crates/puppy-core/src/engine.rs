@@ -1,4 +1,4 @@
-//! The engine abstraction implemented by the HTTP (and later torrent) engines.
+//! The engine abstraction implemented by the URL (HTTP(S), FTP(S)) and torrent engines.
 
 use crate::types::{
     AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, SeedPolicy, Selection,
@@ -70,6 +70,14 @@ pub enum EngineError {
     /// is shown as is. Transient: a later attempt may find it working.
     #[error("{0}")]
     Unavailable(String),
+    /// An FTP server refused a command: its reply code and text. 4xx replies ("try
+    /// again later") are transient, 5xx ones permanent.
+    #[error("FTP {code}: {message}")]
+    Ftp { code: u16, message: String },
+    /// TLS could not be set up as required (a certificate that does not verify, or a
+    /// server refusing TLS where it is required). Not transient.
+    #[error("TLS: {0}")]
+    Tls(String),
 }
 
 impl EngineError {
@@ -79,6 +87,7 @@ impl EngineError {
         match self {
             EngineError::Network(_) | EngineError::Unavailable(_) => true,
             EngineError::Http { status } => is_transient_status(*status),
+            EngineError::Ftp { code, .. } => (400..500).contains(code),
             _ => false,
         }
     }
@@ -203,6 +212,15 @@ mod tests {
         assert!(!EngineError::Io(std::io::Error::other("disk full")).is_transient());
         assert!(!EngineError::Invalid("x".into()).is_transient());
         assert!(!EngineError::NotFound(1).is_transient());
+        let ftp = |code| EngineError::Ftp {
+            code,
+            message: "x".into(),
+        };
+        assert!(ftp(421).is_transient());
+        assert!(ftp(450).is_transient());
+        assert!(!ftp(530).is_transient());
+        assert!(!ftp(550).is_transient());
+        assert!(!EngineError::Tls("bad certificate".into()).is_transient());
         let e = EngineError::Unavailable("torrent engine unavailable (see daemon log)".into());
         assert!(e.is_transient());
         assert_eq!(e.to_string(), "torrent engine unavailable (see daemon log)");

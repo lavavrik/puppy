@@ -10,7 +10,7 @@ use crate::engine::EngineEvent;
 use crate::fsutil::{
     mark_sparse, rename_no_replace, sanitize_filename, sync_parent_dir, unique_path,
 };
-use crate::http::probe::{RemoteInfo, probe};
+use crate::http::probe::RemoteInfo;
 use crate::http::resume::{part_path, sidecar_path};
 use crate::http::segments::Segment;
 use crate::types::AddRequest;
@@ -26,14 +26,9 @@ pub(super) async fn prepare(
     req: &AddRequest,
     cfg: &HttpConfig,
 ) -> Result<(RemoteInfo, Vec<MirrorRt>, PathBuf), EngineError> {
-    let read_timeout = std::time::Duration::from_millis(cfg.read_timeout_ms);
     let mut mirrors = locations(req);
-    let probes = futures_util::future::join_all(
-        mirrors
-            .iter()
-            .map(|m| probe(client, &m.url, &m.context, read_timeout)),
-    )
-    .await;
+    let remotes: Vec<_> = mirrors.iter().map(MirrorRt::remote).collect();
+    let probes = futures_util::future::join_all(remotes.iter().map(|r| r.probe(client, cfg))).await;
     let remote = choose(&mut mirrors, probes)?;
     let dir = req
         .output_dir

@@ -1,13 +1,15 @@
 //! Restoring a download from its sidecar after a crash or restart.
 
 use super::files::file_len;
-use super::mirrors::{MirrorRt, Validators, locations, restore_records};
+use super::mirrors::{MirrorRt, Validators, locations, restore_records, with_password_of};
 use super::transfer::spawn_run;
 use super::{Env, HttpDownload, Plan, SegEntry, file_name};
 use crate::config::HttpConfig;
 use crate::engine::{AddOptions, Added, EngineError, EngineEvent};
 use crate::http::probe::RemoteInfo;
-use crate::http::resume::{HttpResumeState, context_hash, part_path, sidecar_path};
+use crate::http::resume::{
+    HttpResumeState, context_hash, part_path, sidecar_path, without_context,
+};
 use crate::limiter::TokenBucket;
 use crate::types::{AddRequest, AttentionReason, DownloadId, DownloadState, Source};
 use std::io;
@@ -85,7 +87,7 @@ impl HttpDownload {
         let final_path = final_path.to_path_buf();
         let sidecar = sidecar_path(&final_path);
         let loaded = HttpResumeState::load(&final_path).await;
-        let foreign = matches!(&loaded, Ok(s) if s.request.source != req.source);
+        let foreign = matches!(&loaded, Ok(s) if s.request.source != without_context(&req).source);
         let loaded = loaded.and_then(|state| check_source(state, &req));
         let part_len = file_len(&part_path(&final_path)).await?;
 
@@ -195,7 +197,8 @@ impl HttpDownload {
 
 /// The sidecar must belong to the caller's request.
 fn check_source(state: HttpResumeState, req: &AddRequest) -> Result<HttpResumeState, EngineError> {
-    if state.request.source != req.source {
+    // The sidecar's URLs have no password.
+    if state.request.source != without_context(req).source {
         return Err(EngineError::Invalid(
             "resume sidecar belongs to a different source".into(),
         ));
@@ -210,7 +213,7 @@ fn mirrors_from(req: &AddRequest, state: &HttpResumeState) -> Vec<MirrorRt> {
     let mut mirrors = locations(req);
     if let Some(primary) = mirrors.first_mut() {
         primary.v = Validators {
-            final_url: state.final_url.clone(),
+            final_url: with_password_of(&state.final_url, &primary.url),
             etag: state.etag.clone(),
             etag_strong: state.etag_strong,
             last_modified: state.last_modified.clone(),

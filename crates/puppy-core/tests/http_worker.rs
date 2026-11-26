@@ -38,6 +38,7 @@ fn make_ctx(s: &TestServer, file: std::fs::File, if_range: Option<&str>) -> Work
         cancel: CancellationToken::new(),
         failover: false,
         got: Default::default(),
+        ftp: None,
     }
 }
 

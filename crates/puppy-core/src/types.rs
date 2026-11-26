@@ -8,9 +8,16 @@ pub type DownloadId = u64;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
-    Http { url: url::Url },
-    Magnet { uri: String },
-    TorrentFile { path: PathBuf },
+    /// A URL: `http`, `https`, `ftp`, `ftps` (implicit FTPS) or `ftpes` (explicit FTPS).
+    Http {
+        url: url::Url,
+    },
+    Magnet {
+        uri: String,
+    },
+    TorrentFile {
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -73,7 +80,18 @@ pub fn masked_url(url: &url::Url) -> String {
     shown.to_string()
 }
 
-/// Another location of an HTTP(S) download's file (aria2's TAB-separated URIs, a
+/// `url` without its password (the user name is kept), as written where secrets must not
+/// go (the resume sidecar).
+pub fn without_password(url: &url::Url) -> url::Url {
+    let mut out = url.clone();
+    if out.password().is_some() {
+        // Only fails for URLs that cannot have credentials, which this one has.
+        let _ = out.set_password(None);
+    }
+    out
+}
+
+/// Another location of a URL download's file (aria2's TAB-separated URIs, a
 /// Metalink `<url>`). The download's source stays its primary URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mirror {
@@ -129,13 +147,14 @@ pub struct AddRequest {
     /// Seeding policy override for a torrent (`None`: the daemon's defaults).
     #[serde(default)]
     pub seed: Option<SeedPolicy>,
-    /// The digest the finished file must have (HTTP only): checked once it is complete
+    /// The digest the finished file must have (URL downloads only): checked once it is complete
     /// (state `Verifying`); a mismatch fails the download and keeps the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<crate::checksum::Checksum>,
-    /// Other locations of the same file (HTTP only), besides `source` (the primary). The
-    /// engine probes them, uses the ones that agree with the primary on size and range
-    /// support, spreads connections over them and fails over between them.
+    /// Other locations of the same file (URL downloads only), besides `source` (the
+    /// primary), over HTTP(S) or FTP(S) whatever the primary's protocol. The engine probes
+    /// them, uses the ones that agree with the primary on size and range support, spreads
+    /// connections over them and fails over between them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrors: Vec<Mirror>,
 }
@@ -267,7 +286,7 @@ pub struct SegmentView {
     pub active: bool,
 }
 
-/// One location of an HTTP download's file and how the download uses it.
+/// One location of a URL download's file and how the download uses it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MirrorView {
     /// Display form (a password masked).
@@ -300,6 +319,7 @@ pub enum MirrorState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineDetail {
+    /// A URL download (HTTP(S) or FTP(S): the same segmented transfer).
     Http {
         segments: Vec<SegmentView>,
         connections: u16,

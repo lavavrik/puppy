@@ -13,7 +13,9 @@ use crate::http::probe::RemoteInfo;
 use crate::http::resume::MirrorResume;
 use crate::http::worker::{backoff, is_url_rejected};
 use crate::meter::SpeedMeter;
-use crate::types::{AddRequest, MirrorState, MirrorView, RequestContext, Source, masked_url};
+use crate::types::{
+    AddRequest, MirrorState, MirrorView, RequestContext, Source, masked_url, without_password,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -107,6 +109,9 @@ pub(super) struct MirrorRt {
     pub reresolved_at: Option<u64>,
     /// Its URL is being re-resolved: no new connections meanwhile.
     pub busy: bool,
+    /// The location's FTP side (sessions, what was learned about the server), for an
+    /// FTP(S) URL.
+    pub ftp: Option<Arc<crate::ftp::Site>>,
     meter: SpeedMeter,
     last_got: u64,
 }
@@ -114,6 +119,7 @@ pub(super) struct MirrorRt {
 impl MirrorRt {
     fn new(url: url::Url, primary: bool, context: RequestContext) -> Self {
         MirrorRt {
+            ftp: crate::ftp::is_ftp(&url).then(|| crate::ftp::Site::new(&url)),
             v: Validators::unknown(&url),
             url,
             primary,
@@ -143,6 +149,14 @@ impl MirrorRt {
         let reason = reason.into();
         tracing::info!(url = %masked_url(&self.url), "mirror dropped: {reason}");
         self.health = Health::Dropped { kind, reason };
+    }
+
+    /// Already has as many workers as its server allows connections (FTP servers that
+    /// turned a session away).
+    pub fn at_capacity(&self) -> bool {
+        self.ftp
+            .as_ref()
+            .is_some_and(|s| s.at_capacity(self.active))
     }
 
     /// Usable now (a bench that has run out is lifted).
@@ -229,11 +243,11 @@ impl MirrorRt {
         }
     }
 
-    /// The record kept in the resume sidecar.
+    /// The record kept in the resume sidecar (no passwords).
     pub fn record(&self) -> MirrorResume {
         MirrorResume {
-            url: self.url.clone(),
-            final_url: self.v.final_url.clone(),
+            url: without_password(&self.url),
+            final_url: without_password(&self.v.final_url),
             etag: self.v.etag.clone(),
             etag_strong: self.v.etag_strong,
             last_modified: self.v.last_modified.clone(),
@@ -241,8 +255,9 @@ impl MirrorRt {
     }
 }
 
-/// The request's locations: its source (primary) first, then its HTTP(S) mirrors by
-/// priority (lower first, unnumbered last, otherwise as given), duplicates removed.
+/// The request's locations: its source (primary) first, then its HTTP(S) and FTP(S)
+/// mirrors by priority (lower first, unnumbered last, otherwise as given), duplicates
+/// removed.
 pub(super) fn locations(req: &AddRequest) -> Vec<MirrorRt> {
     let Source::Http { url: primary } = &req.source else {
         return Vec::new();
@@ -251,7 +266,7 @@ pub(super) fn locations(req: &AddRequest) -> Vec<MirrorRt> {
     let mut mirrors: Vec<_> = req.mirrors.iter().collect();
     mirrors.sort_by_key(|m| m.priority.unwrap_or(u32::MAX));
     for m in mirrors {
-        if !matches!(m.url.scheme(), "http" | "https") || out.iter().any(|o| o.url == m.url) {
+        if !is_url_scheme(m.url.scheme()) || out.iter().any(|o| o.url == m.url) {
             continue;
         }
         let context = req.context.for_mirror(primary, &m.url);
@@ -260,12 +275,17 @@ pub(super) fn locations(req: &AddRequest) -> Vec<MirrorRt> {
     out
 }
 
-/// Applies a sidecar's records (by URL) to `mirrors`.
+/// The schemes a URL download's locations may have.
+pub(crate) fn is_url_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https") || crate::ftp::is_ftp_scheme(scheme)
+}
+
+/// Applies a sidecar's records (by URL; the sidecar's have no password) to `mirrors`.
 pub(super) fn restore_records(mirrors: &mut [MirrorRt], records: &[MirrorResume]) {
     for m in mirrors.iter_mut().filter(|m| !m.primary) {
-        if let Some(r) = records.iter().find(|r| r.url == m.url) {
+        if let Some(r) = records.iter().find(|r| r.url == without_password(&m.url)) {
             m.v = Validators {
-                final_url: r.final_url.clone(),
+                final_url: with_password_of(&r.final_url, &m.url),
                 etag: r.etag.clone(),
                 etag_strong: r.etag_strong,
                 last_modified: r.last_modified.clone(),
@@ -274,9 +294,20 @@ pub(super) fn restore_records(mirrors: &mut [MirrorRt], records: &[MirrorResume]
     }
 }
 
+/// `recorded` (from a sidecar, without password) as `given` if it is the same URL: with
+/// `given`'s password then.
+pub(super) fn with_password_of(recorded: &url::Url, given: &url::Url) -> url::Url {
+    if *recorded == without_password(given) {
+        given.clone()
+    } else {
+        recorded.clone()
+    }
+}
+
 /// The mirror a new connection goes to: among the usable ones that `allowed` lets
-/// through (and that are not being re-resolved), the one with the fewest connections,
-/// ties broken by the faster one per connection, then by order. `None` if there is none.
+/// through (and that are not being re-resolved, nor FTP servers at their session limit),
+/// the one with the fewest connections, ties broken by the faster one per connection,
+/// then by order. `None` if there is none.
 pub(super) fn pick(
     mirrors: &mut [MirrorRt],
     now: Instant,
@@ -284,7 +315,11 @@ pub(super) fn pick(
 ) -> Option<usize> {
     let mut best: Option<usize> = None;
     for i in 0..mirrors.len() {
-        if !mirrors[i].available(now) || mirrors[i].busy || !allowed(&mirrors[i]) {
+        if !mirrors[i].available(now)
+            || mirrors[i].busy
+            || mirrors[i].at_capacity()
+            || !allowed(&mirrors[i])
+        {
             continue;
         }
         best = match best {

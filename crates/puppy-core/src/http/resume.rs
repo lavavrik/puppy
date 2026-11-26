@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::EngineError;
 use crate::fsutil::atomic_write;
 use crate::http::segments::Segment;
-use crate::types::{AddRequest, RequestContext};
+use crate::types::{AddRequest, Mirror, RequestContext, Source, without_password};
 
 /// Current sidecar format version. 2: request context no longer stored.
 pub const VERSION: u32 = 2;
@@ -53,10 +53,26 @@ pub struct MirrorResume {
     pub last_modified: Option<String>,
 }
 
-/// The request as recorded in a sidecar: everything but its context.
+/// The request as recorded in a sidecar: everything but its context and the passwords
+/// in its URLs.
 pub fn without_context(req: &AddRequest) -> AddRequest {
+    let source = match &req.source {
+        Source::Http { url } => Source::Http {
+            url: without_password(url),
+        },
+        other => other.clone(),
+    };
     AddRequest {
+        source,
         context: RequestContext::default(),
+        mirrors: req
+            .mirrors
+            .iter()
+            .map(|m| Mirror {
+                url: without_password(&m.url),
+                ..m.clone()
+            })
+            .collect(),
         ..req.clone()
     }
 }
@@ -317,6 +333,26 @@ mod tests {
         assert_eq!(s.context, RequestContext::default());
         assert_eq!(s.source, req.source);
         assert_eq!(s.filename, req.filename);
+    }
+
+    #[test]
+    fn without_context_drops_url_passwords() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let req = AddRequest {
+            source: Source::Http {
+                url: u("ftp://bob:SECRET@example.com/a"),
+            },
+            output_dir: None,
+            filename: None,
+            files: Default::default(),
+            seed: None,
+            context: RequestContext::default(),
+            checksum: None,
+            mirrors: vec![Mirror::new(u("https://amy:SECRET2@mirror.example/a"))],
+        };
+        let s = serde_json::to_string(&without_context(&req)).unwrap();
+        assert!(!s.contains("SECRET"), "{s}");
+        assert!(s.contains("bob@") && s.contains("amy@"), "{s}");
     }
 
     #[tokio::test]

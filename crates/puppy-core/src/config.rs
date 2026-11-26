@@ -1,6 +1,29 @@
 //! Engine configuration.
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Whether `ftp://` sessions use TLS (`AUTH TLS`, explicit FTPS). `ftps://` (implicit
+/// FTPS) and `ftpes://` (explicit FTPS, required) URLs choose for themselves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FtpTls {
+    /// Plain FTP: credentials and data travel unencrypted.
+    Off,
+    /// Ask for TLS and use it if the server offers it; carry on in plain FTP only if the
+    /// server refuses `AUTH TLS`. A certificate that does not verify fails the download.
+    #[default]
+    Try,
+    /// TLS or nothing: a server refusing `AUTH TLS` fails the download.
+    Require,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FtpConfig {
+    pub tls: FtpTls,
+    /// More trusted root certificates (DER) for FTPS, besides the system's (tests).
+    pub extra_roots: Vec<Vec<u8>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
@@ -18,8 +41,10 @@ pub struct HttpConfig {
     pub read_timeout_ms: u64,
     /// Upper bound for validating a remote file before resuming it.
     pub validate_timeout_ms: u64,
+    /// HTTP(S) proxy for HTTP(S) downloads. FTP connections never use it.
     pub proxy: Option<url::Url>,
     pub default_dir: PathBuf,
+    pub ftp: FtpConfig,
 }
 
 impl Default for HttpConfig {
@@ -39,6 +64,7 @@ impl Default for HttpConfig {
             default_dir: dirs::download_dir()
                 .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
                 .unwrap_or_else(|| PathBuf::from("Downloads")),
+            ftp: FtpConfig::default(),
         }
     }
 }

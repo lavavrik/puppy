@@ -251,7 +251,7 @@ async fn fetch(
     Ok(Fetched::Range { total, data })
 }
 
-fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(start))?;
     let mut buf = vec![0; usize::try_from(end - start).map_err(std::io::Error::other)?];
@@ -261,7 +261,7 @@ fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
 
 /// Up to three windows of at most `len` bytes at the start, middle and end of the
 /// completed bytes, each inside one completed range; duplicates removed.
-fn spot_windows(completed: &[(u64, u64)], len: u64) -> Vec<(u64, u64)> {
+pub(crate) fn spot_windows(completed: &[(u64, u64)], len: u64) -> Vec<(u64, u64)> {
     let sum: u64 = completed.iter().map(|(s, e)| e - s).sum();
     if sum == 0 {
         return Vec::new();
