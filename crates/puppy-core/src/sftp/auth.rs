@@ -321,7 +321,7 @@ async fn keyboard_interactive(
 fn failure_message(user: &str, ep: &Endpoint, a: &Attempts) -> String {
     let accepts: Vec<&str> = a.methods.iter().map(<&str>::from).collect();
     let tried = if a.tried.is_empty() {
-        "nothing it accepts".to_string()
+        "no key or password it accepts".to_string()
     } else {
         a.tried.join(", ")
     };
