@@ -1032,6 +1032,7 @@ fn demo_app(theme: Theme) -> App {
             segments,
             connections: 7,
             resumable: true,
+            mirrors: Vec::new(),
         },
     ));
     a.totals = Totals {
