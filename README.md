@@ -426,16 +426,20 @@ Things to know about v1:
   apply to torrents at any time.
 - **After a daemon restart** a torrent goes on from the pieces it had when
   the daemon stopped (fast resume). At a clean stop (`puppy stop`, or any
-  normal shutdown) the daemon keeps each torrent's piece map and the size and
-  modification time of its files (`torrents/<id>.resume`). On restore, if the
-  files are exactly as recorded, up to 64 of the recorded pieces are read
-  back and their hashes checked; the torrent then shows its progress at once
-  instead of re-checking all its data. Otherwise it checks the data already
-  on disk in full before it goes on, showing 0 until the check is done (a
-  large library takes a while): after the daemon was killed or crashed, when
-  a file was changed, moved, truncated or deleted while the daemon was down,
-  when a checked piece is bad, or when the `.torrent` changed. A record is
-  used once: after a restart, only the next clean stop writes a new one.
+  normal shutdown) the daemon flushes each torrent's files to disk and keeps
+  its piece map and the size and modification time of its files
+  (`torrents/<id>.resume`). It keeps none for a torrent whose file is shorter
+  than the pieces it had, or was modified after the torrent last wrote to it
+  (for example a seeding torrent's file edited by another program). On
+  restore, if the files are exactly as recorded, up to 64 of the recorded
+  pieces are read back and their hashes checked; the torrent then shows its
+  progress at once instead of re-checking all its data. Otherwise it checks
+  the data already on disk in full before it goes on, showing 0 until the
+  check is done (a large library takes a while): after the daemon was killed
+  or crashed, when there was no record, when a file was changed, moved,
+  truncated or deleted while the daemon was down, when a checked piece is
+  bad, or when the `.torrent` changed. A record is used once: after a
+  restart, only the next clean stop writes a new one.
 - **Deleting a torrent's files** (also once it has completed) deletes exactly
   the files the torrent lists, then its folders once empty; anything else in
   them stays. A torrent whose `.torrent` file is gone (shown as "torrent file

@@ -171,6 +171,14 @@ pub(crate) const SPOT_CHECKS: usize = 64;
 /// of them), then random others. False if one does not match or cannot be read, or the
 /// bitmap does not fit the torrent.
 pub(crate) fn spot_check(torrent: &[u8], output_folder: &Path, bits: &[u8]) -> bool {
+    check(torrent, output_folder, bits, true)
+}
+
+/// Whether every piece `bits` claims lies inside its files as they are on disk (each
+/// file it overlaps is at least that long), and (`hash`) the [`spot_check`] passes. A
+/// file cut short while the daemon ran would otherwise be padded with zeros by librqbit
+/// and those zeros served as the claimed pieces.
+fn check(torrent: &[u8], output_folder: &Path, bits: &[u8], hash: bool) -> bool {
     let Ok(meta) = torrent_from_bytes(torrent) else {
         return false;
     };
@@ -192,6 +200,39 @@ pub(crate) fn spot_check(torrent: &[u8], output_folder: &Path, bits: &[u8]) -> b
         offset += f.len;
     }
     let plen = u64::from(lengths.default_piece_length());
+    let total = lengths.total_length();
+    let claimed: Vec<u32> = (0..pieces).filter(|&p| has(p)).collect();
+    // Files and pieces both in torrent order: one pass over the files.
+    let mut sizes: HashMap<usize, u64> = HashMap::new();
+    let mut first = 0;
+    for &p in &claimed {
+        let start = u64::from(p) * plen;
+        let end = (start + plen).min(total);
+        while first < files.len() && files[first].1 + files[first].2 <= start {
+            first += 1;
+        }
+        for (i, (path, off, len)) in files.iter().enumerate().skip(first) {
+            if *off >= end {
+                break;
+            }
+            let (Some(path), true) = (path, *len > 0) else {
+                continue;
+            };
+            let size = match sizes.get(&i) {
+                Some(&n) => n,
+                None => match std::fs::metadata(path) {
+                    Ok(m) => *sizes.entry(i).or_insert(m.len()),
+                    Err(_) => return false,
+                },
+            };
+            if size < end.min(off + len) - off {
+                return false;
+            }
+        }
+    }
+    if !hash {
+        return true;
+    }
     let mut picked = BTreeSet::new();
     for &(ref path, off, len) in &files {
         if picked.len() >= SPOT_CHECKS / 2 {
@@ -205,7 +246,6 @@ pub(crate) fn spot_check(torrent: &[u8], output_folder: &Path, bits: &[u8]) -> b
             picked.insert(p);
         }
     }
-    let claimed: Vec<u32> = (0..pieces).filter(|&p| has(p)).collect();
     let mut x = RandomState::new().hash_one(0u8) | 1;
     for _ in 0..claimed.len().min(SPOT_CHECKS * 4) {
         if picked.len() >= SPOT_CHECKS.min(claimed.len()) {
@@ -268,26 +308,98 @@ pub(crate) fn spot_check(torrent: &[u8], output_folder: &Path, bits: &[u8]) -> b
     })
 }
 
-/// At a clean shutdown (the session stopped): writes torrent `info`'s exact piece map
-/// `bits` (MSB first, byte padded: librqbit's bitmap format) to `bitv`, then the record
-/// of its files in `output_folder` to `record`, both atomically and durably, in that
-/// order (the record vouches for the bitmap). Files that cannot be vouched for: no
-/// record.
-pub(crate) async fn save(
-    bitv: PathBuf,
-    record: PathBuf,
-    bits: Vec<u8>,
-    info: std::sync::Arc<TorrentInfo>,
-    output_folder: PathBuf,
-) -> io::Result<()> {
-    fsutil::atomic_write(&bitv, &bits, true).await?;
-    let rec = tokio::task::spawn_blocking(move || Record::take(&info, &output_folder))
+/// What a clean shutdown stores for one torrent (the session stopped: librqbit writes
+/// nothing any more).
+pub(crate) struct Save {
+    pub bitv: PathBuf,
+    pub record: PathBuf,
+    /// The exact piece map (MSB first, byte padded: librqbit's bitmap format).
+    pub bits: Vec<u8>,
+    /// The `.torrent`.
+    pub torrent: bytes::Bytes,
+    pub info: std::sync::Arc<TorrentInfo>,
+    pub output_folder: PathBuf,
+    /// A time by which every write librqbit made to the files was done (`None`: not
+    /// known).
+    pub wrote_ns: Option<u64>,
+}
+
+impl Save {
+    /// Writes the piece map to `bitv`, then the record of the files to `record`, both
+    /// atomically and durably, in that order (the record vouches for the map), if the
+    /// files can be vouched for ([`vouch`]); otherwise no record (a full check after the
+    /// restart).
+    pub(crate) async fn run(self) -> io::Result<()> {
+        let Save {
+            bitv,
+            record,
+            bits,
+            torrent,
+            info,
+            output_folder,
+            wrote_ns,
+        } = self;
+        let claimed = bits.clone();
+        let rec = tokio::task::spawn_blocking(move || {
+            vouch(&torrent, &info, &output_folder, &claimed, wrote_ns)
+        })
         .await
         .map_err(io::Error::other)?;
-    match rec {
-        Some(rec) => fsutil::atomic_write(&record, &rec.to_bytes(), true).await,
-        None => remove(&record),
+        // An old record never vouches for the new map, even half-written.
+        remove(&record)?;
+        let Some(rec) = rec else {
+            return Ok(());
+        };
+        fsutil::atomic_write(&bitv, &bits, true).await?;
+        fsutil::atomic_write(&record, &rec.to_bytes(), true).await
     }
+}
+
+/// The record of torrent `info`'s files in `output_folder`, if they can vouch for the
+/// claimed pieces `bits`: each claimed piece lies inside its files ([`check`]), every
+/// file's data is on disk (synced: librqbit never syncs it, and a power loss could
+/// otherwise keep a recorded modification time over lost data), and no file was
+/// modified after `wrote_ns` (librqbit's last write: anything later is someone
+/// else's, for example a file rewritten in place while it was seeding). Blocking.
+fn vouch(
+    torrent: &[u8],
+    info: &TorrentInfo,
+    output_folder: &Path,
+    bits: &[u8],
+    wrote_ns: Option<u64>,
+) -> Option<Record> {
+    if !check(torrent, output_folder, bits, false) {
+        tracing::warn!(torrent = %info.name, "a file is shorter than the pieces it had");
+        return None;
+    }
+    for rel in &info.files {
+        let path = output_folder.join(rel);
+        // Windows needs write access to flush a file; opening it changes nothing.
+        let mut opts = std::fs::OpenOptions::new();
+        if cfg!(windows) {
+            opts.write(true);
+        } else {
+            opts.read(true);
+        }
+        match opts.open(&path).and_then(|f| f.sync_data()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "syncing for a fast resume: {e}");
+                return None;
+            }
+        }
+    }
+    let rec = Record::take(info, output_folder)?;
+    let wrote = wrote_ns?;
+    if rec.files.iter().flatten().any(|s| s.mtime_ns > wrote) {
+        tracing::warn!(
+            torrent = %info.name,
+            "a file changed after the torrent last wrote to it: checking it in full next time"
+        );
+        return None;
+    }
+    Some(rec)
 }
 
 /// Before the session starts: creates the store's folder (owner-only, like the engine's
@@ -329,6 +441,7 @@ pub(crate) fn prepare_dir(dir: &Path, records_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection;
 
     /// Piece length of the test torrents (the smallest librqbit takes).
     const PLEN: usize = 16 * 1024;
@@ -508,6 +621,69 @@ mod tests {
         assert!(check(&[0xA0]), "pieces 0 and 2 are fine");
         std::fs::remove_file(f.out.join("a")).unwrap();
         assert!(!check(&[0x80]), "unreadable");
+    }
+
+    #[test]
+    fn claimed_pieces_must_lie_inside_the_files() {
+        let f = Fixture::new();
+        let fits = |bits: &[u8]| check(&f.bytes, &f.out, bits, false);
+        assert!(fits(&[0xE0]));
+        // sub/b loses its last bytes: piece 2 (its tail) no longer fits, pieces 0 and 1
+        // (a, and a's tail with b's head) still do.
+        let b = f.out.join("sub/b");
+        let len = std::fs::metadata(&b).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        assert!(!fits(&[0xE0]));
+        assert!(!fits(&[0x20]));
+        assert!(
+            fits(&[0xC0]),
+            "the shortened file is not claimed past its end"
+        );
+        // The hashes alone could miss it: the size check sees every claimed piece.
+        assert!(!spot_check(&f.bytes, &f.out, &[0x20]));
+    }
+
+    #[test]
+    fn vouch_needs_fitting_files_unchanged_since_the_last_write() {
+        let f = Fixture::new();
+        let later = selection::now_ns() + 1_000_000_000;
+        let vouch = |wrote| vouch(&f.bytes, &f.info, &f.out, &[0xE0], wrote);
+        assert!(vouch(Some(later)).is_some());
+        assert!(vouch(None).is_none(), "librqbit's last write unknown");
+        // Written after librqbit's last write: by someone else.
+        let earlier = selection::now_ns() - 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(f.out.join("a"), vec![7u8; PLEN * 3 / 2]).unwrap();
+        assert!(vouch(Some(earlier)).is_none());
+        assert!(vouch(Some(selection::now_ns())).is_some());
+        // Cut short (whatever its modification time).
+        std::fs::write(f.out.join("sub/b"), b"x").unwrap();
+        assert!(vouch(Some(later)).is_none());
+    }
+
+    #[tokio::test]
+    async fn save_writes_no_record_it_cannot_vouch_for() {
+        let f = Fixture::new();
+        let save = |wrote_ns| Save {
+            bitv: f.bitv.clone(),
+            record: f.rec.clone(),
+            bits: vec![0xE0],
+            torrent: f.bytes.clone().into(),
+            info: std::sync::Arc::new(f.info.clone()),
+            output_folder: f.out.clone(),
+            wrote_ns,
+        };
+        save(Some(selection::now_ns())).run().await.unwrap();
+        assert!(f.rec.exists() && f.bitv.exists());
+        assert!(f.admit());
+        std::fs::write(&f.rec, b"stale").unwrap();
+        save(None).run().await.unwrap();
+        assert!(!f.rec.exists(), "an old record is not left behind");
     }
 
     #[test]

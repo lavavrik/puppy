@@ -159,6 +159,13 @@ pub(crate) struct Entry {
     /// librqbit's fetched-bytes counter of the current live session as last seen (a
     /// change means it wrote data).
     pub(crate) last_fetched: u64,
+    /// A time (ns since the epoch) by which every write librqbit made to the torrent's
+    /// files so far was done (`None`: not known yet). A file modified after it was
+    /// changed by someone else: no fast resume ([`fastresume::save`]).
+    pub(crate) wrote_ns: Option<u64>,
+    /// The librqbit torrent (its id) and whether it was complete when `wrote_ns` was
+    /// last moved past its check or completion (librqbit sets file lengths then).
+    pub(crate) writes_seen: Option<(usize, bool)>,
     pub(crate) slot: Slot,
     /// The state last broadcast by the poll task.
     pub(crate) last_state: Option<DownloadState>,
@@ -864,30 +871,40 @@ impl Shared {
         }
     }
 
-    /// Records when librqbit last wrote the data of torrents with chosen files: now, if
-    /// it fetched anything since the last look (it may have written bytes of shared
-    /// pieces into placeholders up to then).
+    /// Records when librqbit last wrote to each torrent's files: now, if it fetched
+    /// anything since the last look, or if the torrent is past its data check or newly
+    /// complete (librqbit sets file lengths then). For torrents with chosen files this
+    /// is also when it may last have written bytes of shared pieces into placeholders.
     pub(crate) fn note_writes(&self) {
         let todo: Vec<_> = self
             .lock()
             .iter()
-            .filter_map(|(&id, e)| match (&e.slot, &e.selected) {
-                (Slot::Managed(h), Some(_)) => Some((id, h.clone())),
+            .filter_map(|(&id, e)| match &e.slot {
+                Slot::Managed(h) => Some((id, h.clone())),
                 _ => None,
             })
             .collect();
         for (id, h) in todo {
-            let fetched = h.stats().live.map_or(0, |l| l.snapshot.fetched_bytes);
+            let stats = h.stats();
+            let fetched = stats.live.as_ref().map_or(0, |l| l.snapshot.fetched_bytes);
+            let checked = !h.with_state(|s| matches!(s, ManagedTorrentState::Initializing(_)));
+            let phase = (h.id(), stats.finished);
+            let now = selection::now_ns();
             let mut map = self.lock();
             let Some(e) = map.get_mut(&id) else {
                 continue;
             };
+            if checked && e.writes_seen != Some(phase) {
+                e.writes_seen = Some(phase);
+                e.wrote_ns = Some(now);
+            }
             if fetched != e.last_fetched {
                 e.last_fetched = fetched;
-                if fetched > 0
-                    && let Some(c) = &mut e.selected
-                {
-                    Arc::make_mut(c).record.last_write_ns = Some(selection::now_ns());
+                if fetched > 0 {
+                    e.wrote_ns = Some(now);
+                    if let Some(c) = &mut e.selected {
+                        Arc::make_mut(c).record.last_write_ns = Some(now);
+                    }
                 }
             }
         }
@@ -1010,26 +1027,51 @@ impl Shared {
     /// Shutdown, once the session has stopped (nothing writes any more): stores the
     /// exact piece map of every torrent librqbit has one of, with the record that
     /// vouches for it (see [`fastresume::save`]), all at once. A torrent without one
-    /// (still checking its data, failed) is checked in full after the restart.
+    /// (still checking its data, failed) is checked in full after the restart. Under the
+    /// ops lock: a download removed meanwhile gets nothing stored again.
     async fn persist_resume(&self) {
+        let _ops = self.ops.lock().await;
         let todo: Vec<_> = self
             .lock()
             .iter()
             .filter_map(|(&id, e)| match (&e.slot, &e.info) {
-                (Slot::Managed(h), Some(info)) => {
-                    Some((id, h.clone(), info.clone(), e.layout.output_folder.clone()))
-                }
+                (Slot::Managed(h), Some(info)) => Some((
+                    id,
+                    h.clone(),
+                    info.clone(),
+                    e.layout.output_folder.clone(),
+                    e.wrote_ns,
+                )),
                 _ => None,
             })
             .collect();
+        let now = selection::now_ns();
         let mut writes = tokio::task::JoinSet::new();
-        for (id, h, info, output) in todo {
+        for (id, h, info, output, wrote_ns) in todo {
             let Some((_, bits)) = self.exact_map(&h) else {
                 continue;
             };
-            let (bitv, record) = (self.bitv_file(&info.info_hash), self.resume_record(id));
+            let Ok(torrent) = h.with_metadata(|m| m.torrent_bytes.clone()) else {
+                continue;
+            };
+            // An incomplete torrent may have written up to the stop (complete ones
+            // write nothing: anything newer than their last write is someone else's).
+            let wrote_ns = if h.stats().finished {
+                wrote_ns
+            } else {
+                Some(now)
+            };
+            let save = fastresume::Save {
+                bitv: self.bitv_file(&info.info_hash),
+                record: self.resume_record(id),
+                bits,
+                torrent,
+                info,
+                output_folder: output,
+                wrote_ns,
+            };
             writes.spawn(async move {
-                if let Err(e) = fastresume::save(bitv, record, bits, info, output).await {
+                if let Err(e) = save.run().await {
                     tracing::warn!(id, "recording the pieces for a fast resume: {e}");
                 }
             });
@@ -1676,6 +1718,8 @@ impl TorrentEngine {
                     choice: FileChoice::All,
                     selected: chosen.clone(),
                     last_fetched: 0,
+                    wrote_ns: None,
+                    writes_seen: None,
                     slot: Slot::Adding,
                     last_state: None,
                     completed_sent,
@@ -1814,6 +1858,8 @@ impl TorrentEngine {
                     choice: FileChoice::All,
                     selected: None,
                     last_fetched: 0,
+                    wrote_ns: None,
+                    writes_seen: None,
                     slot: Slot::Choosing {
                         bytes: bytes.clone(),
                         trackers,
@@ -1907,6 +1953,8 @@ impl TorrentEngine {
                 choice,
                 selected: None,
                 last_fetched: 0,
+                wrote_ns: None,
+                writes_seen: None,
                 slot,
                 last_state: None,
                 completed_sent: false,
@@ -2157,6 +2205,8 @@ impl TorrentEngine {
                 choice: FileChoice::All,
                 selected: None,
                 last_fetched: 0,
+                wrote_ns: None,
+                writes_seen: None,
                 slot: Slot::Attention(AttentionReason::ValidationFailed {
                     detail: TORRENT_MISSING.into(),
                 }),
@@ -3225,6 +3275,8 @@ mod tests {
             choice: FileChoice::All,
             selected: None,
             last_fetched: 0,
+            wrote_ns: None,
+            writes_seen: None,
             slot: Slot::Held,
             last_state: None,
             completed_sent: false,

@@ -433,3 +433,113 @@ async fn removed_while_down_leaves_no_stored_pieces() {
     second.start_session().await.unwrap();
     assert!(!map.exists());
 }
+
+/// Downloads `MULTI` completely (both seeding targets 0: paused at completion) and lets
+/// the engine see the completion.
+async fn download_all(root: &Path, seeder: &Seeder) -> (TorrentEngine, Added) {
+    let first = engine(root, vec![seeder.addr]).await;
+    let added = first
+        .add(
+            1,
+            torrent_req(root, seeder),
+            StartMode::Fresh,
+            AddOptions::default(),
+        )
+        .await
+        .unwrap();
+    wait(&first, 1, "completion", |s| {
+        s.state == DownloadState::Completed
+    })
+    .await;
+    // A few looks of the poll task: the completion is noted.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    (first, added)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_torrent_resumes_without_a_full_check() {
+    let seeder = Seeder::start(MULTI).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (first, added) = download_all(root, &seeder).await;
+    first.shutdown().await;
+    drop(first);
+    assert!(record(root, 1).exists(), "untouched files are vouched for");
+
+    let second = engine(root, Vec::new()).await;
+    restore(&second, 1, torrent_req(root, &seeder), &added).await;
+    let st = checked(&second, 1).await;
+    assert_eq!(st.state, DownloadState::Completed);
+    assert_eq!(st.done_bytes, total());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_cut_short_while_running_is_checked_in_full() {
+    let seeder = Seeder::start(MULTI).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (first, added) = download_all(root, &seeder).await;
+
+    // While the engine runs: a.bin loses its last 16 pieces' worth, its modification
+    // time put back (so only the sizes tell).
+    let a = added.path.join("a.bin");
+    let mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
+    f.set_len((600 * KIB - 16 * PIECE_LENGTH as usize) as u64)
+        .unwrap();
+    f.set_modified(mtime).unwrap();
+    drop(f);
+    first.shutdown().await;
+    drop(first);
+    assert!(
+        !record(root, 1).exists(),
+        "nothing vouches for the cut file"
+    );
+
+    let second = engine(root, Vec::new()).await;
+    restore(&second, 1, torrent_req(root, &seeder), &added).await;
+    // (Its status stays `Completed`: it had stopped seeding, and is not seeded again.)
+    checked(&second, 1).await;
+    let a = file_range(&second, 1, "a.bin").await;
+    let cut = whole_pieces(&(a.end - 16 * PIECE_LENGTH as u64..a.end));
+    assert!(
+        second.piece_bits(1).unwrap()[cut].iter().all(|b| !b),
+        "checked in full: the cut pieces are missing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_rewritten_while_running_is_checked_in_full() {
+    let seeder = Seeder::start(MULTI).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (first, added) = download_all(root, &seeder).await;
+
+    // While the engine runs: a.bin rewritten in place (same size, other bytes).
+    std::fs::write(added.path.join("a.bin"), vec![0u8; 600 * KIB]).unwrap();
+    first.shutdown().await;
+    drop(first);
+    assert!(
+        !record(root, 1).exists(),
+        "changed after the torrent's last write"
+    );
+
+    let second = engine(root, Vec::new()).await;
+    restore(&second, 1, torrent_req(root, &seeder), &added).await;
+    checked(&second, 1).await;
+    let a = whole_pieces(&file_range(&second, 1, "a.bin").await);
+    assert!(second.piece_bits(1).unwrap()[a].iter().all(|b| !b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_during_shutdown_stores_nothing() {
+    let seeder = Seeder::start_with_limit(MULTI, SLOW).await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (first, _, _, _) = download_part(root, &seeder, 1, torrent_req(root, &seeder)).await;
+    let (removed, ()) = tokio::join!(first.remove(1, false), first.shutdown());
+    removed.unwrap();
+    drop(first);
+    assert!(!record(root, 1).exists());
+    assert!(!bitv(root, &seeder.info_hash_hex).exists());
+}
