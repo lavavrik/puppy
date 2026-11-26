@@ -27,6 +27,8 @@ md-5.workspace = true
 suppaftp.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

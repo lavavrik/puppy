@@ -25,6 +25,52 @@ pub struct FtpConfig {
     pub extra_roots: Vec<Vec<u8>>,
 }
 
+/// Which ssh-agent SFTP logins ask to sign (see [`crate::sftp`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SshAgent {
+    /// The agent the most recent client offered (its `SSH_AUTH_SOCK`, sent with its
+    /// `hello`), then this process's own: `SSH_AUTH_SOCK`, and on Windows the OpenSSH
+    /// agent's named pipe and Pageant.
+    #[default]
+    Auto,
+    /// This socket (Unix) or named pipe (Windows) only.
+    Path(PathBuf),
+    /// No agent.
+    Off,
+}
+
+/// SFTP logins and host keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpConfig {
+    pub agent: SshAgent,
+    /// Private keys tried after the agent's, in order (a missing file is skipped; an
+    /// encrypted one cannot be used: its passphrase cannot be asked for).
+    pub identity_files: Vec<PathBuf>,
+    /// `known_hosts` files a server's host key is looked up in (OpenSSH format, hashed
+    /// entries included).
+    pub known_hosts: Vec<PathBuf>,
+    /// puppy's own `known_hosts`, written by `puppy ssh trust` (and looked up too).
+    pub trusted_hosts: Option<PathBuf>,
+}
+
+impl Default for SftpConfig {
+    /// The user's: `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa` and `~/.ssh/known_hosts`.
+    fn default() -> Self {
+        let ssh = dirs::home_dir().map(|h| h.join(".ssh"));
+        let in_ssh = |names: &[&str]| -> Vec<PathBuf> {
+            ssh.iter()
+                .flat_map(|d| names.iter().map(move |n| d.join(n)))
+                .collect()
+        };
+        SftpConfig {
+            agent: SshAgent::Auto,
+            identity_files: in_ssh(&["id_ed25519", "id_ecdsa", "id_rsa"]),
+            known_hosts: in_ssh(&["known_hosts"]),
+            trusted_hosts: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub connections: u16,
@@ -41,10 +87,11 @@ pub struct HttpConfig {
     pub read_timeout_ms: u64,
     /// Upper bound for validating a remote file before resuming it.
     pub validate_timeout_ms: u64,
-    /// HTTP(S) proxy for HTTP(S) downloads. FTP connections never use it.
+    /// HTTP(S) proxy for HTTP(S) downloads. FTP and SFTP connections never use it.
     pub proxy: Option<url::Url>,
     pub default_dir: PathBuf,
     pub ftp: FtpConfig,
+    pub sftp: SftpConfig,
 }
 
 impl Default for HttpConfig {
@@ -65,6 +112,7 @@ impl Default for HttpConfig {
                 .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
                 .unwrap_or_else(|| PathBuf::from("Downloads")),
             ftp: FtpConfig::default(),
+            sftp: SftpConfig::default(),
         }
     }
 }

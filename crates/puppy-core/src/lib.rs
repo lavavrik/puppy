@@ -6,6 +6,7 @@ pub mod ftp;
 pub mod http;
 pub mod limiter;
 pub mod meter;
+pub mod sftp;
 pub mod tls;
 pub mod types;
 

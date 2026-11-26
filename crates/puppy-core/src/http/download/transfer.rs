@@ -217,6 +217,9 @@ async fn run_worker(
     seg: Arc<SegmentShared>,
     single: bool,
 ) -> WorkerExit {
+    if let Some(sftp) = &ctx.sftp {
+        return crate::sftp::worker::run(ctx, sftp, start, seg, single).await;
+    }
     match &ctx.ftp {
         Some(ftp) => crate::ftp::worker::run(ctx, ftp, start, seg, single).await,
         None if single => run_single(ctx, seg).await,
@@ -229,6 +232,12 @@ async fn run_worker(
 async fn pre_check(ctx: &WorkerCtx, c: &PreCheck) -> Option<WorkerExit> {
     let (start, end) = c.window;
     let check = async {
+        if let Some(sftp) = &ctx.sftp {
+            return crate::sftp::validate::spot_check(
+                &sftp.site, c.total, start, end, &c.part, &ctx.cfg,
+            )
+            .await;
+        }
         match &ctx.ftp {
             Some(ftp) => {
                 crate::ftp::validate::spot_check(&ftp.site, c.total, start, end, &c.part, &ctx.cfg)
@@ -314,6 +323,9 @@ async fn transfer(inner: &Arc<Inner>, cancel: &CancellationToken) -> Outcome {
         m.active = 0;
         m.busy = false;
         if let Some(site) = &m.ftp {
+            site.reset();
+        }
+        if let Some(site) = &m.sftp {
             site.reset();
         }
     }
@@ -499,6 +511,10 @@ impl Inner {
             ftp: m.ftp.clone().map(|site| crate::ftp::FtpTarget {
                 site,
                 mdtm: m.v.last_modified.clone(),
+            }),
+            sftp: m.sftp.clone().map(|site| crate::sftp::SftpTarget {
+                site,
+                mtime: m.v.last_modified.clone(),
             }),
         }
     }

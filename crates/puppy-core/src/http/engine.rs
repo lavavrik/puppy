@@ -74,7 +74,7 @@ impl Engine for HttpEngine {
     }
 
     fn accepts(&self, source: &Source) -> bool {
-        matches!(source, Source::Http { url } if matches!(url.scheme(), "http" | "https") || crate::ftp::is_ftp(url))
+        matches!(source, Source::Http { url } if crate::http::is_url_scheme(url.scheme()))
     }
 
     async fn add(
@@ -85,7 +85,9 @@ impl Engine for HttpEngine {
         opts: AddOptions,
     ) -> Result<Added, EngineError> {
         if !self.accepts(&req.source) {
-            return Err(EngineError::Unsupported("not an HTTP(S) or FTP(S) source"));
+            return Err(EngineError::Unsupported(
+                "not an HTTP(S), FTP(S) or SFTP source",
+            ));
         }
         {
             let mut map = self.downloads.lock().unwrap();

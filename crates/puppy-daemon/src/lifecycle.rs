@@ -676,12 +676,23 @@ impl Write for LogFile {
 /// per process; later calls only switch the log file.
 /// Drops every event of the FTP client library, whatever RUST_LOG says (also for one of
 /// its modules): it traces every command it sends, `PASS` with the password included.
+/// Of the SSH libraries (russh, russh-sftp) only warnings and errors pass: their debug
+/// and trace output dumps protocol messages, login ones among them.
 fn not_secret() -> tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
-    tracing_subscriber::filter::filter_fn(|m| !is_secret_target(m.target()))
+    tracing_subscriber::filter::filter_fn(|m| {
+        !is_secret_target(m.target())
+            && !(is_ssh_target(m.target()) && *m.level() > tracing::Level::WARN)
+    })
 }
 
 fn is_secret_target(target: &str) -> bool {
     target == "suppaftp" || target.starts_with("suppaftp::")
+}
+
+fn is_ssh_target(target: &str) -> bool {
+    ["russh", "russh_sftp", "russh_cryptovec", "ssh_key"]
+        .iter()
+        .any(|t| target == *t || target.strip_prefix(t).is_some_and(|r| r.starts_with("::")))
 }
 
 fn init_logging(log_dir: &Path) {
@@ -731,6 +742,12 @@ mod log_filter_tests {
         }
         for t in ["puppy_core::ftp::session", "suppaftpx", "puppy_daemon"] {
             assert!(!super::is_secret_target(t), "{t}");
+        }
+        for t in ["russh", "russh::client::encrypted", "russh_sftp::client"] {
+            assert!(super::is_ssh_target(t), "{t}");
+        }
+        for t in ["russhx", "puppy_core::sftp::auth"] {
+            assert!(!super::is_ssh_target(t), "{t}");
         }
     }
 }

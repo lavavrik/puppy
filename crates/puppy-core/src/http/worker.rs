@@ -98,6 +98,8 @@ pub struct WorkerCtx {
     /// The location is an FTP(S) one: segments go through [`crate::ftp::worker`], and
     /// `client`, `context` and `if_range` are unused.
     pub ftp: Option<crate::ftp::FtpTarget>,
+    /// The location is an SFTP one: segments go through [`crate::sftp::worker`].
+    pub sftp: Option<crate::sftp::SftpTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

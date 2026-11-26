@@ -1,4 +1,4 @@
-//! The engine abstraction implemented by the URL (HTTP(S), FTP(S)) and torrent engines.
+//! The engine abstraction implemented by the URL (HTTP(S), FTP(S), SFTP) and torrent engines.
 
 use crate::types::{
     AddRequest, DownloadId, DownloadState, DownloadStatus, EngineDetail, SeedPolicy, Selection,
@@ -78,6 +78,11 @@ pub enum EngineError {
     /// server refusing TLS where it is required). Not transient.
     #[error("TLS: {0}")]
     Tls(String),
+    /// SSH or SFTP refused the download for good: an unknown or changed host key, a
+    /// failed login, a missing file or a refused permission. The message says what to
+    /// do. Not transient.
+    #[error("{0}")]
+    Ssh(String),
 }
 
 impl EngineError {
@@ -221,6 +226,7 @@ mod tests {
         assert!(!ftp(530).is_transient());
         assert!(!ftp(550).is_transient());
         assert!(!EngineError::Tls("bad certificate".into()).is_transient());
+        assert!(!EngineError::Ssh("SSH: host key unknown".into()).is_transient());
         let e = EngineError::Unavailable("torrent engine unavailable (see daemon log)".into());
         assert!(e.is_transient());
         assert_eq!(e.to_string(), "torrent engine unavailable (see daemon log)");

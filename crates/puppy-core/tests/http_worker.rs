@@ -39,6 +39,7 @@ fn make_ctx(s: &TestServer, file: std::fs::File, if_range: Option<&str>) -> Work
         failover: false,
         got: Default::default(),
         ftp: None,
+        sftp: None,
     }
 }
 

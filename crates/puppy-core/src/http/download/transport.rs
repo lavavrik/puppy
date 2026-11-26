@@ -1,5 +1,5 @@
 //! What depends on a location's protocol: probing it and validating it before a resume
-//! go over HTTP(S) or FTP(S) as its URL says (segments too: see `transfer`). Locations
+//! go over HTTP(S), FTP(S) or SFTP as its URL says (segments too: see `transfer`). Locations
 //! of one download may mix protocols; each is probed and validated on its own.
 
 use super::mirrors::MirrorRt;
@@ -21,6 +21,7 @@ pub(super) struct Remote {
     url: url::Url,
     context: RequestContext,
     ftp: Option<Arc<crate::ftp::Site>>,
+    sftp: Option<Arc<crate::sftp::Site>>,
 }
 
 impl MirrorRt {
@@ -29,13 +30,15 @@ impl MirrorRt {
             url: self.url.clone(),
             context: self.context.clone(),
             ftp: self.ftp.clone(),
+            sftp: self.sftp.clone(),
         }
     }
 }
 
 impl Remote {
+    /// Not HTTP(S): no redirects to re-resolve.
     pub(super) fn is_ftp(&self) -> bool {
-        self.ftp.is_some()
+        self.ftp.is_some() || self.sftp.is_some()
     }
 
     /// Size, range support, validators and name of the file at this location.
@@ -44,6 +47,9 @@ impl Remote {
         client: &reqwest::Client,
         cfg: &HttpConfig,
     ) -> Result<RemoteInfo, EngineError> {
+        if let Some(site) = &self.sftp {
+            return crate::sftp::probe(site, cfg).await;
+        }
         match &self.ftp {
             Some(site) => crate::ftp::probe(site, cfg).await,
             None => {
@@ -63,6 +69,9 @@ impl Remote {
         part: &Path,
         cfg: &HttpConfig,
     ) -> Result<Validation, EngineError> {
+        if let Some(site) = &self.sftp {
+            return crate::sftp::validate::validate_remote(site, state, part, cfg).await;
+        }
         match &self.ftp {
             Some(site) => crate::ftp::validate::validate_remote(site, state, part, cfg).await,
             None => validate_remote(client, &self.context, &self.url, state, part, cfg).await,

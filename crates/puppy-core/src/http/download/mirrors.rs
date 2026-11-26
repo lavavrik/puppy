@@ -112,6 +112,8 @@ pub(super) struct MirrorRt {
     /// The location's FTP side (sessions, what was learned about the server), for an
     /// FTP(S) URL.
     pub ftp: Option<Arc<crate::ftp::Site>>,
+    /// The location's SFTP side (connections, the learned limit), for an SFTP URL.
+    pub sftp: Option<Arc<crate::sftp::Site>>,
     meter: SpeedMeter,
     last_got: u64,
 }
@@ -120,6 +122,7 @@ impl MirrorRt {
     fn new(url: url::Url, primary: bool, context: RequestContext) -> Self {
         MirrorRt {
             ftp: crate::ftp::is_ftp(&url).then(|| crate::ftp::Site::new(&url)),
+            sftp: crate::sftp::is_sftp(&url).then(|| crate::sftp::Site::new(&url)),
             v: Validators::unknown(&url),
             url,
             primary,
@@ -157,6 +160,10 @@ impl MirrorRt {
         self.ftp
             .as_ref()
             .is_some_and(|s| s.at_capacity(self.active))
+            || self
+                .sftp
+                .as_ref()
+                .is_some_and(|s| s.at_capacity(self.active))
     }
 
     /// Usable now (a bench that has run out is lifted).
@@ -277,7 +284,7 @@ pub(super) fn locations(req: &AddRequest) -> Vec<MirrorRt> {
 
 /// The schemes a URL download's locations may have.
 pub(crate) fn is_url_scheme(scheme: &str) -> bool {
-    matches!(scheme, "http" | "https") || crate::ftp::is_ftp_scheme(scheme)
+    crate::http::is_url_scheme(scheme)
 }
 
 /// Applies a sidecar's records (by URL; the sidecar's have no password) to `mirrors`.
