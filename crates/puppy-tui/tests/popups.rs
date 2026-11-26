@@ -242,7 +242,7 @@ fn add_submit_valid_url_emits_cmd() {
 fn invalid_source_inline_error() {
     let (mut a, now) = connected(vec![]);
     a.update(ch('a'), now);
-    typed(&mut a, "ftp://nope/x", now);
+    typed(&mut a, "gopher://nope/x", now);
     a.update(key(KeyCode::Tab), now);
     assert!(a.update(key(KeyCode::Enter), now).is_empty());
     let f = add_form(&a);
@@ -694,7 +694,7 @@ fn parse_source_variants() {
     }
     let missing = t.with_file_name("missing.torrent");
     for bad in [
-        "ftp://x/a",
+        "gopher://x/a",
         "hello",
         "magnet:xt",
         "",

@@ -8,7 +8,7 @@ use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
 use puppy_core::checksum::Checksum;
 use puppy_core::types::{
-    AddRequest, DownloadId, FileChoice, Mirror, RequestContext, SeedPolicy, Source,
+    AddRequest, DownloadId, FileChoice, Mirror, RequestContext, SeedPolicy, Source, masked_url,
 };
 use puppy_proto::{ReplyData, Request};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
@@ -30,7 +30,7 @@ pub struct AddArgs {
     pub headers: Vec<String>,
     pub cookie: Option<String>,
     pub referer: Option<String>,
-    /// `--checksum ALGO=HEX` (one HTTP(S) source only).
+    /// `--checksum ALGO=HEX` (one HTTP(S) or FTP(S) source only).
     pub checksum: Option<String>,
     /// `--files` specs (torrents only): numbers, ranges and globs.
     pub files: Vec<String>,
@@ -42,7 +42,7 @@ pub struct AddArgs {
     pub seed_time: Option<String>,
     /// `-i FILE`: an aria2-style input file (`-`: stdin), added after `sources`.
     pub input_file: Option<PathBuf>,
-    /// `--mirror URL` (repeatable): other locations of the one HTTP(S) source's file.
+    /// `--mirror URL` (repeatable): other locations of the one URL source's file.
     pub mirrors: Vec<String>,
 }
 
@@ -199,6 +199,11 @@ impl Defaults {
             },
             None => self.choice.clone(),
         };
+        // A password in the URL is never echoed back (`added 3 ftp://bob:***@host/f`).
+        let shown = match &source {
+            Source::Http { url } if url.password().is_some() => masked_url(url),
+            _ => shown,
+        };
         Planned {
             shown,
             req: AddRequest {
@@ -273,7 +278,8 @@ fn plan_input_file(
         }
         if !mirrors.is_empty() && !matches!(source, Source::Http { .. }) {
             bad(format!(
-                "TAB-separated mirrors only apply to HTTP(S) downloads, but {uri} is a torrent"
+                "TAB-separated mirrors only apply to HTTP(S) and FTP(S) downloads, but {uri} is \
+                 a torrent"
             ));
             continue;
         }
@@ -287,7 +293,7 @@ fn plan_input_file(
             }
         } else if o.checksum.is_some() {
             bad(format!(
-                "checksum only applies to HTTP(S) downloads, but {uri} is a torrent \
+                "checksum only applies to HTTP(S) and FTP(S) downloads, but {uri} is a torrent \
                  (BitTorrent verifies every piece already)"
             ));
             continue;
@@ -316,13 +322,14 @@ fn plan_input_file(
     }
 }
 
-/// A mirror URL (`--mirror`, a TAB-separated URI): absolute HTTP(S).
+/// A mirror URL (`--mirror`, a TAB-separated URI): absolute HTTP(S) or FTP(S), whatever
+/// the source's protocol.
 fn parse_mirror(s: &str) -> Result<Mirror, String> {
     let s = unquote(s.trim());
     match url::Url::parse(s) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") => Ok(Mirror::new(u)),
+        Ok(u) if matches!(parse_source(s), Ok(Source::Http { .. })) => Ok(Mirror::new(u)),
         Ok(u) => Err(format!(
-            "mirror {s}: only HTTP(S) mirrors are supported, not {}:",
+            "mirror {s}: only HTTP(S) and FTP(S) mirrors are supported, not {}:",
             u.scheme()
         )),
         Err(e) => Err(format!("mirror {s}: not a URL ({e})")),
@@ -530,7 +537,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             .find(|p| !matches!(p.req.source, Source::Http { .. }))
     {
         return Err(CliError::Usage(format!(
-            "--checksum only applies to HTTP(S) downloads, but {} is a torrent \
+            "--checksum only applies to HTTP(S) and FTP(S) downloads, but {} is a torrent \
              (BitTorrent verifies every piece already)",
             p.shown
         )));
@@ -542,7 +549,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             .find(|p| !matches!(p.req.source, Source::Http { .. }))
     {
         return Err(CliError::Usage(format!(
-            "--mirror only applies to HTTP(S) downloads, but {} is a torrent",
+            "--mirror only applies to HTTP(S) and FTP(S) downloads, but {} is a torrent",
             p.shown
         )));
     }

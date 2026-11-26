@@ -1934,7 +1934,7 @@ async fn mirrors_survive_a_daemon_restart() {
 }
 
 #[tokio::test]
-async fn mirrors_with_a_torrent_or_ftp_are_refused() {
+async fn mirrors_with_a_torrent_or_another_scheme_are_refused() {
     let env = Env::new();
     let m = env.manager(3).await;
     let s = server(|_| {}).await;
@@ -1943,9 +1943,11 @@ async fn mirrors_with_a_torrent_or_ftp_are_refused() {
         uri: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
     };
     torrent.mirrors = vec![puppy_core::types::Mirror::new(s.url("/file.bin"))];
-    let mut ftp = env.req(&s, "a.bin");
-    ftp.mirrors = vec![puppy_core::types::Mirror::new("ftp://h/f".parse().unwrap())];
-    for req in [torrent, ftp] {
+    let mut gopher = env.req(&s, "a.bin");
+    gopher.mirrors = vec![puppy_core::types::Mirror::new(
+        "gopher://h/f".parse().unwrap(),
+    )];
+    for req in [torrent, gopher] {
         match m.add(req, false, None).await {
             Err(e @ ManagerError::BadRequest(_)) => {
                 assert!(e.to_string().contains("mirror"), "{e}");

@@ -689,7 +689,11 @@ fn init_logging(log_dir: &Path) {
         Err(e) => eprintln!("puppyd: cannot open log file {}: {e}", path.display()),
     }
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        // The FTP client library traces every command it sends, `PASS` included: never log
+        // it, whatever RUST_LOG says.
+        .add_directive("suppaftp=off".parse().expect("static directive"));
     let file_layer = fmt::layer().with_ansi(false).with_writer(|| LogFile);
     let stderr_layer = io::stderr()
         .is_terminal()

@@ -13,6 +13,11 @@ use puppy_core::types::{
 };
 use puppy_proto::{Event, Settings};
 
+/// The schemes of URL downloads and their mirrors.
+fn is_url_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https") || puppy_core::ftp::is_ftp_scheme(scheme)
+}
+
 type Result<T> = std::result::Result<T, ManagerError>;
 
 fn entry_mut(st: &mut State, id: DownloadId) -> Result<&mut Entry> {
@@ -72,23 +77,19 @@ impl Manager {
         let inner = &self.inner;
         if req.checksum.is_some() && !matches!(req.source, Source::Http { .. }) {
             return Err(ManagerError::BadRequest(
-                "a checksum only applies to HTTP(S) downloads: BitTorrent verifies every \
-                 piece already"
+                "a checksum only applies to HTTP(S) and FTP(S) downloads: BitTorrent \
+                 verifies every piece already"
                     .into(),
             ));
         }
         if !req.mirrors.is_empty() && !matches!(req.source, Source::Http { .. }) {
             return Err(ManagerError::BadRequest(
-                "mirrors only apply to HTTP(S) downloads".into(),
+                "mirrors only apply to HTTP(S) and FTP(S) downloads".into(),
             ));
         }
-        if let Some(m) = req
-            .mirrors
-            .iter()
-            .find(|m| !matches!(m.url.scheme(), "http" | "https"))
-        {
+        if let Some(m) = req.mirrors.iter().find(|m| !is_url_scheme(m.url.scheme())) {
             return Err(ManagerError::BadRequest(format!(
-                "mirror {}: only HTTP(S) mirrors are supported",
+                "mirror {}: only HTTP(S) and FTP(S) mirrors are supported",
                 puppy_core::types::masked_url(&m.url)
             )));
         }

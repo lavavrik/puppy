@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use puppy_core::config::HttpConfig;
+use puppy_core::config::{FtpConfig, FtpTls, HttpConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +131,14 @@ impl Default for NotificationsConfig {
     }
 }
 
+/// FTP settings (`[ftp]`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct FtpSection {
+    /// TLS for `ftp://` URLs: `"try"` (the default), `"require"` or `"off"`.
+    pub tls: FtpTls,
+}
+
 /// Self-update settings (`[update]`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -164,6 +172,7 @@ pub struct Config {
     pub torrent: TorrentConfig,
     pub notifications: NotificationsConfig,
     pub update: UpdateConfig,
+    pub ftp: FtpSection,
     /// First delay before a transiently failed download is retried automatically;
     /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
     /// the file.
@@ -193,6 +202,7 @@ impl Default for Config {
             torrent: TorrentConfig::default(),
             notifications: NotificationsConfig::default(),
             update: UpdateConfig::default(),
+            ftp: FtpSection::default(),
             retry_base: Duration::from_secs(30),
             shutdown_pause_timeout: Duration::from_secs(10),
         }
@@ -236,6 +246,10 @@ impl Config {
             connections: self.connections,
             proxy: self.proxy.clone(),
             default_dir: self.download_dir.clone(),
+            ftp: FtpConfig {
+                tls: self.ftp.tls,
+                ..FtpConfig::default()
+            },
             ..HttpConfig::default()
         }
     }

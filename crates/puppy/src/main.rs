@@ -123,10 +123,10 @@ enum Command {
         #[arg(long)]
         wait: bool,
         /// Check the finished file against this digest, `ALGO=HEX` (`sha-256`,
-        /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S) source only.
+        /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S) or FTP(S) source only.
         #[arg(long, value_name = "ALGO=HEX")]
         checksum: Option<String>,
-        /// Another URL of the same file (repeatable; one HTTP(S) source only):
+        /// Another URL of the same file, HTTP(S) or FTP(S) (repeatable; one URL source only):
         /// connections are spread over the URLs that agree on the file, and fail over
         /// between them. Cookies and headers go to the source's origin only.
         #[arg(long = "mirror", value_name = "URL")]
