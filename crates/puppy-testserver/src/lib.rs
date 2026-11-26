@@ -1,5 +1,6 @@
 //! Configurable axum test server shared by HTTP-engine integration tests.
 
+pub mod ftp;
 pub mod github;
 
 use axum::Router;

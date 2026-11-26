@@ -17,3 +17,4 @@ sha2.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+tokio-rustls.workspace = true
