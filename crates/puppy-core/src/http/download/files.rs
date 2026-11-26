@@ -29,7 +29,7 @@ pub(super) async fn prepare(
     let mut mirrors = locations(req);
     let remotes: Vec<_> = mirrors.iter().map(MirrorRt::remote).collect();
     let probes = futures_util::future::join_all(remotes.iter().map(|r| r.probe(client, cfg))).await;
-    let remote = choose(&mut mirrors, probes)?;
+    let remote = choose(&mut mirrors, probes, req.size)?;
     let dir = req
         .output_dir
         .clone()
@@ -53,14 +53,24 @@ pub(super) async fn prepare(
 /// does (or the size is unknown, so nothing can be compared), one stream goes to the
 /// first and the others are dropped. Without any answer, the primary's error (or, with
 /// mirrors and some transient error among them, a transient one naming them all).
+///
+/// With an `expected` size (a Metalink's), a location reporting another size is dropped
+/// first, so a stale primary cannot outvote the mirrors; if every location that answered
+/// had another size, the download fails (not transiently).
 pub(super) fn choose(
     mirrors: &mut [MirrorRt],
     probes: Vec<Result<RemoteInfo, EngineError>>,
+    expected: Option<u64>,
 ) -> Result<RemoteInfo, EngineError> {
     let mut answered = Vec::new();
     let mut first_err = None;
+    let mut wrong_size = None;
     for (i, probe) in probes.into_iter().enumerate() {
         match probe {
+            Ok(info) if expected.is_some() && info.total.is_some() && info.total != expected => {
+                mirrors[i].drop_with(DropKind::Changed, size_unexpected(info.total, expected));
+                wrong_size.get_or_insert(info.total);
+            }
             Ok(info) => answered.push((i, info)),
             Err(e) => {
                 mirrors[i].drop_with(kind_of(&e), format!("probe failed: {e}"));
@@ -69,7 +79,16 @@ pub(super) fn choose(
         }
     }
     let Some((_, reference)) = answered.first().cloned() else {
-        let e = first_err.expect("one probe per location");
+        let Some(e) = first_err else {
+            // Every location answered, with another size than expected.
+            let got = wrong_size.flatten().unwrap_or_default();
+            let want = expected.unwrap_or_default();
+            return Err(EngineError::Invalid(if mirrors.len() == 1 {
+                format!("the file is {got} bytes, not the expected {want}")
+            } else {
+                summary(mirrors)
+            }));
+        };
         let transient = mirrors.iter().any(|m| {
             matches!(
                 m.health,
@@ -117,6 +136,16 @@ pub(super) fn choose(
         accepts_ranges: ranged || reference.accepts_ranges,
         ..reference
     })
+}
+
+/// Why a location with `got` bytes is not the file of `want` bytes the request expects.
+fn size_unexpected(got: Option<u64>, want: Option<u64>) -> String {
+    let show = |n: Option<u64>| n.map_or("unknown".to_string(), |n| format!("{n} bytes"));
+    format!(
+        "its size ({}) is not the expected {}",
+        show(got),
+        show(want)
+    )
 }
 
 /// Picks a free name and creates its `.part` with `create_new` (retrying if another

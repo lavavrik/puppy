@@ -103,6 +103,7 @@ impl Env {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         }
     }
 

@@ -245,6 +245,7 @@ impl AddForm {
                 seed: None,
                 checksum,
                 mirrors: Vec::new(),
+                size: None,
             },
             start_paused: self.start_paused,
         })

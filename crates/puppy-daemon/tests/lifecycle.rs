@@ -170,6 +170,7 @@ impl Env {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         }
     }
 
@@ -678,6 +679,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;
@@ -706,6 +708,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;

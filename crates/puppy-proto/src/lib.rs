@@ -610,6 +610,7 @@ mod tests {
                     seed: None,
                     checksum: None,
                     mirrors: Vec::new(),
+                    size: None,
                 },
                 start_paused: true,
                 limit: Some(9),

@@ -81,6 +81,7 @@ impl Env {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         }
     }
 }
@@ -481,6 +482,7 @@ async fn unsupported_source_is_bad_request() {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     };
     let err = m.add(req, false, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::BadRequest(_)), "{err:?}");

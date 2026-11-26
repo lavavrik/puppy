@@ -31,6 +31,7 @@ fn request(s: &TestServer, dir: &Path) -> AddRequest {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     }
 }
 

@@ -57,6 +57,7 @@ fn request(primary: &TestServer, mirrors: &[&TestServer], dir: &Path) -> AddRequ
             .iter()
             .map(|s| Mirror::new(s.url("/file.bin")))
             .collect(),
+        size: None,
     }
 }
 
@@ -201,6 +202,67 @@ async fn mirror_with_wrong_size_is_dropped() {
     );
     assert_eq!(b.range_requests(), 0);
     assert_eq!(shown[1].done_bytes, 0);
+}
+
+/// With an expected size (a Metalink's), a primary serving another size is dropped
+/// instead of outvoting the mirror that has the right one.
+#[tokio::test]
+async fn expected_size_drops_a_stale_primary() {
+    let a = server(|c| c.len = LEN + 1).await;
+    let b = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = AddRequest {
+        size: Some(LEN),
+        ..request(&a, &[&b], dir.path())
+    };
+    let (dl, added) = start(req, cfg(dir.path())).await;
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+    let shown = mirrors(&dl);
+    let why = dropped_reason(&shown[0]);
+    assert!(
+        why.contains(&(LEN + 1).to_string()) && why.contains("expected"),
+        "{why}"
+    );
+    assert_eq!(a.range_requests(), 0);
+    assert_eq!(shown[1].done_bytes, LEN);
+}
+
+/// No location serving the expected size fails the add, not transiently.
+#[tokio::test]
+async fn expected_size_nowhere_fails_the_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = cfg(dir.path());
+    let a = server(|_| {}).await;
+    let b = server(|c| c.len = LEN + 2).await;
+    for (req, want) in [
+        (request(&a, &[], dir.path()), "not the expected"),
+        (request(&a, &[&b], dir.path()), "no mirror works"),
+    ] {
+        let req = AddRequest {
+            size: Some(LEN - 1),
+            ..req
+        };
+        let (tx, _) = broadcast::channel(16);
+        let e = HttpDownload::start_fresh(
+            1,
+            req,
+            AddOptions::default(),
+            build_client(&c).unwrap(),
+            c.clone(),
+            TokenBucket::new(None),
+            tx,
+        )
+        .await
+        .err()
+        .expect("no location has the size");
+        assert!(!e.is_transient(), "{e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains(want) && msg.contains(&(LEN - 1).to_string()),
+            "{msg}"
+        );
+    }
 }
 
 /// A mirror without range support is dropped while the ranged locations are used.

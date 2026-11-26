@@ -977,6 +977,7 @@ mod tests {
                 seed: None,
                 checksum: None,
                 mirrors: Vec::new(),
+                size: None,
             },
             limit: None,
             state: crate::store::StoredState::Queued,

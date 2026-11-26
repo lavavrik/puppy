@@ -202,6 +202,7 @@ pub fn to_add_request(m: &AddMsg) -> Result<AddRequest, String> {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     })
 }
 
@@ -285,6 +286,7 @@ mod tests {
                 seed: None,
                 checksum: None,
                 mirrors: Vec::new(),
+                size: None,
             }
         );
     }

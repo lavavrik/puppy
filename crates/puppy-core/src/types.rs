@@ -165,6 +165,12 @@ pub struct AddRequest {
     /// connections over them and fails over between them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrors: Vec<Mirror>,
+    /// The file's size in bytes, when known in advance (a Metalink's `<size>`; URL
+    /// downloads only). A location reporting another size is dropped when the download
+    /// starts, and if every location that answers does, the download fails. One that does
+    /// not report a size is used as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// Which files of a multi-file torrent to download.

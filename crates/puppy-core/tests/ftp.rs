@@ -48,6 +48,7 @@ fn request(url: url::Url, dir: &Path) -> AddRequest {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     }
 }
 

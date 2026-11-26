@@ -386,6 +386,7 @@ mod tests {
                     seed: None,
                     checksum: None,
                     mirrors: Vec::new(),
+                    size: None,
                 },
                 limit: Some(5),
                 state: StoredState::Failed {

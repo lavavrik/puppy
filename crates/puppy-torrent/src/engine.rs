@@ -3222,6 +3222,7 @@ mod tests {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         };
         engine
             .add(1, req, StartMode::Fresh, AddOptions::default())

@@ -780,6 +780,7 @@ impl Inner {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         };
         let mirrors = mirrors::locations(&req);
         env.build(

@@ -52,6 +52,7 @@ fn torrent_req(root: &Path, seeder: &Seeder, seed: Option<SeedPolicy>) -> AddReq
         seed,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     }
 }
 
@@ -419,6 +420,7 @@ fn choosing_req(root: &Path) -> AddRequest {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     }
 }
 

@@ -185,6 +185,7 @@ mod tests {
                 seed: None,
                 checksum: None,
                 mirrors: Vec::new(),
+                size: None,
             },
             context_hash: context_hash(&RequestContext::default()),
             final_url: url,
@@ -328,6 +329,7 @@ mod tests {
             },
             checksum: None,
             mirrors: Vec::new(),
+            size: None,
         };
         let s = without_context(&req);
         assert_eq!(s.context, RequestContext::default());
@@ -349,6 +351,7 @@ mod tests {
             context: RequestContext::default(),
             checksum: None,
             mirrors: vec![Mirror::new(u("https://amy:SECRET2@mirror.example/a"))],
+            size: None,
         };
         let s = serde_json::to_string(&without_context(&req)).unwrap();
         assert!(!s.contains("SECRET"), "{s}");

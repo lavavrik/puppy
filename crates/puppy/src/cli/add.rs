@@ -218,6 +218,7 @@ impl Defaults {
                     .into_iter()
                     .chain(self.mirrors.iter().cloned())
                     .collect(),
+                size: None,
             },
             paused: o.pause.unwrap_or(self.paused),
             limit: o.limit.unwrap_or(self.limit),

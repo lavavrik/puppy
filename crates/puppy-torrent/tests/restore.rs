@@ -49,6 +49,7 @@ fn req(root: &Path, source: Source) -> AddRequest {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        size: None,
     }
 }
 
