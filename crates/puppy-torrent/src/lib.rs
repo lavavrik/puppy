@@ -2,6 +2,7 @@
 //! librqbit type appears in this crate's public API.
 
 mod engine;
+mod fastresume;
 mod map;
 mod poll;
 mod seeding;
