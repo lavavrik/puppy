@@ -47,7 +47,9 @@ fn wait_for(env: &Env, id: u64, pred: impl Fn(&serde_json::Value) -> bool) -> se
 async fn input_file_ftp_lines_and_a_private_password() {
     let mut env = Env::new();
     // The FTP library traces every command (PASS too): even asked for, it is not logged.
-    env.extra.push(("RUST_LOG", "info,suppaftp=trace".into()));
+    // A module's target is more specific than any blanket rule: not logged either.
+    env.extra
+        .push(("RUST_LOG", "info,suppaftp::async_ftp=trace".into()));
     let s = FtpServer::start(FtpCfg {
         login: Some(("bob".into(), SECRET.into())),
         ..FtpCfg::default()
@@ -140,6 +142,8 @@ async fn input_file_ftp_lines_and_a_private_password() {
     let log = std::fs::read_to_string(env.paths().log_dir.join("puppyd.log")).unwrap();
     assert!(!log.contains(SECRET), "{log}");
     assert!(!log.contains("PASS"), "{log}");
+    // The log was being written all along.
+    assert!(log.contains("does not offer TLS"), "{log}");
     // Only the private state file has it.
     let state = std::fs::read_to_string(env.paths().state_file).unwrap();
     assert!(state.contains(SECRET));
@@ -152,4 +156,19 @@ async fn input_file_ftp_lines_and_a_private_password() {
             .mode();
         assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
+}
+
+/// A mirror refused for its scheme is named without its password.
+#[test]
+fn a_refused_mirror_is_shown_without_its_password() {
+    let env = Env::new();
+    let (status, out, err) = env.run(&[
+        "add",
+        "--mirror",
+        &format!("gopher://amy:{SECRET}@h/f"),
+        "http://127.0.0.1:9/a",
+    ]);
+    assert_eq!(status.code(), Some(2), "{out}\n{err}");
+    assert!(!err.contains(SECRET) && !out.contains(SECRET), "{err}");
+    assert!(err.contains("gopher://amy:***@h/f"), "{err}");
 }

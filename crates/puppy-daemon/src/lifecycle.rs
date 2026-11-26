@@ -674,6 +674,16 @@ impl Write for LogFile {
 /// Logs to `log_dir/puppyd.log` (appending) and to stderr when it is a terminal,
 /// filtered by `RUST_LOG` (default `info`). The global subscriber is installed once
 /// per process; later calls only switch the log file.
+/// Drops every event of the FTP client library, whatever RUST_LOG says (also for one of
+/// its modules): it traces every command it sends, `PASS` with the password included.
+fn not_secret() -> tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
+    tracing_subscriber::filter::filter_fn(|m| !is_secret_target(m.target()))
+}
+
+fn is_secret_target(target: &str) -> bool {
+    target == "suppaftp" || target.starts_with("suppaftp::")
+}
+
 fn init_logging(log_dir: &Path) {
     use std::io::IsTerminal;
     use tracing_subscriber::prelude::*;
@@ -689,15 +699,16 @@ fn init_logging(log_dir: &Path) {
         Err(e) => eprintln!("puppyd: cannot open log file {}: {e}", path.display()),
     }
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"))
-        // The FTP client library traces every command it sends, `PASS` included: never log
-        // it, whatever RUST_LOG says.
-        .add_directive("suppaftp=off".parse().expect("static directive"));
-    let file_layer = fmt::layer().with_ansi(false).with_writer(|| LogFile);
-    let stderr_layer = io::stderr()
-        .is_terminal()
-        .then(|| fmt::layer().with_writer(io::stderr));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let file_layer = fmt::layer()
+        .with_ansi(false)
+        .with_writer(|| LogFile)
+        .with_filter(not_secret());
+    let stderr_layer = io::stderr().is_terminal().then(|| {
+        fmt::layer()
+            .with_writer(io::stderr)
+            .with_filter(not_secret())
+    });
     // Fails if a subscriber is already set (an earlier daemon in this process, or the
     // embedding program's own): keep that one.
     let _ = tracing_subscriber::registry()
@@ -705,4 +716,21 @@ fn init_logging(log_dir: &Path) {
         .with(file_layer)
         .with(stderr_layer)
         .try_init();
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    #[test]
+    fn ftp_library_targets_are_never_logged() {
+        for t in [
+            "suppaftp",
+            "suppaftp::async_ftp",
+            "suppaftp::async_ftp::tokio_ftp::control",
+        ] {
+            assert!(super::is_secret_target(t), "{t}");
+        }
+        for t in ["puppy_core::ftp::session", "suppaftpx", "puppy_daemon"] {
+            assert!(!super::is_secret_target(t), "{t}");
+        }
+    }
 }

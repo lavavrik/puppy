@@ -329,7 +329,8 @@ fn parse_mirror(s: &str) -> Result<Mirror, String> {
     match url::Url::parse(s) {
         Ok(u) if matches!(parse_source(s), Ok(Source::Http { .. })) => Ok(Mirror::new(u)),
         Ok(u) => Err(format!(
-            "mirror {s}: only HTTP(S) and FTP(S) mirrors are supported, not {}:",
+            "mirror {}: only HTTP(S) and FTP(S) mirrors are supported, not {}:",
+            masked_url(&u),
             u.scheme()
         )),
         Err(e) => Err(format!("mirror {s}: not a URL ({e})")),

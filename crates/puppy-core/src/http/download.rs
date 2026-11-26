@@ -720,7 +720,11 @@ impl Inner {
                 return Ok(false);
             }
         }
-        tracing::info!(id = self.id, url = %info.final_url, "re-resolved the download URL");
+        tracing::info!(
+            id = self.id,
+            url = %crate::types::masked_url(&info.final_url),
+            "re-resolved the download URL"
+        );
         self.lock().mirrors[i].v.final_url = info.final_url;
         if persist && let Err(e) = self.write_sidecar().await {
             // The old sidecar only makes a restore re-resolve again.
