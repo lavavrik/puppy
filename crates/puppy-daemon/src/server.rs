@@ -372,7 +372,7 @@ fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(Se
                 ..
             } => {
                 if let Some(sock) = ssh_auth_sock {
-                    // SFTP logins use the agent of the most recent client first.
+                    // SFTP logins try the agents of recent clients (the most recent first).
                     puppy_core::sftp::offer_agent(&sock);
                 }
                 (

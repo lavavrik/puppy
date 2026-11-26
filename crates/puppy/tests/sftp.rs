@@ -313,3 +313,51 @@ async fn trust_refuses_a_new_key_type_without_replace_type() {
     let (status, _, err) = env.run(&["ssh", "trust", "--yes", "*.example,127.0.0.1"]);
     assert_eq!(status.code(), Some(2), "{err}");
 }
+
+/// A later client offering another agent (a dashboard opened over SSH with a
+/// forwarded, empty agent) does not break a download's logins: the agent it was added
+/// with comes first, and an agent without keys is passed over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_clients_empty_agent_does_not_take_over() {
+    let env = env(None);
+    let s = SftpServer::start(SftpCfg {
+        authorized: vec!["agent_ed25519"],
+        ..SftpCfg::default()
+    })
+    .await;
+    s.set_file("/f", data(50 * KIB, 5), MTIME);
+    trust(&env, &s);
+    let pid = std::process::id();
+    let good = std::path::PathBuf::from(format!("/tmp/pz-{pid}-good.sock"));
+    let empty = std::path::PathBuf::from(format!("/tmp/pz-{pid}-empty.sock"));
+    for p in [&good, &empty] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _g = start_agent(&good, &["agent_ed25519"]).await;
+    let _e = start_agent(&empty, &[]).await;
+    let dl = env.dl_dir();
+    let url = s.url("/f").to_string();
+    let (status, out, err) = run_with(
+        &env,
+        &["add", "--paused", "-o", dl.to_str().unwrap(), &url],
+        &[("SSH_AUTH_SOCK", good.to_str().unwrap())],
+    );
+    assert!(status.success(), "{out}\n{err}");
+    // The most recent client offers the empty agent and resumes it.
+    let (status, out, err) = run_with(
+        &env,
+        &["resume", "1"],
+        &[("SSH_AUTH_SOCK", empty.to_str().unwrap())],
+    );
+    assert!(status.success(), "{out}\n{err}");
+    let (status, out, err) = run_with(
+        &env,
+        &["wait", "1"],
+        &[("SSH_AUTH_SOCK", empty.to_str().unwrap())],
+    );
+    for p in [&good, &empty] {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(status.success(), "{out}\n{err}");
+    assert_eq!(std::fs::read(dl.join("f")).unwrap(), data(50 * KIB, 5));
+}

@@ -153,13 +153,23 @@ impl Drop for Unregister<'_> {
     }
 }
 
-/// This process's ssh-agent (`SSH_AUTH_SOCK`), offered to the daemon with `hello`: a
-/// daemon started elsewhere (a login service) can then use the agent of the session
-/// its downloads are added from.
-fn ssh_auth_sock() -> Option<String> {
+/// This process's ssh-agent (`SSH_AUTH_SOCK`), offered to the daemon with `hello` (a
+/// daemon started elsewhere, as a login service, can then use the agent of the session
+/// its downloads are added from) and given with an SFTP download it adds
+/// ([`with_ssh_agent`]).
+pub fn ssh_auth_sock() -> Option<String> {
     std::env::var("SSH_AUTH_SOCK")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// `req` with this process's ssh-agent as the one its SFTP logins try first, if it
+/// downloads anything over SFTP.
+pub fn with_ssh_agent(mut req: puppy_core::types::AddRequest) -> puppy_core::types::AddRequest {
+    if puppy_core::sftp::uses_sftp(&req) {
+        req.context.ssh_agent = ssh_auth_sock();
+    }
+    req
 }
 
 impl Client {

@@ -68,32 +68,50 @@ async fn connect_agent_at(_path: &Path) -> Option<Agent> {
     None
 }
 
-/// The agent to use, if one answers.
-async fn connect_agent(cfg: &SshAgent) -> Option<Agent> {
+/// The agents to try, in order: for [`SshAgent::Auto`] the one of the client that
+/// added the download, those other clients offered (the most recent first), then this
+/// process's own (`SSH_AUTH_SOCK`; on Windows the OpenSSH agent's pipe, then Pageant).
+fn agent_candidates(cfg: &SshAgent, ep: &Endpoint) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
     match cfg {
-        SshAgent::Off => None,
-        SshAgent::Path(p) => connect_agent_at(p).await,
+        SshAgent::Off => {}
+        SshAgent::Path(p) => out.push(p.clone()),
         SshAgent::Auto => {
-            let mut candidates: Vec<PathBuf> = super::offered_agent().into_iter().collect();
-            candidates.extend(
+            out.extend(ep.agent.clone());
+            out.extend(super::offered_agents());
+            out.extend(
                 std::env::var_os("SSH_AUTH_SOCK")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from),
             );
             #[cfg(windows)]
-            candidates.push(PathBuf::from(r"\\.\pipe\openssh-ssh-agent"));
-            for c in candidates {
-                if let Some(a) = connect_agent_at(&c).await {
-                    return Some(a);
-                }
-            }
-            #[cfg(windows)]
-            if let Ok(a) = AgentClient::connect_pageant().await {
-                return Some(a.dynamic());
-            }
-            None
+            out.push(PathBuf::from(r"\\.\pipe\openssh-ssh-agent"));
         }
     }
+    let mut seen = Vec::new();
+    out.retain(|p| {
+        let new = !seen.contains(p);
+        seen.push(p.clone());
+        new
+    });
+    out
+}
+
+/// The agents that answer, in [`agent_candidates`] order.
+async fn agents(cfg: &SshAgent, ep: &Endpoint) -> Vec<(String, Agent)> {
+    let mut out = Vec::new();
+    for c in agent_candidates(cfg, ep) {
+        if let Some(a) = connect_agent_at(&c).await {
+            out.push((c.display().to_string(), a));
+        }
+    }
+    #[cfg(windows)]
+    if matches!(cfg, SshAgent::Auto)
+        && let Ok(a) = AgentClient::connect_pageant().await
+    {
+        out.push(("Pageant".to_string(), a.dynamic()));
+    }
+    out
 }
 
 /// What a login attempt learned.
@@ -170,9 +188,17 @@ pub(super) async fn login(
     }
     let mut offered: Vec<PublicKey> = Vec::new();
 
-    if a.allows(MethodKind::PublicKey)
-        && let Some(mut agent) = connect_agent(&cfg.agent).await
-    {
+    // Each agent that answers, until one of its keys gets in: one that is gone or has
+    // no keys (a stale or empty forwarded agent) is passed over.
+    let candidates = if a.allows(MethodKind::PublicKey) {
+        agents(&cfg.agent, ep).await
+    } else {
+        Vec::new()
+    };
+    for (name, mut agent) in candidates {
+        if !a.allows(MethodKind::PublicKey) {
+            break;
+        }
         if let Some(binding) = h.agent_session_binding() {
             // Older agents do not know the extension: fine.
             let _ = timed(read, agent.bind_session(binding, false)).await;
@@ -181,11 +207,20 @@ pub(super) async fn login(
             Ok(Ok(ids)) => ids,
             _ => Vec::new(),
         };
-        a.tried.push(format!("ssh-agent ({} key(s))", ids.len()));
-        for id in ids {
-            let AgentIdentity::PublicKey { key, .. } = id else {
-                continue;
-            };
+        tracing::debug!(agent = %name, "ssh-agent with {} key(s)", ids.len());
+        let keys: Vec<PublicKey> = ids
+            .into_iter()
+            .filter_map(|id| match id {
+                AgentIdentity::PublicKey { key, .. } => Some(key),
+                _ => None,
+            })
+            .filter(|k| !offered.iter().any(|o| o.key_data() == k.key_data()))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        a.tried.push(format!("ssh-agent ({} key(s))", keys.len()));
+        for key in keys {
             if !a.allows(MethodKind::PublicKey) {
                 break;
             }

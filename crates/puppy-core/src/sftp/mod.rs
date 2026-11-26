@@ -54,21 +54,39 @@ pub fn is_sftp(url: &url::Url) -> bool {
     is_sftp_scheme(url.scheme())
 }
 
-/// The agent socket the most recent client offered (its `SSH_AUTH_SOCK`): used by
-/// [`crate::config::SshAgent::Auto`] before this process's own.
-static OFFERED_AGENT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Whether the download goes (also) over SFTP: its source or a mirror.
+pub fn uses_sftp(req: &crate::types::AddRequest) -> bool {
+    matches!(&req.source, crate::types::Source::Http { url } if is_sftp(url))
+        || req.mirrors.iter().any(|m| is_sftp(&m.url))
+}
+
+/// How many agent sockets offered by clients are remembered.
+const OFFERED_KEPT: usize = 4;
+
+/// The agent sockets clients offered (their `SSH_AUTH_SOCK`), the most recent first:
+/// tried by [`crate::config::SshAgent::Auto`] after the agent of the client that added
+/// the download and before this process's own.
+static OFFERED_AGENTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// An agent socket path worth trying: absolute (or a Windows pipe name).
+fn agent_path(sock: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(sock);
+    (!sock.is_empty() && (path.is_absolute() || sock.starts_with(r"\\.\pipe\"))).then_some(path)
+}
 
 /// Records the agent socket a client offered (an empty or relative path is ignored).
 pub fn offer_agent(sock: &str) {
-    let path = PathBuf::from(sock);
-    if sock.is_empty() || !(path.is_absolute() || sock.starts_with(r"\\.\pipe\")) {
+    let Some(path) = agent_path(sock) else {
         return;
-    }
-    *OFFERED_AGENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    };
+    let mut kept = OFFERED_AGENTS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.retain(|p| *p != path);
+    kept.insert(0, path);
+    kept.truncate(OFFERED_KEPT);
 }
 
-fn offered_agent() -> Option<PathBuf> {
-    OFFERED_AGENT
+fn offered_agents() -> Vec<PathBuf> {
+    OFFERED_AGENTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -86,6 +104,8 @@ pub(crate) struct Endpoint {
     /// The URL's user name, if any (else the local one).
     pub user: Option<String>,
     pub pass: Option<String>,
+    /// The agent of the client that added the download, tried first.
+    pub agent: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -95,6 +115,7 @@ impl std::fmt::Debug for Endpoint {
             .field("port", &self.port)
             .field("path", &self.path)
             .field("user", &self.user)
+            .field("agent", &self.agent)
             .finish_non_exhaustive()
     }
 }
@@ -133,6 +154,7 @@ impl Endpoint {
             path,
             user,
             pass,
+            agent: None,
         })
     }
 
@@ -225,10 +247,15 @@ impl Drop for Pending<'_> {
 }
 
 impl Site {
-    pub fn new(url: &url::Url) -> Arc<Site> {
+    /// `agent`: the socket of the agent of the client that added the download.
+    pub fn new(url: &url::Url, agent: Option<&str>) -> Arc<Site> {
+        let ep = Endpoint::parse(url).map(|mut ep| {
+            ep.agent = agent.and_then(agent_path);
+            ep
+        });
         Arc::new(Site {
             url: url.clone(),
-            ep: Endpoint::parse(url),
+            ep,
             st: Mutex::new(SiteState::default()),
             freed: Notify::new(),
         })
@@ -430,9 +457,18 @@ mod tests {
     }
 
     #[test]
-    fn offered_agents_must_be_absolute() {
+    fn offered_agents_most_recent_first() {
         offer_agent("relative/sock");
         offer_agent("");
-        assert!(offered_agent().is_none_or(|p| p.is_absolute()));
+        for s in [
+            "/a.sock", "/b.sock", "/c.sock", "/d.sock", "/e.sock", "/c.sock",
+        ] {
+            offer_agent(s);
+        }
+        let kept = offered_agents();
+        assert_eq!(kept.len(), OFFERED_KEPT);
+        assert_eq!(kept[0], PathBuf::from("/c.sock"));
+        assert_eq!(kept[1], PathBuf::from("/e.sock"));
+        assert!(kept.iter().all(|p| p.is_absolute()));
     }
 }

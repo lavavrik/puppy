@@ -634,9 +634,15 @@ are refused. A password is sent only to the host in its own URL, never to a
 mirror's.
 
 **The agent and the daemon.** The daemon signs logins with an agent, so it
-needs to reach one. Every `puppy` command and the dashboard tell the daemon
-their own `SSH_AUTH_SOCK` when they connect, and the daemon uses the agent of
-the most recent one first, then the one in its own environment. A daemon that
+needs to reach one. An SFTP download added with `puppy add` or the dashboard
+remembers the `SSH_AUTH_SOCK` of the command that added it. Every `puppy`
+command and the dashboard also tell the daemon their `SSH_AUTH_SOCK` when they
+connect, and the daemon keeps the last four. A login tries, in order, the
+download's own agent, those of the clients (the most recent first), then the
+one in the daemon's environment, passing over any that is gone or holds no
+keys; so a dashboard opened over SSH with a forwarded agent does not take over
+the logins of downloads added from your desktop, though its agent may be tried
+after theirs. A daemon that
 `puppy` starts on demand has your shell's agent either way. One that runs as a
 login service (see [docs/service.md](docs/service.md)) starts without it and
 picks it up from the first command you run; a download it resumes after a

@@ -768,3 +768,41 @@ async fn a_host_offering_only_an_unknown_key_type_is_refused() {
         "{verdict:?}"
     );
 }
+
+/// With `SshAgent::Auto` the agent of the client that added the download comes first,
+/// then the agents clients offered; one that is gone or holds no keys is passed over.
+#[cfg(unix)]
+#[tokio::test]
+async fn agents_without_keys_or_gone_are_passed_over() {
+    let fx = Fx::new(|c| c.authorized = vec!["agent_ed25519"]).await;
+    fx.s.set_file("/f", data(64 * KIB, 21), MTIME);
+    let empty = fx.path().join("empty.sock");
+    let good = fx.path().join("good.sock");
+    let _e = puppy_testserver::sftp::start_agent(&empty, &[]).await;
+    let _g = puppy_testserver::sftp::start_agent(&good, &["agent_ed25519"]).await;
+    puppy_core::sftp::offer_agent(good.to_str().unwrap());
+    puppy_core::sftp::offer_agent(fx.path().join("gone.sock").to_str().unwrap());
+    let cfg = fx.cfg_with(|c| {
+        c.sftp.agent = SshAgent::Auto;
+        c.sftp.identity_files = Vec::new();
+    });
+    let mut req = fx.request(fx.s.url("/f"));
+    // The adding client's agent: reachable, but without keys.
+    req.context.ssh_agent = Some(empty.to_str().unwrap().into());
+    let e = HttpEngine::new(cfg).unwrap();
+    e.add(1, req, StartMode::Fresh, AddOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(completed(&e, 1).await).unwrap(),
+        data(64 * KIB, 21)
+    );
+    let logins = fx.s.logins();
+    assert!(!logins.is_empty());
+    assert!(
+        logins
+            .iter()
+            .all(|l| l == "publickey:puppy-test-agent_ed25519"),
+        "{logins:?}"
+    );
+}

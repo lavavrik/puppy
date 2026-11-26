@@ -438,6 +438,7 @@ fn secret_context() -> RequestContext {
         ],
         referer: Some("https://example.com/page".into()),
         user_agent: Some("TestAgent/1".into()),
+        ssh_agent: None,
     }
 }
 

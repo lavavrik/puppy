@@ -153,7 +153,8 @@ impl DaemonApi for ClientApi {
                 request,
                 start_paused,
             } => Request::Add {
-                request,
+                // SFTP logins try this terminal's agent first.
+                request: puppy_client::with_ssh_agent(request),
                 start_paused,
                 limit: None,
             },

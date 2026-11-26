@@ -28,9 +28,10 @@ pub struct FtpConfig {
 /// Which ssh-agent SFTP logins ask to sign (see [`crate::sftp`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SshAgent {
-    /// The agent the most recent client offered (its `SSH_AUTH_SOCK`, sent with its
-    /// `hello`), then this process's own: `SSH_AUTH_SOCK`, and on Windows the OpenSSH
-    /// agent's named pipe and Pageant.
+    /// The agent of the client that added the download (`RequestContext::ssh_agent`),
+    /// those clients offered with their `hello` (the most recent first, a few kept),
+    /// then this process's own: `SSH_AUTH_SOCK`, and on Windows the OpenSSH agent's
+    /// named pipe and Pageant. An agent that is gone or holds no keys is passed over.
     #[default]
     Auto,
     /// This socket (Unix) or named pipe (Windows) only.

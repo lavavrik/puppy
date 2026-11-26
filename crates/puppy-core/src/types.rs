@@ -27,6 +27,11 @@ pub struct RequestContext {
     pub referer: Option<String>,
     pub user_agent: Option<String>,
     pub basic_auth: Option<(String, Option<String>)>,
+    /// The ssh-agent of the client that added an SFTP download (its `SSH_AUTH_SOCK`):
+    /// tried first for its logins. Not a secret (the agent signs only for its owner),
+    /// so it goes to every location of the download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_agent: Option<String>,
 }
 
 impl RequestContext {
@@ -51,6 +56,7 @@ impl RequestContext {
             referer: self.referer.clone(),
             user_agent: self.user_agent.clone(),
             basic_auth: None,
+            ssh_agent: self.ssh_agent.clone(),
         }
     }
 
@@ -64,6 +70,7 @@ impl RequestContext {
         }
         RequestContext {
             user_agent: self.user_agent.clone(),
+            ssh_agent: self.ssh_agent.clone(),
             ..RequestContext::default()
         }
     }
@@ -131,6 +138,7 @@ impl std::fmt::Debug for RequestContext {
             .field("referer", &self.referer)
             .field("user_agent", &self.user_agent)
             .field("basic_auth", &basic_auth)
+            .field("ssh_agent", &self.ssh_agent)
             .finish()
     }
 }
@@ -360,6 +368,7 @@ mod tests {
             referer: Some("https://example.com/p".into()),
             user_agent: Some("UA/1".into()),
             basic_auth: Some(("alice".into(), Some("pw".into()))),
+            ssh_agent: Some("/run/agent.sock".into()),
         };
         let u = |s: &str| url::Url::parse(s).unwrap();
         let orig = u("https://a.example/f");
@@ -375,6 +384,8 @@ mod tests {
             assert_eq!(t.basic_auth, None);
             assert_eq!(t.referer, c.referer);
             assert_eq!(t.user_agent, c.user_agent);
+            assert_eq!(t.ssh_agent, c.ssh_agent);
+            assert_eq!(c.for_mirror(&orig, &u(other)).ssh_agent, c.ssh_agent);
         }
     }
 
@@ -386,6 +397,7 @@ mod tests {
             referer: Some("https://example.com/p".into()),
             user_agent: Some("UA/1".into()),
             basic_auth: Some(("alice".into(), Some("PWSECRET".into()))),
+            ssh_agent: None,
         };
         let s = format!("{c:?}");
         for secret in ["HDRSECRET", "COOKIESECRET", "PWSECRET"] {

@@ -577,6 +577,8 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             let verify = req.checksum.is_some();
             let mirrored = !req.mirrors.is_empty();
             let name = req.filename.clone();
+            // SFTP logins try this shell's agent first.
+            let req = puppy_client::with_ssh_agent(req);
             let result = match client.add(req, paused, limit).await {
                 Ok(id) if verify || mirrored => {
                     check_kept(&client, id, &shown, (verify, mirrored)).await

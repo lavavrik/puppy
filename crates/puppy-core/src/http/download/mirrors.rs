@@ -122,7 +122,8 @@ impl MirrorRt {
     fn new(url: url::Url, primary: bool, context: RequestContext) -> Self {
         MirrorRt {
             ftp: crate::ftp::is_ftp(&url).then(|| crate::ftp::Site::new(&url)),
-            sftp: crate::sftp::is_sftp(&url).then(|| crate::sftp::Site::new(&url)),
+            sftp: crate::sftp::is_sftp(&url)
+                .then(|| crate::sftp::Site::new(&url, context.ssh_agent.as_deref())),
             v: Validators::unknown(&url),
             url,
             primary,
