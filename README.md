@@ -1,8 +1,8 @@
 # puppy
 
 A modern terminal download manager written in Rust, meant as a fresh successor
-to [aria2](https://aria2.github.io/). It downloads over HTTP(S), FTP(S) and
-BitTorrent (magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
+to [aria2](https://aria2.github.io/). It downloads over HTTP(S), FTP(S), SFTP
+and BitTorrent (magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
 owns every download and the queue, so downloads keep going when no client is
 open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
@@ -22,6 +22,10 @@ Early development (v0.1.1). What works today:
   (implicit TLS) and `ftpes://` (explicit TLS) URLs, with `REST` resume,
   passive mode, TLS tried by default, and the same guarantee: a file whose
   size or modification time changed is never continued. See [FTP](#ftp).
+- **SFTP**: the same segmented downloads over `sftp://` URLs, several SSH
+  connections at once, logging in with ssh-agent, key files or a password in
+  the URL, and host keys checked against `known_hosts` (`puppy ssh trust` to
+  add one). See [SFTP](#sftp).
 - **Daemon**: a single instance per user owns the queue (3 active at a time by
   default), with atomically persisted state, a versioned JSON protocol,
   graceful shutdown, and an idle exit when started on demand.
@@ -214,6 +218,8 @@ terminal), go to stderr.
 ```sh
 puppy add https://example.com/a.iso         # add a URL, magnet link or .torrent path
 puppy add ftp://ftp.example.org/pub/a.iso   # FTP (anonymous); ftps:// and ftpes:// for FTPS
+puppy add sftp://me@host.example/srv/a.iso  # SFTP (ssh-agent or ~/.ssh keys)
+puppy ssh trust host.example:2222           # show an SSH host's key and trust it
 puppy add -o ~/isos --limit 2M URL1 URL2    # into a folder, at most 2 MiB/s each
 puppy add --name b.iso --paused URL         # under another name, without starting
 puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
@@ -315,7 +321,7 @@ files` on a download that is not a torrent, or one that already completed
 `add --checksum ALGO=HEX` checks the finished file against a digest:
 `md5`, `sha-1`, `sha-224`, `sha-256`, `sha-384` or `sha-512` (written as
 aria2 and Metalink do, `sha-256=…`; `sha256=…` works too; algorithm and hex
-digits in any case). It needs exactly one HTTP(S) or FTP(S) source (also on stdin):
+digits in any case). It needs exactly one HTTP(S), FTP(S) or SFTP source (also on stdin):
 torrents are refused, since BitTorrent already checks every piece. A
 malformed digest, an unknown algorithm or a wrong number of hex digits is a
 usage error (exit 2). The dashboard's add form (`a`) has an optional
@@ -368,7 +374,7 @@ https://example.com/b.iso
 |--------|---------|
 | `dir` | the folder, as `-o`; a relative one is relative to the current directory |
 | `out` | the file name, as `--name` (a name only: put folders in `dir`) |
-| `checksum` | `ALGO=HEX`, as `--checksum` (HTTP(S) and FTP(S) only) |
+| `checksum` | `ALGO=HEX`, as `--checksum` (HTTP(S), FTP(S) and SFTP only) |
 | `header` | `Name: value`, as `-H` (repeatable) |
 | `referer` | as `--referer` |
 | `user-agent` | the `User-Agent` header |
@@ -380,8 +386,8 @@ https://example.com/b.iso
 
 A URI line may hold several URIs of the same file separated by TABs, as in
 aria2: the first is the download's source and the others are its mirrors, as
-with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an HTTP(S) or
-FTP(S) URL and the first URI one of these too; anything else is a usage error
+with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an HTTP(S),
+FTP(S) or SFTP URL and the first URI one of these too; anything else is a usage error
 for that line. `--mirror` on the command line adds its URLs after the
 line's own.
 
@@ -390,7 +396,7 @@ and an entry's options override them: `-o`, `--limit`, `--paused`, `--files`,
 `--seed-ratio`/`--seed-time` and `--referer` are replaced, and an entry's
 `header` replaces a `-H` of the same name and adds to the others. `--name` and
 `--checksum` still need exactly one download in all, and the torrent-only
-flags still refuse an HTTP(S) or FTP(S) download anywhere on the line. Sources given as
+flags still refuse an HTTP(S), FTP(S) or SFTP download anywhere on the line. Sources given as
 arguments are added first, then the file's, in order; `--json` and `--wait`
 treat them as one list, as for several sources.
 
@@ -399,7 +405,7 @@ with a warning on stderr naming it and its line. Everything else wrong with the
 file is a usage error (exit 2) that adds nothing at all, so a script never ends
 up with half a list queued: an option line before the first URI, one without
 `=`, an empty or bad value for one of the options above, an unknown source, `checksum` on a torrent, a
-torrent option on an HTTP(S) or FTP(S) download, or `pause=true` with `--wait`. Every
+torrent option on an HTTP(S), FTP(S) or SFTP download, or `pause=true` with `--wait`. Every
 problem is reported with its line (`puppy: list.txt: line 7: bad
 max-download-limit "fast": ...`). `seed-time=0`, which in aria2 means "do not seed", is
 refused as well, since puppy's `0` would mean the opposite (never stop). What
@@ -408,11 +414,12 @@ past a torrent's last file) fails that download only, as with several sources.
 
 ### Mirrors
 
-`add --mirror URL` (repeatable) gives an HTTP(S) or FTP(S) download other places
-to get the same file from; the source stays its primary URL. It needs exactly
-one such source, like `--name`. Mirrors are `http://`, `https://`, `ftp://`,
-`ftps://` or `ftpes://` URLs, whatever the source's protocol: an HTTP download
-can take ranges from an FTP mirror and the other way round. A torrent with
+`add --mirror URL` (repeatable) gives an HTTP(S), FTP(S) or SFTP download other
+places to get the same file from; the source stays its primary URL. It needs
+exactly one such source, like `--name`. Mirrors are `http://`, `https://`,
+`ftp://`, `ftps://`, `ftpes://` or `sftp://` URLs, whatever the source's
+protocol: an HTTP download can take ranges from an FTP or SFTP mirror and the
+other way round. A torrent with
 mirrors is refused.
 
 When the download starts, puppy probes the primary and every mirror at once.
@@ -456,7 +463,8 @@ tries every mirror again.
 
 Each location is validated on its own, since mirrors have their own ETag and
 Last-Modified (an FTP location: its size and `MDTM`, checked before each of
-its transfers, see [FTP](#ftp)). Every request to a location carries that
+its transfers, see [FTP](#ftp); an SFTP location: its size and modification
+time, see [SFTP](#sftp)). Every request to a location carries that
 location's own validator as `If-Range`, and the resume sidecar records each location's
 final URL and validators. On resume (also after a restart) every location is
 checked against the partial file as a download without mirrors is: with a
@@ -473,7 +481,7 @@ because it does not answer for now is benched, and checked again before it
 gets a range; if none can be checked, the resume fails transiently.
 
 A location without validators (neither ETag nor Last-Modified; an FTP server
-without `MDTM`) cannot be checked with `If-Range`. Before each range it is given, puppy compares the
+without `MDTM`, an SFTP server that does not report modification times) cannot be checked with `If-Range`. Before each range it is given, puppy compares the
 last bytes (64 KiB) of the largest part already downloaded against what that
 location serves there, and drops it if they differ. Until there are such
 bytes it waits, unless no location has validators at all. What this cannot
@@ -593,6 +601,114 @@ when a proxy is set. Retries, backoff, speed limits, `--checksum`, pause,
 resume and restart work as for HTTP; `info` and the dashboard show an FTP
 download's connections and segment map as for HTTP.
 
+### SFTP
+
+SFTP URLs are `sftp://[user[:password]@]host[:port]/path`, port 22 by default.
+The path is absolute (`sftp://host/srv/a.iso` is `/srv/a.iso`); start it with
+`/~/` for one relative to your home directory on the server
+(`sftp://host/~/a.iso`), as curl does. Without a user name puppy logs in as
+your local user, as `ssh` does. Percent-encoded characters are decoded. A URL
+ending in `/` names a directory and is refused. `scp://` URLs are not
+supported (neither are they in aria2): use `sftp://`, which every OpenSSH
+server offers.
+
+puppy logs in without asking anything, since the daemon has no terminal to ask
+on. It tries, in this order, what the server accepts:
+
+1. The keys of your ssh-agent. On Unix that is the agent at `SSH_AUTH_SOCK`;
+   on Windows the OpenSSH agent's pipe (`\\.\pipe\openssh-ssh-agent`), then
+   Pageant.
+2. Private key files: `[ssh] identity_file` if set, then `~/.ssh/id_ed25519`,
+   `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa`. Only unencrypted ones can be used. An
+   encrypted key needs its passphrase, which puppy cannot ask for: if nothing
+   else works, the download fails saying so (`~/.ssh/id_ed25519 is encrypted
+   and puppy cannot ask for a passphrase: load it into ssh-agent (ssh-add
+   ~/.ssh/id_ed25519) ...`). Load the key into your agent with `ssh-add`.
+3. The password in the URL, with the `password` method or, if the server only
+   offers that, `keyboard-interactive` (answering its password prompt).
+
+A login that fails says what was tried and what the server accepts. It is not
+retried: fix the cause and `puppy resume` the download. Agent forwarding is
+never requested, and channels the server tries to open (forwarding requests)
+are refused. A password is sent only to the host in its own URL, never to a
+mirror's.
+
+**The agent and the daemon.** The daemon signs logins with an agent, so it
+needs to reach one. Every `puppy` command and the dashboard tell the daemon
+their own `SSH_AUTH_SOCK` when they connect, and the daemon uses the agent of
+the most recent one first, then the one in its own environment. A daemon that
+`puppy` starts on demand has your shell's agent either way. One that runs as a
+login service (see [docs/service.md](docs/service.md)) starts without it and
+picks it up from the first command you run; a download it resumes after a
+reboot, before any command, has only the service's own `SSH_AUTH_SOCK` (with
+systemd: `systemctl --user import-environment SSH_AUTH_SOCK`, or an agent
+started as a user service), so give it a key file without a passphrase, or run
+any `puppy` command to hand it your agent. To fix the agent instead, set its
+socket (a named pipe on Windows):
+
+```toml
+[ssh]
+agent = "/run/user/1000/ssh-agent.socket"   # always this agent
+identity_file = "~/.ssh/puppy_ed25519"      # tried after the agent's keys
+```
+
+**Host keys.** Before anything is sent, the server's host key must be listed
+for it in `~/.ssh/known_hosts` or in puppy's own `known_hosts`, in its data
+directory (`~/.local/share/puppy/known_hosts` on Linux,
+`~/Library/Application Support/puppy/known_hosts` on macOS,
+`%APPDATA%\puppy\known_hosts` on Windows). Both are read in OpenSSH's
+format: hashed entries (`HashKnownHosts`), `[host]:port` for another port than
+22, wildcards and `!` negations, and `@revoked` keys, which are refused.
+Host certificates (`@cert-authority`) are not supported. puppy never trusts a
+key on first use. A server whose key is not listed fails the download with
+its fingerprint, as OpenSSH prints it:
+
+```
+SSH: the host key of [host.example]:2222 is not known (ssh-ed25519 key
+SHA256:Qm8T…). Check the fingerprint with the server's administrator; to trust
+it, run `puppy ssh trust host.example:2222`
+```
+
+A server presenting another key of a type listed for it fails with
+`REMOTE HOST IDENTIFICATION HAS CHANGED`, naming the file and line of the old
+key: it may be an attack, so nothing is sent and puppy offers no way to go on
+other than removing the old key yourself (`ssh-keygen -R`).
+
+`puppy ssh trust HOST[:PORT]` (also `[IPv6]:PORT` or an `sftp://` URL)
+connects, prints the server's key and fingerprint, and on a terminal asks
+whether to trust it; check the fingerprint with whoever runs the server (on
+the server: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). `--yes`
+trusts without asking (in scripts, where it refuses to ask otherwise). The key
+goes into puppy's own `known_hosts`, never into `~/.ssh/known_hosts`. A host
+already known is left as it is, and a changed key is refused as above.
+`--json` prints the host, port, key type, fingerprint and what happened
+(`added`, `known`, `changed`, `revoked`).
+
+Downloads are segmented as over HTTP: up to `connections` SSH connections to
+the server, each logged in once, with one SFTP session that reads its range
+with several requests in flight, and is reused for the next range. Several
+connections, rather than several channels on one, give several TCP streams,
+which is what makes segments faster. A server that closes a new connection
+while others are logged in (OpenSSH's `MaxStartups`, a per-user limit) caps
+the download at the connections it accepted; the refused range waits for one
+of them, after a growing delay, and the cap holds until the download is paused
+or retried.
+
+The file's size and modification time (`STAT`) are its validator. Every range
+opens the file and checks them on the open file first; different values mean
+the file changed, and the download needs attention (`remote changed`) without
+taking a byte of it. They are checked again when a range is done. Resuming
+(also after a restart) checks the same; a server that reports no modification
+time gets the byte comparison of HTTP servers without validators.
+
+A password in an SFTP URL is kept and hidden as one in an FTP URL is: only in
+the daemon's private state file, `***` everywhere it is shown, never in the
+log or the resume sidecar. The daemon's log keeps only warnings and errors of
+the SSH library, whatever `RUST_LOG` says. SFTP connections never go through
+the `proxy` setting, and there is no `ProxyJump` or `~/.ssh/config` support:
+puppy connects to the URL's host and port directly. Retries, speed limits,
+`--checksum`, pause, resume, restart and mirrors work as for HTTP.
+
 ### Configuration
 
 Settings go in `config.toml` (where it lives: see below). Keys:
@@ -601,7 +717,8 @@ Settings go in `config.toml` (where it lives: see below). Keys:
 (`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and
 `proxy`. `NO_COLOR` switches to monochrome; without `COLORTERM=truecolor` the
 16 ANSI colors are used. `--theme` overrides the file. `[ftp]` holds the TLS
-setting for `ftp://` URLs (see [FTP](#ftp)).
+setting for `ftp://` URLs (see [FTP](#ftp)), `[ssh]` the agent and key file for
+`sftp://` ones (see [SFTP](#sftp)).
 
 Torrents have their own section:
 
@@ -801,12 +918,12 @@ so no network port is opened. Firefox is not supported yet.
 |---------------------------|-----------------------------------------------------------------|
 | `crates/puppy`            | The `puppy` binary: dashboard, subcommands and native host.     |
 | `crates/puppy-tui`        | The full-screen dashboard (ratatui).                            |
-| `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S)/FTP(S) engine. |
+| `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S)/FTP(S)/SFTP engine. |
 | `crates/puppy-torrent`    | The BitTorrent engine (librqbit behind the `Engine` trait).     |
 | `crates/puppy-daemon`     | The daemon: paths, config, queue manager, state store, server.  |
 | `crates/puppy-proto`      | The daemon ↔ client protocol types and framing.                 |
 | `crates/puppy-client`     | Client library: connecting, requests, events, auto-spawning.    |
-| `crates/puppy-testserver` | HTTP and FTP(S) servers for tests (throttling, failures).       |
+| `crates/puppy-testserver` | HTTP, FTP(S) and SFTP servers for tests (throttling, failures). |
 | `extension/`              | The browser extension (MV3) that hands downloads to puppy.      |
 
 ## Releasing

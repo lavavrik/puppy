@@ -46,6 +46,13 @@ The unit starts when you log in and stops when your last session ends. To keep
 the daemon running while you are logged out (e.g. on a server), enable
 lingering: `loginctl enable-linger "$USER"`.
 
+SFTP downloads sign their logins with an ssh-agent. A service does not inherit
+your shell's `SSH_AUTH_SOCK`; every `puppy` command hands the daemon its own
+when it connects, but a download resumed at login, before any command, only
+has the service's environment. Run `systemctl --user import-environment
+SSH_AUTH_SOCK` from your session (or use an agent started as a user service),
+or set `[ssh] agent` in `config.toml` (see the README's SFTP section).
+
 To remove it:
 
 ```sh
