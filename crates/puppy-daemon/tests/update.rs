@@ -25,10 +25,10 @@ async fn lookup(
 
 #[tokio::test]
 async fn newer_release_is_found() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET)).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().expect("a release");
-    assert_eq!(r.version, v("0.2.0"));
-    assert_eq!(r.archive.name, archive_name(&v("0.2.0"), TARGET));
+    assert_eq!(r.version, v("99.0.0"));
+    assert_eq!(r.archive.name, archive_name(&v("99.0.0"), TARGET));
     assert_eq!(r.checksum.name, format!("{}.sha256", r.archive.name));
 }
 
@@ -45,9 +45,9 @@ async fn same_or_older_is_none() {
 
 #[tokio::test]
 async fn no_asset_for_target_is_none() {
-    let other = FakeGitHub::start(FakeRelease::new("0.2.0", "aarch64-apple-darwin")).await;
+    let other = FakeGitHub::start(FakeRelease::new("99.0.0", "aarch64-apple-darwin")).await;
     assert!(lookup(&other, "0.1.0").await.unwrap().is_none());
-    let unsummed = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET).without_checksum()).await;
+    let unsummed = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET).without_checksum()).await;
     assert!(lookup(&unsummed, "0.1.0").await.unwrap().is_none());
 }
 
@@ -61,7 +61,7 @@ async fn gnu_and_musl_installs_each_pick_their_own_archive() {
         "aarch64-unknown-linux-gnu",
         "aarch64-unknown-linux-musl",
     ];
-    let mut release = FakeRelease::new("0.2.0", targets[0]);
+    let mut release = FakeRelease::new("99.0.0", targets[0]);
     for t in &targets[1..] {
         release = release.also_for(t);
     }
@@ -71,7 +71,7 @@ async fn gnu_and_musl_installs_each_pick_their_own_archive() {
             .await
             .unwrap()
             .expect("a release");
-        assert_eq!(r.archive.name, format!("puppy-0.2.0-{target}.tar.gz"));
+        assert_eq!(r.archive.name, format!("puppy-99.0.0-{target}.tar.gz"));
         assert_eq!(r.checksum.name, format!("{}.sha256", r.archive.name));
         let work = tempfile::tempdir().unwrap();
         let bin = fetch(&client(), &r, work.path()).await.unwrap();
@@ -81,7 +81,7 @@ async fn gnu_and_musl_installs_each_pick_their_own_archive() {
 
 #[tokio::test]
 async fn api_error_is_failed() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET)).await;
     fake.set_status(403);
     match lookup(&fake, "0.1.0").await {
         Err(UpdateError::Failed(msg)) => assert!(msg.contains("403"), "{msg}"),
@@ -92,7 +92,7 @@ async fn api_error_is_failed() {
 
 #[tokio::test]
 async fn bad_checksum_is_rejected() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET).bad_checksum()).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET).bad_checksum()).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let work = tempfile::tempdir().unwrap();
     match fetch(&client(), &r, work.path()).await {
@@ -104,7 +104,7 @@ async fn bad_checksum_is_rejected() {
 
 #[tokio::test]
 async fn extracts_only_the_binary() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET)).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let work = parent.path().join("work");
@@ -124,7 +124,7 @@ async fn extracts_only_the_binary() {
 
 #[tokio::test]
 async fn missing_binary_is_failed() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET).without_binary()).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET).without_binary()).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let work = tempfile::tempdir().unwrap();
     match fetch(&client(), &r, work.path()).await {
@@ -135,7 +135,7 @@ async fn missing_binary_is_failed() {
 
 #[tokio::test]
 async fn fetch_empties_the_work_dir_first() {
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET)).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let work = tempfile::tempdir().unwrap();
     std::fs::write(work.path().join("stale"), b"x").unwrap();
@@ -149,7 +149,7 @@ async fn fetch_empties_the_work_dir_first() {
 async fn fetch_check_and_replace() {
     use puppy_daemon::update::{replace_exe, sanity_check};
     use std::os::unix::fs::PermissionsExt;
-    let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;
+    let fake = FakeGitHub::start(FakeRelease::new("99.0.0", TARGET)).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let work = tempfile::tempdir().unwrap();
     let new = fetch(&client(), &r, work.path()).await.unwrap();
@@ -172,7 +172,7 @@ async fn fetch_check_and_replace() {
 async fn sanity_failure_leaves_exe_untouched() {
     use puppy_daemon::update::sanity_check;
     let fake =
-        FakeGitHub::start(FakeRelease::new("0.2.0", TARGET).binary_prints("puppy 9.9.8")).await;
+        FakeGitHub::start(FakeRelease::new("99.0.0", TARGET).binary_prints("puppy 9.9.8")).await;
     let r = lookup(&fake, "0.1.0").await.unwrap().unwrap();
     let work = tempfile::tempdir().unwrap();
     let new = fetch(&client(), &r, work.path()).await.unwrap();
@@ -287,7 +287,7 @@ mod daemon {
 
     impl Env {
         async fn new() -> Self {
-            Self::with(FakeRelease::new("0.2.0", puppy_daemon::update::TARGET)).await
+            Self::with(FakeRelease::new("99.0.0", puppy_daemon::update::TARGET)).await
         }
 
         async fn with(release: FakeRelease) -> Self {
@@ -539,7 +539,7 @@ mod daemon {
                 can_install,
                 ..
             } => {
-                assert_eq!(version, "0.2.0");
+                assert_eq!(version, "99.0.0");
                 assert!(can_install);
             }
             _ => unreachable!(),
@@ -555,7 +555,7 @@ mod daemon {
         let mut c = env.client().await;
         let s = reply_status(c.update(true).await);
         assert!(
-            matches!(&s, UpdateStatus::Available { version, can_install: true, .. } if version == "0.2.0"),
+            matches!(&s, UpdateStatus::Available { version, can_install: true, .. } if version == "99.0.0"),
             "{s:?}"
         );
         assert_eq!(std::fs::read(&env.exe).unwrap(), b"old");
@@ -581,7 +581,7 @@ mod daemon {
         let mut c = env.client().await;
         let s = reply_status(c.update(true).await);
         assert!(
-            matches!(&s, UpdateStatus::Available { version, .. } if version == "0.2.0"),
+            matches!(&s, UpdateStatus::Available { version, .. } if version == "99.0.0"),
             "{s:?}"
         );
         assert_eq!(
@@ -705,7 +705,7 @@ mod daemon {
         assert_eq!(
             s,
             UpdateStatus::Installed {
-                version: "0.2.0".into()
+                version: "99.0.0".into()
             }
         );
         assert_eq!(exited(d).await, RunOutcome::Restart);
@@ -713,7 +713,7 @@ mod daemon {
             .arg("--version")
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "puppy 0.2.0");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "puppy 99.0.0");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -825,7 +825,7 @@ mod daemon {
             .unwrap()
             .unwrap();
         assert_eq!(outcome, RunOutcome::Restart);
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
     }
 
     /// The HTTP engine, except that a finished download seeds (like a torrent would).
@@ -919,7 +919,7 @@ mod daemon {
             .unwrap()
             .unwrap();
         assert_eq!(outcome, RunOutcome::Restart);
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -974,7 +974,7 @@ mod daemon {
             "installed {:?} after the client left",
             quiet_from.elapsed()
         );
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
     }
 
     #[cfg(unix)]
@@ -1029,7 +1029,7 @@ mod daemon {
         c.wait_available().await;
         drop(c);
         assert_eq!(exited(d).await, RunOutcome::Exited);
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1064,7 +1064,7 @@ mod daemon {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_install_leaves_no_marker() {
         let env = Env::with(
-            FakeRelease::new("0.2.0", puppy_daemon::update::TARGET).binary_prints("puppy 9.9.8"),
+            FakeRelease::new("99.0.0", puppy_daemon::update::TARGET).binary_prints("puppy 9.9.8"),
         )
         .await;
         let d = env.start(true).await;
@@ -1179,7 +1179,7 @@ mod daemon {
         c.request(Request::Pause { id }).await;
         drop(c);
         assert_eq!(exited(d).await, RunOutcome::Restart);
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
         assert_eq!(env.fake.downloads(), 1, "downloaded the update again");
     }
 
@@ -1215,7 +1215,7 @@ mod daemon {
         // Idle again: it installs (without downloading again) and exits.
         drop(c);
         assert_eq!(exited(d).await, RunOutcome::Exited);
-        assert_eq!(exe_version(&env), "puppy 0.2.0");
+        assert_eq!(exe_version(&env), "puppy 99.0.0");
         assert_eq!(env.fake.downloads(), 1, "downloaded the update again");
     }
 }

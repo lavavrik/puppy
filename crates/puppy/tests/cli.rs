@@ -1498,7 +1498,7 @@ fn update_env(github: &puppy_testserver::github::FakeGitHub) -> Env {
 }
 
 fn fake_release() -> puppy_testserver::github::FakeRelease {
-    puppy_testserver::github::FakeRelease::new("0.2.0", puppy_daemon::update::TARGET)
+    puppy_testserver::github::FakeRelease::new("99.0.0", puppy_daemon::update::TARGET)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1507,13 +1507,13 @@ async fn update_check_reports_available() {
     let env = update_env(&github);
     let (status, out, err) = env.run(&["update", "--check"]);
     assert!(status.success(), "{status:?}: {err}");
-    assert_eq!(out.trim(), "puppy 0.2.0 is available", "{err}");
+    assert_eq!(out.trim(), "puppy 99.0.0 is available", "{err}");
 
     let (status, out, err) = env.run(&["update", "--check", "--json"]);
     assert!(status.success(), "{status:?}: {err}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["status"]["state"], "available", "{out}");
-    assert_eq!(v["status"]["version"], "0.2.0", "{out}");
+    assert_eq!(v["status"]["version"], "99.0.0", "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1539,7 +1539,7 @@ async fn status_mentions_update() {
     let (status, out, err) = env.run(&["status"]);
     assert!(status.success(), "{err}");
     assert!(
-        out.contains("update available: puppy 0.2.0 (puppy update)"),
+        out.contains("update available: puppy 99.0.0 (puppy update)"),
         "{out}"
     );
     let (status, out, err) = env.run(&["status", "--json"]);
@@ -1554,7 +1554,7 @@ async fn status_mentions_update() {
 async fn update_reports_missing_comeback() {
     // A stand-in that answers `--version` and otherwise sleeps instead of serving.
     let release = fake_release().binary_script(
-        "if [ \"$1\" = \"--version\" ]; then echo 'puppy 0.2.0'; exit 0; fi\nexec sleep 30",
+        "if [ \"$1\" = \"--version\" ]; then echo 'puppy 99.0.0'; exit 0; fi\nexec sleep 30",
     );
     let github = puppy_testserver::github::FakeGitHub::start(release).await;
     let mut env = update_env(&github);
@@ -1585,9 +1585,9 @@ async fn update_reports_missing_comeback() {
     }
     assert_eq!(status.code(), Some(1), "{out} {err}");
     assert!(out.contains("updating puppy "), "{out}");
-    assert!(out.contains("\u{2192} 0.2.0\u{2026}"), "{out}");
+    assert!(out.contains("\u{2192} 99.0.0\u{2026}"), "{out}");
     assert!(
-        err.contains("puppy: the daemon did not come back as 0.2.0"),
+        err.contains("puppy: the daemon did not come back as 99.0.0"),
         "{err}"
     );
 }
