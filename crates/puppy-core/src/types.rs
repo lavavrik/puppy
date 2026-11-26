@@ -152,7 +152,7 @@ pub struct AddRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<crate::checksum::Checksum>,
     /// Other locations of the same file (URL downloads only), besides `source` (the
-    /// primary), over HTTP(S) or FTP(S) whatever the primary's protocol. The engine probes
+    /// primary), over HTTP(S), FTP(S) or SFTP whatever the primary's protocol. The engine probes
     /// them, uses the ones that agree with the primary on size and range support, spreads
     /// connections over them and fails over between them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -319,7 +319,7 @@ pub enum MirrorState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineDetail {
-    /// A URL download (HTTP(S) or FTP(S): the same segmented transfer).
+    /// A URL download (HTTP(S), FTP(S) or SFTP: the same segmented transfer).
     Http {
         segments: Vec<SegmentView>,
         connections: u16,

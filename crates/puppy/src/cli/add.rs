@@ -30,7 +30,7 @@ pub struct AddArgs {
     pub headers: Vec<String>,
     pub cookie: Option<String>,
     pub referer: Option<String>,
-    /// `--checksum ALGO=HEX` (one HTTP(S) or FTP(S) source only).
+    /// `--checksum ALGO=HEX` (one HTTP(S), FTP(S) or SFTP source only).
     pub checksum: Option<String>,
     /// `--files` specs (torrents only): numbers, ranges and globs.
     pub files: Vec<String>,
@@ -278,7 +278,7 @@ fn plan_input_file(
         }
         if !mirrors.is_empty() && !matches!(source, Source::Http { .. }) {
             bad(format!(
-                "TAB-separated mirrors only apply to HTTP(S) and FTP(S) downloads, but {uri} is \
+                "TAB-separated mirrors only apply to HTTP(S), FTP(S) and SFTP downloads, but {uri} is \
                  a torrent"
             ));
             continue;
@@ -293,7 +293,7 @@ fn plan_input_file(
             }
         } else if o.checksum.is_some() {
             bad(format!(
-                "checksum only applies to HTTP(S) and FTP(S) downloads, but {uri} is a torrent \
+                "checksum only applies to HTTP(S), FTP(S) and SFTP downloads, but {uri} is a torrent \
                  (BitTorrent verifies every piece already)"
             ));
             continue;
@@ -322,14 +322,14 @@ fn plan_input_file(
     }
 }
 
-/// A mirror URL (`--mirror`, a TAB-separated URI): absolute HTTP(S) or FTP(S), whatever
+/// A mirror URL (`--mirror`, a TAB-separated URI): absolute HTTP(S), FTP(S) or SFTP, whatever
 /// the source's protocol.
 fn parse_mirror(s: &str) -> Result<Mirror, String> {
     let s = unquote(s.trim());
     match url::Url::parse(s) {
         Ok(u) if matches!(parse_source(s), Ok(Source::Http { .. })) => Ok(Mirror::new(u)),
         Ok(u) => Err(format!(
-            "mirror {}: only HTTP(S) and FTP(S) mirrors are supported, not {}:",
+            "mirror {}: only HTTP(S), FTP(S) and SFTP mirrors are supported, not {}:",
             masked_url(&u),
             u.scheme()
         )),
@@ -538,7 +538,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             .find(|p| !matches!(p.req.source, Source::Http { .. }))
     {
         return Err(CliError::Usage(format!(
-            "--checksum only applies to HTTP(S) and FTP(S) downloads, but {} is a torrent \
+            "--checksum only applies to HTTP(S), FTP(S) and SFTP downloads, but {} is a torrent \
              (BitTorrent verifies every piece already)",
             p.shown
         )));
@@ -550,7 +550,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             .find(|p| !matches!(p.req.source, Source::Http { .. }))
     {
         return Err(CliError::Usage(format!(
-            "--mirror only applies to HTTP(S) and FTP(S) downloads, but {} is a torrent",
+            "--mirror only applies to HTTP(S), FTP(S) and SFTP downloads, but {} is a torrent",
             p.shown
         )));
     }

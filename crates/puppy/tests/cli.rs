@@ -1736,7 +1736,7 @@ async fn info_shows_live_mirror_state() {
     let _ = env.run(&["rm", "1", "--delete-files"]);
 }
 
-/// `--mirror` needs one URL source and HTTP(S)/FTP(S) mirror URLs: usage errors otherwise,
+/// `--mirror` needs one URL source and HTTP(S)/FTP(S)/SFTP mirror URLs: usage errors otherwise,
 /// before any daemon starts.
 #[test]
 fn add_mirror_usage_errors() {
@@ -1747,7 +1747,7 @@ fn add_mirror_usage_errors() {
         (vec!["add", "--mirror", &b, &a, &b], "exactly one source"),
         (
             vec!["add", "--mirror", "gopher://h/f", &a],
-            "only HTTP(S) and FTP(S) mirrors",
+            "only HTTP(S), FTP(S) and SFTP mirrors",
         ),
         (vec!["add", "--mirror", "not a url", &a], "not a URL"),
         (
@@ -1958,7 +1958,7 @@ fn add_input_file_invalid_entry_rejects_the_batch() {
         "bad.txt: line 3: bad max-download-limit \"fast\"",
         "bad.txt: line 4: ignoring unsupported option `bogus`",
         "bad.txt: line 7: not a url",
-        "bad.txt: line 8: mirror gopher://h/f: only HTTP(S) and FTP(S) mirrors are supported",
+        "bad.txt: line 8: mirror gopher://h/f: only HTTP(S), FTP(S) and SFTP mirrors are supported",
         "bad.txt: line 9: seed-ratio only applies to torrents",
         "bad.txt: 5 problems, nothing was added",
     ] {

@@ -262,7 +262,7 @@ impl MirrorRt {
     }
 }
 
-/// The request's locations: its source (primary) first, then its HTTP(S) and FTP(S)
+/// The request's locations: its source (primary) first, then its HTTP(S), FTP(S) and SFTP
 /// mirrors by priority (lower first, unnumbered last, otherwise as given), duplicates
 /// removed.
 pub(super) fn locations(req: &AddRequest) -> Vec<MirrorRt> {

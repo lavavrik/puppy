@@ -16,8 +16,7 @@ use crate::format::{parse_rate, rate_input};
 pub const ADD_EMPTY_SOURCE: &str = "enter a URL, magnet link or .torrent path";
 pub const ADD_BAD_SOURCE: &str = "not a URL, magnet link or .torrent file";
 pub const ADD_BAD_DIR: &str = "use an absolute folder path";
-pub const ADD_CHECKSUM_NOT_HTTP: &str =
-    "a checksum only applies to HTTP(S) and FTP(S) downloads (BitTorrent verifies its pieces)";
+pub const ADD_CHECKSUM_NOT_HTTP: &str = "a checksum only applies to HTTP(S), FTP(S) and SFTP downloads (BitTorrent verifies its pieces)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddField {
@@ -116,7 +115,7 @@ fn expand_tilde_with(s: &str, home: Option<&Path>) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Interprets the add form's source: an http(s) or ftp(s) URL (`ftp`, `ftps`, `ftpes`), a
+/// Interprets the add form's source: an http(s), ftp(s) (`ftp`, `ftps`, `ftpes`) or `sftp` URL, a
 /// `magnet:?` link, or an existing
 /// `.torrent` file (made absolute: the daemon has another working directory).
 /// Surrounding whitespace and quotes are ignored.
@@ -127,7 +126,7 @@ pub fn parse_source(s: &str) -> Result<Source, String> {
         return Ok(Source::Magnet { uri: s.to_string() });
     }
     if let Ok(url) = url::Url::parse(s)
-        && (matches!(url.scheme(), "http" | "https") || puppy_core::ftp::is_ftp(&url))
+        && puppy_core::http::is_url_scheme(url.scheme())
         && url.host_str().is_some_and(|h| !h.is_empty())
     {
         return Ok(Source::Http { url });
@@ -530,7 +529,13 @@ mod tests {
         ));
         // A .torrent path that does not exist is not accepted.
         assert!(parse_source("/nonexistent/puppy/a.TORRENT").is_err());
-        for ftp in ["ftp://x/a", "FTPS://u:p@x:990/a", "ftpes://x/a"] {
+        for ftp in [
+            "ftp://x/a",
+            "FTPS://u:p@x:990/a",
+            "ftpes://x/a",
+            "sftp://u@x/srv/a",
+            "SFTP://x:2222/~/a",
+        ] {
             assert!(
                 matches!(parse_source(ftp), Ok(Source::Http { .. })),
                 "{ftp}"

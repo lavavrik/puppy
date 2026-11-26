@@ -9,6 +9,7 @@ pub mod input_file;
 pub mod list;
 pub mod output;
 pub mod seed;
+pub mod ssh;
 pub mod update;
 pub mod wait;
 

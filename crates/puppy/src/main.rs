@@ -123,10 +123,10 @@ enum Command {
         #[arg(long)]
         wait: bool,
         /// Check the finished file against this digest, `ALGO=HEX` (`sha-256`,
-        /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S) or FTP(S) source only.
+        /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S), FTP(S) or SFTP source only.
         #[arg(long, value_name = "ALGO=HEX")]
         checksum: Option<String>,
-        /// Another URL of the same file, HTTP(S) or FTP(S) (repeatable; one URL source only):
+        /// Another URL of the same file, HTTP(S), FTP(S) or SFTP (repeatable; one URL source only):
         /// connections are spread over the URLs that agree on the file, and fail over
         /// between them. Cookies and headers go to the source's origin only.
         #[arg(long = "mirror", value_name = "URL")]
@@ -250,6 +250,11 @@ enum Command {
         #[command(subcommand)]
         action: BrowserAction,
     },
+    /// SFTP host keys.
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
     /// Native messaging host started by the browser extension.
     #[command(hide = true)]
     NativeHost {
@@ -257,6 +262,20 @@ enum Command {
         /// `--parent-window=` (Windows); ignored.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         browser_args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SshAction {
+    /// Fetch a server's host key, show its fingerprint and, once confirmed, add it to
+    /// puppy's own known_hosts, so that SFTP downloads from it work.
+    Trust {
+        /// HOST, HOST:PORT, [IPv6]:PORT or an sftp:// URL (port 22 by default).
+        #[arg(value_name = "HOST[:PORT]")]
+        host: String,
+        /// Trust it without asking (check the fingerprint first: it is printed).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -429,6 +448,9 @@ fn main() -> ExitCode {
                 }
                 BrowserAction::Status => cli::browser::status(cli.json).await,
             },
+            Some(Command::Ssh {
+                action: SshAction::Trust { host, yes },
+            }) => cli::ssh::trust(&Ctx::from_env(cli.json)?, &host, yes).await,
             Some(Command::NativeHost { browser_args: _ }) => native_host::run().await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
