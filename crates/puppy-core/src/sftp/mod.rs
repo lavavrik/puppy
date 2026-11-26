@@ -458,17 +458,28 @@ mod tests {
 
     #[test]
     fn offered_agents_most_recent_first() {
+        // An agent the platform can reach: a named pipe on Windows (where `/a.sock` has
+        // no drive letter, so is not absolute), a Unix socket path elsewhere.
+        fn agent(name: &str) -> String {
+            if cfg!(windows) {
+                format!(r"\\.\pipe\{name}")
+            } else {
+                format!("/{name}.sock")
+            }
+        }
         offer_agent("relative/sock");
         offer_agent("");
-        for s in [
-            "/a.sock", "/b.sock", "/c.sock", "/d.sock", "/e.sock", "/c.sock",
-        ] {
-            offer_agent(s);
+        for s in ["a", "b", "c", "d", "e", "c"] {
+            offer_agent(&agent(s));
         }
         let kept = offered_agents();
         assert_eq!(kept.len(), OFFERED_KEPT);
-        assert_eq!(kept[0], PathBuf::from("/c.sock"));
-        assert_eq!(kept[1], PathBuf::from("/e.sock"));
-        assert!(kept.iter().all(|p| p.is_absolute()));
+        assert_eq!(kept[0], PathBuf::from(agent("c")));
+        assert_eq!(kept[1], PathBuf::from(agent("e")));
+        assert!(
+            kept.iter()
+                .all(|p| agent_path(p.to_str().unwrap()).as_ref() == Some(p)),
+            "{kept:?}"
+        );
     }
 }
