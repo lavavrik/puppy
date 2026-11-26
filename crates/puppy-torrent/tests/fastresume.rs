@@ -55,6 +55,9 @@ fn torrent_req(root: &Path, seeder: &Seeder) -> AddRequest {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
+        mirrors: Vec::new(),
+        size: None,
     }
 }
 
