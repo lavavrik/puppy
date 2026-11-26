@@ -102,6 +102,8 @@ struct Shared {
     range_requests: Mutex<usize>,
     /// The only valid `/signed/<n>` (see `/expiring`).
     signed: AtomicU32,
+    /// Fixed documents by path: (`Content-Type`, body), served before anything else.
+    docs: Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
 }
 
 pub struct TestServer {
@@ -127,6 +129,7 @@ impl TestServer {
             paths: Mutex::new(Vec::new()),
             range_requests: Mutex::new(0),
             signed: AtomicU32::new(0),
+            docs: Mutex::default(),
         });
         let app = Router::new().fallback(handle).with_state(shared.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,6 +170,15 @@ impl TestServer {
     /// the old one answers 403.
     pub fn rotate_signed(&self) {
         self.shared.signed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Serves `body` with `content_type` at `path` (GET and HEAD), e.g. a metalink.
+    pub fn set_doc(&self, path: &str, content_type: &str, body: impl Into<Vec<u8>>) {
+        self.shared
+            .docs
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), (content_type.to_string(), body.into()));
     }
 
     /// Paths of every request received, in order.
@@ -228,6 +240,18 @@ async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
     sh.requests.lock().unwrap().push(req.headers().clone());
     let path = req.uri().path().to_string();
     sh.paths.lock().unwrap().push(path.clone());
+    let doc = sh.docs.lock().unwrap().get(&path).cloned();
+    if let Some((content_type, body)) = doc {
+        let builder = Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, body.len());
+        let body = if req.method() == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from(body)
+        };
+        return builder.body(body).unwrap();
+    }
     // A signed, expiring CDN URL: `/expiring` redirects to the current `/signed/<n>`;
     // older ones are forbidden. Otherwise served like `/file.bin`.
     if path == "/expiring" {

@@ -29,6 +29,7 @@ rustls.workspace = true
 rustls-platform-verifier.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
+quick-xml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -3777,6 +3777,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "puppy-testserver",
+ "quick-xml",
  "reqwest",
  "russh",
  "russh-sftp",

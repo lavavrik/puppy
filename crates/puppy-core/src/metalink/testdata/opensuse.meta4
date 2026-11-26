@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <generator>MirrorBrain/2.19.0</generator>
+  <origin dynamic="true">http://download.opensuse.org/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso.meta4</origin>
+  <published>2024-06-12T10:11:12Z</published>
+  <publisher>
+    <name>openSUSE Download Redirector</name>
+    <url>http://download.opensuse.org</url>
+  </publisher>
+
+  <file name="openSUSE-Leap-15.6-NET-x86_64-Media.iso">
+    <size>270532608</size>
+
+    <!-- <mtime>1717600000</mtime> -->
+
+    <hash type="md5">cf942098fbd86c50e13943311c582379</hash>
+    <hash type="sha-1">e76d9354e8c216fff84e423abd5aaffbcdb95eb1</hash>
+    <hash type="sha-256">2332c346383a169f291f8a37980420bd9051b948b796fc57b285305bff8cf59a</hash>
+    <pieces length="67633152" type="sha-1">
+      <hash>b6589fc6ab0dc82cf12099d1c2d40ab994e8410c</hash>
+      <hash>356a192b7913b04c54574d18c28d46e6395428ab</hash>
+      <hash>da4b9237bacccdf19c0760cab7aec4a8359010b0</hash>
+      <hash>77de68daecd823babbb58edb1c8e14d7106e83bb</hash>
+    </pieces>
+
+    <signature mediatype="application/pgp-signature">-----BEGIN PGP SIGNATURE-----
+
+iQEzBAABCAAdFiEE
+=abcd
+-----END PGP SIGNATURE-----
+</signature>
+
+    <!-- Found 5 mirrors: 2 in the same network prefix, 1 in the same country, 2 in Europe -->
+
+    <url location="de" priority="1">http://ftp.halifax.rwth-aachen.de/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso</url>
+    <url location="de" priority="2">https://ftp.fau.de/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso</url>
+    <url location="cz" priority="3">ftp://mirror.karneval.cz/pub/linux/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso</url>
+    <url location="se" priority="4">rsync://ftp.acc.umu.se/mirror/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso</url>
+    <url location="nl" priority="5">http://mirror.nl.leaseweb.net/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso</url>
+    <metaurl mediatype="torrent" priority="1">http://download.opensuse.org/distribution/leap/15.6/iso/openSUSE-Leap-15.6-NET-x86_64-Media.iso.torrent</metaurl>
+  </file>
+</metalink>

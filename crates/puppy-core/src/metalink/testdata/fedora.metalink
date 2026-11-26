@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<metalink version="3.0" xmlns="http://www.metalinker.org/" type="dynamic" pubdate="Tue, 26 Nov 2026 10:00:01 GMT" generator="mirrormanager" xmlns:mm0="http://fedorahosted.org/mirrormanager">
+ <files>
+  <file name="repomd.xml">
+   <mm0:timestamp>1764150000</mm0:timestamp>
+   <size>7045</size>
+    <verification>
+     <hash type="md5">43b5c9175984c071f30b873fdce0a000</hash>
+     <hash type="sha1">405ab5d2b930fe3725b3cb1ace051f9fd3d6d7af</hash>
+     <hash type="sha256">97b0560280ed60a5a1eaa1bc45492543c8a986ad5a25b468c427eb83c3e88191</hash>
+     <hash type="sha512">b537be33c31741f9d6343c37446fa62c89faf3ebbf9e21061dcbc9ca87fdda16a43efaaa984607d8d8e0980d35af8ed215f264ea7b81bf1b272c8c8c168bb212</hash>
+    </verification>
+   <mm0:alternates>
+    <mm0:alternate>
+     <mm0:timestamp>1764060000</mm0:timestamp>
+     <size>7046</size>
+    <verification>
+     <hash type="md5">6a3a6f6e33217afa6373df9d6b2e8a00</hash>
+     <hash type="sha1">6fa5fbbc16c8f82ea478e5b933b345e46dd285ea</hash>
+     <hash type="sha256">da925a30e31f7fdaa7044e3e5ba4ae17670de82d677b0e7adf5700428a137a36</hash>
+     <hash type="sha512">feb1e08e36c46ba75f4e93a7ade87f1e5935e229ac47f3ce9fbbebd8150c10464db15cb32d7972e4492bead978e5314bdb0fda6a17b241cd5205c1190b7a2854</hash>
+    </verification>
+    </mm0:alternate>
+   </mm0:alternates>
+   <resources maxconnections="1">
+    <url protocol="https" type="https" location="DE" preference="100">https://ftp.fau.de/fedora/linux/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+    <url protocol="http" type="http" location="DE" preference="100">http://ftp.fau.de/fedora/linux/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+    <url protocol="rsync" type="rsync" location="DE" preference="99">rsync://ftp.fau.de/fedora/linux/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+    <url protocol="https" type="https" location="CZ" preference="98">https://mirror.karneval.cz/pub/linux/fedora/linux/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+    <url protocol="ftp" type="ftp" location="US" preference="97">ftp://mirrors.kernel.org/fedora/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+    <url protocol="http" type="bittorrent" location="US" preference="100">http://torrent.fedoraproject.org/repomd.xml.torrent</url>
+    <url protocol="https" type="https" location="US" preference="10">https://dl.fedoraproject.org/pub/fedora/linux/updates/41/Everything/x86_64/repodata/repomd.xml</url>
+   </resources>
+  </file>
+ </files>
+</metalink>
