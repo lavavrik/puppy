@@ -88,6 +88,12 @@ pub struct WorkerCtx {
     pub limiters: [TokenBucket; 2],
     pub cfg: HttpConfig,
     pub cancel: CancellationToken,
+    /// The download has other mirrors to fail over to: a retryable failure ends the
+    /// worker at once ([`WorkerExit::Retryable`]) instead of being retried here, so the
+    /// range can move to another mirror.
+    pub failover: bool,
+    /// Bytes received from this location (shared by its workers).
+    pub got: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +104,17 @@ pub enum WorkerExit {
     RangeUnsupported,
     /// The URL answered 401/403/404/410: possibly an expired signed redirect target.
     UrlRejected(u16),
+    /// A local failure (writing the file): no other server can help.
     Fatal(String),
+    /// The server answered with something unusable (an unexpected status, compressed
+    /// content): this location cannot serve the range.
+    Refused(String),
+    /// With `failover`: one attempt failed on an error that may go away by itself;
+    /// `progress` if it wrote bytes first.
+    Retryable {
+        why: String,
+        progress: bool,
+    },
     /// Every retry failed on errors that may go away by themselves (network errors,
     /// timeouts, HTTP 5xx/429/408).
     Exhausted(String),
@@ -170,6 +186,9 @@ pub async fn run_segment(ctx: &WorkerCtx, start: u64, seg: Arc<SegmentShared>) -
         seg.active.store(false, Ordering::Relaxed);
         match result {
             Attempt::Exit(e) => return e,
+            Attempt::Retry { progress, why } if ctx.failover => {
+                return WorkerExit::Retryable { why, progress };
+            }
             Attempt::Retry { progress, why } => {
                 if progress {
                     attempt = 0;
@@ -309,11 +328,11 @@ async fn attempt_once(
         s if is_url_rejected(s.as_u16()) => {
             return Attempt::Exit(WorkerExit::UrlRejected(s.as_u16()));
         }
-        s => return Attempt::Exit(WorkerExit::Fatal(format!("HTTP {}", s.as_u16()))),
+        s => return Attempt::Exit(WorkerExit::Refused(format!("HTTP {}", s.as_u16()))),
     }
 
     if let Some(why) = compressed(resp.headers()) {
-        return Attempt::Exit(WorkerExit::Fatal(why));
+        return Attempt::Exit(WorkerExit::Refused(why));
     }
     let mut stream = resp.bytes_stream();
     let mut progress = false;
@@ -380,6 +399,7 @@ async fn attempt_once(
             }
             progress = true;
             seg.done.fetch_add(n, Ordering::Release);
+            ctx.got.fetch_add(n, Ordering::Relaxed);
             debug_assert!(start + seg.done.load(Ordering::Acquire) <= seg.lock().end);
             let now = Instant::now();
             meter.record(n, now);

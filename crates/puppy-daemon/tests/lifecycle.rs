@@ -168,6 +168,7 @@ impl Env {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -673,6 +674,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;
@@ -700,6 +702,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;

@@ -6,7 +6,7 @@ use crate::engine::EngineError;
 use crate::http::probe::{apply_context, timed};
 use crate::http::resume::HttpResumeState;
 use crate::http::worker::{compressed, parse_content_range};
-use crate::types::{RequestContext, Source};
+use crate::types::RequestContext;
 use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use std::io::{Read, Seek, SeekFrom};
@@ -29,19 +29,20 @@ pub enum Validation {
 /// is sent as `If-Range` but (1 s granularity) the spot check runs as well; a weak ETag
 /// counts as no validator. Network and unexpected HTTP errors are `Err` (transient), never
 /// `Changed`; so is exceeding `cfg.validate_timeout_ms`.
+///
+/// `ctx` is the context of requests to `origin` (the source, or a mirror's URL); the
+/// requests go to `state.final_url`, possibly another origin (see
+/// [`RequestContext::for_target`]).
 pub async fn validate_remote(
     client: &reqwest::Client,
     ctx: &RequestContext,
+    origin: &url::Url,
     state: &HttpResumeState,
     part: &Path,
     cfg: &HttpConfig,
 ) -> Result<Validation, EngineError> {
     let limit = Duration::from_millis(cfg.validate_timeout_ms);
-    // Validation goes to the final URL, which may be another origin than the source.
-    let ctx = &match &state.request.source {
-        Source::Http { url } => ctx.for_target(url, &state.final_url),
-        _ => RequestContext::default(),
-    };
+    let ctx = &ctx.for_target(origin, &state.final_url);
     let net = Net {
         client,
         ctx,

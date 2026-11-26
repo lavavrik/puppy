@@ -7,7 +7,9 @@ use super::seed;
 use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
 use puppy_core::checksum::Checksum;
-use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, SeedPolicy, Source};
+use puppy_core::types::{
+    AddRequest, DownloadId, FileChoice, Mirror, RequestContext, SeedPolicy, Source,
+};
 use puppy_proto::{ReplyData, Request};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
 use puppy_tui::format::parse_rate;
@@ -40,6 +42,8 @@ pub struct AddArgs {
     pub seed_time: Option<String>,
     /// `-i FILE`: an aria2-style input file (`-`: stdin), added after `sources`.
     pub input_file: Option<PathBuf>,
+    /// `--mirror URL` (repeatable): other locations of the one HTTP(S) source's file.
+    pub mirrors: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +146,8 @@ struct Defaults {
     choice: FileChoice,
     seed: Option<SeedPolicy>,
     checksum: Option<Checksum>,
+    /// `--mirror`s (for the one source there is).
+    mirrors: Vec<Mirror>,
 }
 
 /// One download to add, fully decided.
@@ -157,7 +163,14 @@ impl Defaults {
     /// `source` with these defaults, overridden by `o` (an input-file entry's options;
     /// empty for a command-line source). An entry's `header` replaces a `-H` of the same
     /// name and adds the rest; a seeding option replaces only its half of the policy.
-    fn plan(&self, shown: String, source: Source, o: &EntryOptions) -> Planned {
+    /// `mirrors` are the entry's own (TAB-separated URIs); `--mirror`s come after them.
+    fn plan(
+        &self,
+        shown: String,
+        source: Source,
+        mirrors: Vec<Mirror>,
+        o: &EntryOptions,
+    ) -> Planned {
         let mut context = self.context.clone();
         context.headers.retain(|(n, _)| {
             !o.headers
@@ -196,6 +209,10 @@ impl Defaults {
                 files,
                 seed,
                 checksum: o.checksum.clone().or_else(|| self.checksum.clone()),
+                mirrors: mirrors
+                    .into_iter()
+                    .chain(self.mirrors.iter().cloned())
+                    .collect(),
             },
             paused: o.pause.unwrap_or(self.paused),
             limit: o.limit.unwrap_or(self.limit),
@@ -236,14 +253,6 @@ fn plan_input_file(
                 message,
             })
         };
-        if entry.uris.len() > 1 && !input_file::MIRRORS_SUPPORTED {
-            bad(format!(
-                "{} TAB-separated URIs: mirrors (several URIs for one file) are not \
-                 supported yet; put each on its own line to download them separately",
-                entry.uris.len()
-            ));
-            continue;
-        }
         let uri = &entry.uris[0];
         let source = match parse_source(uri) {
             Ok(s) => s,
@@ -252,6 +261,22 @@ fn plan_input_file(
                 continue;
             }
         };
+        let mut mirrors = Vec::new();
+        for m in &entry.uris[1..] {
+            match parse_mirror(m) {
+                Ok(m) => mirrors.push(m),
+                Err(e) => bad(e),
+            }
+        }
+        if mirrors.len() + 1 < entry.uris.len() {
+            continue;
+        }
+        if !mirrors.is_empty() && !matches!(source, Source::Http { .. }) {
+            bad(format!(
+                "TAB-separated mirrors only apply to HTTP(S) downloads, but {uri} is a torrent"
+            ));
+            continue;
+        }
         let Some(o) = options else { continue };
         if matches!(source, Source::Http { .. }) {
             if let Some(key) = o.torrent_only() {
@@ -271,7 +296,7 @@ fn plan_input_file(
             bad("pause=true does not go with --wait: a paused download never ends".into());
             continue;
         }
-        planned.push(defaults.plan(unquote(uri).to_string(), source, &o));
+        planned.push(defaults.plan(unquote(uri).to_string(), source, mirrors, &o));
     }
     errors.sort_by_key(|e| e.line);
     match errors.as_slice() {
@@ -288,6 +313,19 @@ fn plan_input_file(
                 many.len()
             )))
         }
+    }
+}
+
+/// A mirror URL (`--mirror`, a TAB-separated URI): absolute HTTP(S).
+fn parse_mirror(s: &str) -> Result<Mirror, String> {
+    let s = unquote(s.trim());
+    match url::Url::parse(s) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => Ok(Mirror::new(u)),
+        Ok(u) => Err(format!(
+            "mirror {s}: only HTTP(S) mirrors are supported, not {}:",
+            u.scheme()
+        )),
+        Err(e) => Err(format!("mirror {s}: not a URL ({e})")),
     }
 }
 
@@ -385,6 +423,16 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             "--checksum needs exactly one source: one digest cannot match several files".into(),
         ));
     }
+    let mirrors = args
+        .mirrors
+        .iter()
+        .map(|m| parse_mirror(m).map_err(|e| CliError::Usage(format!("bad --mirror: {e}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !mirrors.is_empty() && file.is_none() && args.sources.len() != 1 {
+        return Err(CliError::Usage(
+            "--mirror needs exactly one source: mirrors are other places of one file".into(),
+        ));
+    }
     if file.as_deref() == Some(Path::new("-")) && args.sources.iter().any(|s| s == "-") {
         return Err(CliError::Usage(
             "stdin can only be read once: give `-` as a source or `-i -`, not both".into(),
@@ -404,6 +452,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         choice,
         seed,
         checksum,
+        mirrors,
     };
 
     // Plan everything first: usage-level problems should not leave a half-done add.
@@ -430,13 +479,20 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             "--checksum needs exactly one source: one digest cannot match several files".into(),
         ));
     }
+    if !defaults.mirrors.is_empty() && total != 1 {
+        return Err(CliError::Usage(
+            "--mirror needs exactly one source: mirrors are other places of one file".into(),
+        ));
+    }
 
     let mut failed = Vec::new();
     let mut planned = Vec::new();
     let none = EntryOptions::default();
     for s in &sources {
         match parse_source(s) {
-            Ok(source) => planned.push(defaults.plan(unquote(s).to_string(), source, &none)),
+            Ok(source) => {
+                planned.push(defaults.plan(unquote(s).to_string(), source, Vec::new(), &none))
+            }
             Err(e) => {
                 err(format_args!("puppy: {s}: {e}"));
                 failed.push(Failed {
@@ -480,6 +536,26 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         )));
     }
 
+    if !defaults.mirrors.is_empty()
+        && let Some(p) = planned
+            .iter()
+            .find(|p| !matches!(p.req.source, Source::Http { .. }))
+    {
+        return Err(CliError::Usage(format!(
+            "--mirror only applies to HTTP(S) downloads, but {} is a torrent",
+            p.shown
+        )));
+    }
+    for p in &planned {
+        if !p.req.mirrors.is_empty() && p.req.checksum.is_none() {
+            err(format_args!(
+                "puppy: {}: warning: mirrors without a checksum: a mirror that serves \
+                 different bytes of the same size would go unnoticed (add --checksum)",
+                p.shown
+            ));
+        }
+    }
+
     let mut added = Vec::new();
     if !planned.is_empty() {
         let client = ctx.client().await?;
@@ -491,9 +567,12 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         } in planned
         {
             let verify = req.checksum.is_some();
+            let mirrored = !req.mirrors.is_empty();
             let name = req.filename.clone();
             let result = match client.add(req, paused, limit).await {
-                Ok(id) if verify => check_checksum_kept(&client, id).await,
+                Ok(id) if verify || mirrored => {
+                    check_kept(&client, id, &shown, (verify, mirrored)).await
+                }
                 r => r.map_err(Into::into),
             };
             match result {
@@ -554,17 +633,28 @@ enum AddError {
     NoChecksumSupport,
 }
 
-/// A daemon older than checksums ignores the field: the download it added would never
-/// be verified. Its snapshot then has no checksum; such a download is removed again.
-async fn check_checksum_kept(
+/// A daemon older than checksums or mirrors ignores those fields. Without its checksum
+/// the download would never be verified, so it is removed again. Without its mirrors it
+/// still downloads the right file, from the primary only: that is only warned about.
+async fn check_kept(
     client: &puppy_client::Client,
     id: DownloadId,
+    shown: &str,
+    (want_checksum, want_mirrors): (bool, bool),
 ) -> Result<DownloadId, AddError> {
-    let kept = match client.call(Request::Get { id }).await? {
-        ReplyData::Download { download, .. } => download.checksum.is_some(),
-        _ => false,
+    let (checksum, mirrors) = match client.call(Request::Get { id }).await? {
+        ReplyData::Download { download, .. } => {
+            (download.checksum.is_some(), !download.mirrors.is_empty())
+        }
+        _ => (false, false),
     };
-    if kept {
+    if want_mirrors && !mirrors {
+        err(format_args!(
+            "puppy: {shown}: warning: the running puppy daemon is too old for mirrors, \
+             so it downloads from the first URL only; run `puppy stop` to restart it"
+        ));
+    }
+    if checksum || !want_checksum {
         return Ok(id);
     }
     if let Err(e) = client

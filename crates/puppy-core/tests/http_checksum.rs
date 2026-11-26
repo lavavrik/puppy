@@ -38,6 +38,7 @@ fn request(s: &TestServer, dir: &Path, checksum: Option<Checksum>) -> AddRequest
         files: Default::default(),
         seed: None,
         checksum,
+        mirrors: Vec::new(),
     }
 }
 

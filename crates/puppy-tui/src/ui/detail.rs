@@ -1,7 +1,7 @@
 //! The detail pane: everything about the selected download, its speed history and its
 //! segment strip (HTTP) or piece map (torrent).
 
-use puppy_core::types::{EngineDetail, SegmentView};
+use puppy_core::types::{EngineDetail, MirrorState, MirrorView, SegmentView};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Verification, WireState};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -39,6 +39,8 @@ const MAP_MIN: u16 = 2;
 const PIECE_ROWS: u16 = 8;
 /// Connection bar rows at most.
 const CONN_ROWS: u16 = 8;
+/// Mirror rows at most (below their heading).
+const MIRROR_ROWS: u16 = 6;
 /// Blank columns between the two grid columns.
 const GUTTER: u16 = 3;
 
@@ -101,6 +103,7 @@ enum Engine<'a> {
         segments: &'a [SegmentView],
         connections: u16,
         resumable: bool,
+        mirrors: &'a [MirrorView],
     },
     Torrent {
         piece_count: u32,
@@ -123,6 +126,8 @@ struct Plan {
     spark: u16,
     /// Connection bar rows (HTTP).
     conn: u16,
+    /// Mirrors heading plus one row per mirror shown (HTTP with mirrors; 0: none).
+    mirrors: u16,
     /// Torrent: the swarm summary line.
     summary: bool,
     /// Torrent: piece map rows.
@@ -143,11 +148,19 @@ impl Plan {
             gaps: [false; 4],
             spark: 0,
             conn: 0,
+            mirrors: 0,
             summary: false,
             map: 0,
         };
         match engine {
-            Engine::Http { segments, .. } => {
+            Engine::Http {
+                segments, mirrors, ..
+            } => {
+                // Which mirrors are in use comes before the connection bars.
+                let rows = u16::try_from(mirrors.len()).unwrap_or(u16::MAX);
+                if rows > 0 && avail >= 2 {
+                    plan.mirrors = take(&mut avail, 1 + rows.min(MIRROR_ROWS));
+                }
                 let active = segments.iter().filter(|s| s.active).count();
                 plan.conn = take(
                     &mut avail,
@@ -200,10 +213,12 @@ impl<'a> Engine<'a> {
                 segments,
                 connections,
                 resumable,
+                mirrors,
             }) => Engine::Http {
                 segments,
                 connections: *connections,
                 resumable: *resumable,
+                mirrors,
             },
             Some(EngineDetail::Torrent {
                 piece_count,
@@ -238,6 +253,7 @@ impl<'a> Engine<'a> {
                 segments,
                 connections,
                 resumable,
+                mirrors,
             } => {
                 let Some(head) = c.line() else { return };
                 let plural = if connections == 1 { "" } else { "s" };
@@ -258,6 +274,9 @@ impl<'a> Engine<'a> {
                         theme: t,
                     }
                     .render(r, buf);
+                }
+                if plan.mirrors > 0 {
+                    mirror_rows(t, buf, c, mirrors, plan.mirrors - 1);
                 }
                 c.gap(plan.gaps[3]);
                 if let Some(r) = c.take(plan.conn) {
@@ -315,6 +334,68 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+}
+
+/// The `Mirrors` heading ("2 of 3 in use") and up to `rows` mirrors: each URL with how
+/// it is used (connections and speed, benched with its reason, or dropped with its
+/// reason).
+fn mirror_rows(t: &Theme, buf: &mut Buffer, c: &mut Cursor, mirrors: &[MirrorView], rows: u16) {
+    let Some(head) = c.line() else { return };
+    let in_use = mirrors
+        .iter()
+        .filter(|m| m.state == MirrorState::InUse)
+        .count();
+    let note = format!("{in_use} of {} in use", mirrors.len());
+    heading(t, buf, head, "Mirrors", &note);
+    let shown = mirrors.len().min(usize::from(rows));
+    for (i, m) in mirrors.iter().take(shown).enumerate() {
+        let Some(r) = c.line() else { return };
+        let more = mirrors.len() - shown;
+        if i + 1 == shown && more > 0 {
+            let msg = format!("… and {} more (puppy info)", more + 1);
+            text(buf, r.x, r.y, r.width, &msg, t.style(Token::Dim));
+            return;
+        }
+        let (status, tok) = mirror_status(m);
+        let url = format::display_safe(&m.url);
+        let status_w = u16::try_from(status.chars().count()).unwrap_or(u16::MAX);
+        // The status keeps its room; the URL is shortened in the middle.
+        let url_len = u16::try_from(url.chars().count()).unwrap_or(u16::MAX);
+        let url_w = url_len.min(r.width.saturating_sub(status_w + 2).max(r.width * 2 / 5));
+        let shown_url = format::truncate_middle(&url, usize::from(url_w));
+        text(buf, r.x, r.y, url_w, &shown_url, t.style(Token::Text));
+        let x = r.x + url_w.min(r.width) + 2;
+        if x < r.right() {
+            text(buf, x, r.y, r.right() - x, &status, t.style(tok));
+        }
+    }
+}
+
+/// How one mirror is used, in a few words, and its colour.
+pub fn mirror_status(m: &MirrorView) -> (String, Token) {
+    match &m.state {
+        MirrorState::InUse if m.connections > 0 => {
+            let plural = if m.connections == 1 { "" } else { "s" };
+            let s = format!("{} conn{plural} · {}", m.connections, format::speed(m.bps));
+            (s, Token::Ok)
+        }
+        MirrorState::InUse => ("in use".into(), Token::Text),
+        MirrorState::Benched {
+            reason,
+            retry_in_secs,
+        } => (
+            format!(
+                "retry in {retry_in_secs} s: {}",
+                format::display_safe(reason)
+            ),
+            Token::Warn,
+        ),
+        MirrorState::Dropped { reason } => (
+            format!("dropped: {}", format::display_safe(reason)),
+            Token::Err,
+        ),
+        MirrorState::Unknown => ("unknown".into(), Token::Dim),
     }
 }
 

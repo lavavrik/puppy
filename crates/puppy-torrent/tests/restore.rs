@@ -48,6 +48,7 @@ fn req(root: &Path, source: Source) -> AddRequest {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 

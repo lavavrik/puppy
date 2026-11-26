@@ -33,6 +33,7 @@ fn snap(id: DownloadId, state: WireState) -> DownloadSnapshot {
         note: None,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 

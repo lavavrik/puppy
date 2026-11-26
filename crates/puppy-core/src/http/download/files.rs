@@ -1,5 +1,8 @@
 //! Filesystem steps of a download: reserving `<final>.part` and finalizing it.
 
+use super::mirrors::{
+    DropKind, Health, MirrorRt, Validators, kind_of, locations, size_differs, summary,
+};
 use super::{Inner, SegEntry};
 use crate::config::HttpConfig;
 use crate::engine::EngineError;
@@ -15,15 +18,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Probes the remote and reserves `<final>.part` in the output directory.
+/// Probes every location of the file (the source and its mirrors, concurrently), keeps
+/// the ones that agree (see [`choose`]) and reserves `<final>.part` in the output
+/// directory.
 pub(super) async fn prepare(
     client: &reqwest::Client,
-    url: &url::Url,
     req: &AddRequest,
     cfg: &HttpConfig,
-) -> Result<(RemoteInfo, PathBuf), EngineError> {
+) -> Result<(RemoteInfo, Vec<MirrorRt>, PathBuf), EngineError> {
     let read_timeout = std::time::Duration::from_millis(cfg.read_timeout_ms);
-    let remote = probe(client, url, &req.context, read_timeout).await?;
+    let mut mirrors = locations(req);
+    let probes = futures_util::future::join_all(
+        mirrors
+            .iter()
+            .map(|m| probe(client, &m.url, &m.context, read_timeout)),
+    )
+    .await;
+    let remote = choose(&mut mirrors, probes)?;
     let dir = req
         .output_dir
         .clone()
@@ -35,7 +46,82 @@ pub(super) async fn prepare(
         .unwrap_or_else(|| remote.filename.clone());
     let total = remote.total;
     let final_path = blocking(move || create_part(&dir, &name, total)).await?;
-    Ok((remote, final_path))
+    Ok((remote, mirrors, final_path))
+}
+
+/// Decides which locations a fresh download uses, from their probes (in the order of
+/// `mirrors`, the primary first), and returns the facts about the file.
+///
+/// The file is what the primary says it is (or, if the primary did not answer, the
+/// first mirror that did): its size and name. A location that failed its probe, or has
+/// another size, is dropped. Of the rest, the ones that honour ranges are used; if none
+/// does (or the size is unknown, so nothing can be compared), one stream goes to the
+/// first and the others are dropped. Without any answer, the primary's error (or, with
+/// mirrors and some transient error among them, a transient one naming them all).
+pub(super) fn choose(
+    mirrors: &mut [MirrorRt],
+    probes: Vec<Result<RemoteInfo, EngineError>>,
+) -> Result<RemoteInfo, EngineError> {
+    let mut answered = Vec::new();
+    let mut first_err = None;
+    for (i, probe) in probes.into_iter().enumerate() {
+        match probe {
+            Ok(info) => answered.push((i, info)),
+            Err(e) => {
+                mirrors[i].drop_with(kind_of(&e), format!("probe failed: {e}"));
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    let Some((_, reference)) = answered.first().cloned() else {
+        let e = first_err.expect("one probe per location");
+        let transient = mirrors.iter().any(|m| {
+            matches!(
+                m.health,
+                Health::Dropped {
+                    kind: DropKind::Transient,
+                    ..
+                }
+            )
+        });
+        if mirrors.len() > 1 && transient {
+            return Err(EngineError::Unavailable(summary(mirrors)));
+        }
+        return Err(e);
+    };
+    let total = reference.total;
+    let mut agreeing = Vec::new();
+    for (i, info) in answered {
+        if total.is_some() && info.total == total {
+            agreeing.push((i, info));
+        } else if total.is_none() && agreeing.is_empty() {
+            agreeing.push((i, info)); // the reference itself
+        } else if total.is_none() {
+            mirrors[i].drop_with(
+                DropKind::Fatal,
+                "the file's size is unknown, so mirrors cannot be compared",
+            );
+        } else {
+            mirrors[i].drop_with(DropKind::Changed, size_differs(info.total, total));
+        }
+    }
+    let ranged = total.is_some() && agreeing.iter().any(|(_, info)| info.accepts_ranges);
+    for (n, (i, info)) in agreeing.iter().enumerate() {
+        if ranged && !info.accepts_ranges {
+            mirrors[*i].drop_with(DropKind::RangeUnsupported, "does not honour range requests");
+        } else if !ranged && n > 0 {
+            mirrors[*i].drop_with(
+                DropKind::RangeUnsupported,
+                "one stream only: no location honours range requests",
+            );
+        } else {
+            mirrors[*i].v = Validators::of(info);
+        }
+    }
+    Ok(RemoteInfo {
+        accepts_ranges: ranged || reference.accepts_ranges,
+        ..reference
+    })
 }
 
 /// Picks a free name and creates its `.part` with `create_new` (retrying if another

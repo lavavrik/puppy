@@ -31,6 +31,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         note: None,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 
@@ -690,6 +691,7 @@ fn http_detail(connections: u16) -> puppy_core::types::EngineDetail {
         segments: Vec::new(),
         connections,
         resumable: true,
+        mirrors: Vec::new(),
     }
 }
 

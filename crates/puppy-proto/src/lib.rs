@@ -306,6 +306,10 @@ pub struct DownloadSnapshot {
     /// The checksum the file is verified against once complete (`add --checksum`).
     #[serde(default)]
     pub checksum: Option<Checksum>,
+    /// The mirrors of an HTTP download (`add --mirror`), display form (a password
+    /// masked), in the order given; how each is used is in the engine detail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
 }
 
 /// Where a download with a checksum stands with it, derived from its state.
@@ -510,6 +514,7 @@ mod tests {
             note: None,
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -600,6 +605,7 @@ mod tests {
                     files: Default::default(),
                     seed: None,
                     checksum: None,
+                    mirrors: Vec::new(),
                 },
                 start_paused: true,
                 limit: Some(9),

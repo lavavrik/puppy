@@ -1,6 +1,7 @@
 //! Restoring a download from its sidecar after a crash or restart.
 
 use super::files::file_len;
+use super::mirrors::{MirrorRt, Validators, locations, restore_records};
 use super::transfer::spawn_run;
 use super::{Env, HttpDownload, Plan, SegEntry, file_name};
 use crate::config::HttpConfig;
@@ -96,7 +97,8 @@ impl HttpDownload {
         {
             if foreign {
                 let remote = unknown_remote(&url, &final_path);
-                let (inner, added) = env.build(req, remote, final_path, Plan::unknown());
+                let mirrors = locations(&req);
+                let (inner, added) = env.build(req, remote, mirrors, final_path, Plan::unknown());
                 inner.needs_attention(AttentionReason::ValidationFailed {
                     detail: "resume sidecar belongs to a different source".into(),
                 });
@@ -108,18 +110,19 @@ impl HttpDownload {
                 && total != len
             {
                 let remote = from_sidecar(state, &final_path);
-                let (inner, added) = env.build(req, remote, final_path, Plan::unknown());
+                let mirrors = mirrors_from(&req, state);
+                let (inner, added) = env.build(req, remote, mirrors, final_path, Plan::unknown());
                 inner.needs_attention(AttentionReason::ValidationFailed {
                     detail: format!("final file is {len} bytes, expected {total}"),
                 });
                 return Ok((HttpDownload { inner }, added));
             }
-            let mut remote = match &loaded {
-                Ok(state) => from_sidecar(state, &final_path),
-                Err(_) => unknown_remote(&url, &final_path),
+            let (mut remote, mirrors) = match &loaded {
+                Ok(state) => (from_sidecar(state, &final_path), mirrors_from(&req, state)),
+                Err(_) => (unknown_remote(&url, &final_path), locations(&req)),
             };
             remote.total = Some(len);
-            let (inner, added) = env.build(req, remote, final_path, Plan::finished(len));
+            let (inner, added) = env.build(req, remote, mirrors, final_path, Plan::finished(len));
             inner.lock().finalized = true;
             if inner.request.checksum.is_some() {
                 // Not verified yet (or it failed): the sidecar stays until it passes.
@@ -145,7 +148,8 @@ impl HttpDownload {
             Ok(s) => s,
             Err(e) => {
                 let remote = unknown_remote(&url, &final_path);
-                let (inner, added) = env.build(req, remote, final_path, Plan::unknown());
+                let mirrors = locations(&req);
+                let (inner, added) = env.build(req, remote, mirrors, final_path, Plan::unknown());
                 inner.needs_attention(AttentionReason::ValidationFailed {
                     detail: format!("cannot load resume sidecar: {e}"),
                 });
@@ -158,7 +162,8 @@ impl HttpDownload {
             tracing::info!(id, "request context differs from the one recorded");
         }
         let remote = from_sidecar(&state, &final_path);
-        let (inner, added) = env.build(req, remote, final_path, Plan::restored(&state));
+        let mirrors = mirrors_from(&req, &state);
+        let (inner, added) = env.build(req, remote, mirrors, final_path, Plan::restored(&state));
         let reason = match (part_len, state.total) {
             (None, _) => Some(AttentionReason::ValidationFailed {
                 detail: "partial file is missing".into(),
@@ -196,6 +201,23 @@ fn check_source(state: HttpResumeState, req: &AddRequest) -> Result<HttpResumeSt
         ));
     }
     Ok(state)
+}
+
+/// The request's locations with the validators the sidecar recorded for each (the
+/// primary's are its top-level fields). Mirrors are those of the request (the daemon's
+/// record), matched to the sidecar's by URL.
+fn mirrors_from(req: &AddRequest, state: &HttpResumeState) -> Vec<MirrorRt> {
+    let mut mirrors = locations(req);
+    if let Some(primary) = mirrors.first_mut() {
+        primary.v = Validators {
+            final_url: state.final_url.clone(),
+            etag: state.etag.clone(),
+            etag_strong: state.etag_strong,
+            last_modified: state.last_modified.clone(),
+        };
+    }
+    restore_records(&mut mirrors, &state.mirrors);
+    mirrors
 }
 
 /// Remote facts recorded in a sidecar.

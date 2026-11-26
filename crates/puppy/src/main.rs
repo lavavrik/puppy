@@ -68,6 +68,7 @@ impl From<ThemeArg> for ThemeChoice {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // parsed once per run; boxing buys nothing
 enum Command {
     /// Run the background daemon that owns all downloads (normally started by a
     /// login service, or automatically by `puppy`).
@@ -125,6 +126,11 @@ enum Command {
         /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S) source only.
         #[arg(long, value_name = "ALGO=HEX")]
         checksum: Option<String>,
+        /// Another URL of the same file (repeatable; one HTTP(S) source only):
+        /// connections are spread over the URLs that agree on the file, and fail over
+        /// between them. Cookies and headers go to the source's origin only.
+        #[arg(long = "mirror", value_name = "URL")]
+        mirrors: Vec<String>,
         /// Torrent: download only these files, by number as `puppy files` shows
         /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable. Every comma splits
         /// specs: use numbers for brace globs or names containing a comma.
@@ -338,6 +344,7 @@ fn main() -> ExitCode {
                 seed_ratio,
                 seed_time,
                 input_file,
+                mirrors,
             }) => {
                 cli::add::run(
                     &Ctx::from_env(cli.json)?,
@@ -356,6 +363,7 @@ fn main() -> ExitCode {
                         seed_ratio,
                         seed_time,
                         input_file,
+                        mirrors,
                     },
                     wait,
                 )

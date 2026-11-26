@@ -528,6 +528,7 @@ mod tests {
             note: None,
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 

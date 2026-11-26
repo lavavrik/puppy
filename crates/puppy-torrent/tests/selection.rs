@@ -102,6 +102,7 @@ impl Env {
             files,
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 

@@ -2,20 +2,14 @@
 
 use super::{Entry, Inner, Manager, ManagerError, is_active, is_finished, is_seeding};
 use puppy_core::engine::EngineKind;
-use puppy_core::types::{DownloadId, DownloadState, EngineDetail, Source};
+use puppy_core::types::{DownloadId, DownloadState, EngineDetail, Source, masked_url};
 use puppy_proto::{DownloadSnapshot, EngineKindTag, Totals};
 
 /// How a source is shown: the URL (with any password masked), the magnet URI or the
 /// .torrent path.
 fn source_display(source: &Source) -> String {
     match source {
-        Source::Http { url } if url.password().is_some() => {
-            let mut shown = url.clone();
-            // Only fails for URLs that cannot have credentials, which this one has.
-            let _ = shown.set_password(Some("***"));
-            shown.to_string()
-        }
-        Source::Http { url } => url.to_string(),
+        Source::Http { url } => masked_url(url),
         Source::Magnet { uri } => uri.clone(),
         Source::TorrentFile { path } => path.display().to_string(),
     }
@@ -119,6 +113,13 @@ impl Inner {
             note: status.as_ref().and_then(|s| s.note.clone()),
             seed: e.rec.request.seed.clone(),
             checksum: e.rec.request.checksum.clone(),
+            mirrors: e
+                .rec
+                .request
+                .mirrors
+                .iter()
+                .map(|m| masked_url(&m.url))
+                .collect(),
         };
         (snap, detail)
     }

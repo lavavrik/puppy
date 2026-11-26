@@ -45,6 +45,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         note: None,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 
@@ -424,6 +425,7 @@ fn http_detail() -> EngineDetail {
         ],
         connections: 2,
         resumable: true,
+        mirrors: Vec::new(),
     }
 }
 
@@ -1140,6 +1142,7 @@ fn detail_placeholder_reserves_the_http_height() {
         segments: Vec::new(),
         connections: 1,
         resumable: true,
+        mirrors: Vec::new(),
     };
     for (w, h) in [(80u16, 24u16), (80, 30), (120, 24)] {
         let mut a = app(vec![active(1, "ubuntu.iso")]);
@@ -1375,4 +1378,53 @@ fn render_verifying_row_and_checksum_detail() {
         "{:?}",
         r[line]
     );
+}
+
+#[test]
+fn detail_lists_the_mirrors_and_their_state() {
+    use puppy_core::types::{MirrorState, MirrorView};
+    let view = |url: &str, primary, state, connections| MirrorView {
+        url: url.into(),
+        primary,
+        state,
+        connections,
+        bps: 1024 * 1024,
+        done_bytes: 0,
+    };
+    let EngineDetail::Http {
+        segments,
+        connections,
+        resumable,
+        ..
+    } = http_detail()
+    else {
+        unreachable!()
+    };
+    let detail = EngineDetail::Http {
+        segments,
+        connections,
+        resumable,
+        mirrors: vec![
+            view("https://a.example/f.iso", true, MirrorState::InUse, 4),
+            view(
+                "https://b.example/f.iso",
+                false,
+                MirrorState::Dropped {
+                    reason: "probe failed: http status 404".into(),
+                },
+                0,
+            ),
+        ],
+    };
+    let mut a = app(vec![active(1, "ubuntu.iso")]);
+    a.detail = Some((1, detail));
+    let rows = render(&mut a, 120, 40);
+    assert!(find(&rows, "Mirrors").is_some(), "{rows:#?}");
+    assert!(find(&rows, "1 of 2 in use").is_some(), "{rows:#?}");
+    assert!(
+        find(&rows, "https://a.example/f.iso").is_some(),
+        "{rows:#?}"
+    );
+    assert!(find(&rows, "4 conns").is_some(), "{rows:#?}");
+    assert!(find(&rows, "dropped: probe failed").is_some(), "{rows:#?}");
 }

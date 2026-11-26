@@ -385,6 +385,7 @@ mod tests {
                     files: Default::default(),
                     seed: None,
                     checksum: None,
+                    mirrors: Vec::new(),
                 },
                 limit: Some(5),
                 state: StoredState::Failed {
@@ -515,6 +516,36 @@ mod tests {
             raw.contains("a9993e364706816aba3e25717850c26c9cd0d89d"),
             "{raw}"
         );
+    }
+
+    /// A state file from before mirrors loads with none; one written without mirrors
+    /// has no `mirrors` key (an older daemon reads it as is); mirrors round-trip.
+    #[tokio::test]
+    async fn mirrors_field_is_optional_and_round_trips() {
+        let (d, s) = store();
+        let old = r#"{"version":1,"next_id":2,"order":[1],"settings":null,"downloads":[
+            {"id":1,"request":{"source":{"kind":"http","url":"http://x/f.bin"},
+             "output_dir":null,"filename":null,"context":{"headers":[],"cookies":null,
+             "referer":null,"user_agent":null,"basic_auth":null}},
+             "limit":null,"state":{"kind":"queued"},"name":null,"path":null,
+             "total_bytes":null,"created_unix":1,"finished_unix":null}]}"#;
+        std::fs::write(d.path().join("state.json"), old).unwrap();
+        let st = s.load().await.unwrap();
+        assert_eq!(st.downloads.len(), 1);
+        assert!(st.downloads[0].request.mirrors.is_empty());
+        assert!(corrupt_files(d.path()).is_empty());
+
+        let plain = serde_json::to_string(&sample(3)).unwrap();
+        assert!(!plain.contains("mirrors"), "{plain}");
+
+        let mut st = sample(3);
+        let mut m = puppy_core::types::Mirror::new("https://m.example/f.bin".parse().unwrap());
+        m.priority = Some(2);
+        st.downloads[0].request.mirrors = vec![m];
+        s.save_now(&st).await.unwrap();
+        assert_eq!(s.load().await.unwrap(), st);
+        let raw = std::fs::read_to_string(d.path().join("state.json")).unwrap();
+        assert!(raw.contains("https://m.example/f.bin"), "{raw}");
     }
 
     #[test]

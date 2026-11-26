@@ -5,7 +5,7 @@ use super::output::{ColWidth, json, out, table};
 use super::{CliError, Ctx};
 use crate::cli::ClientError;
 use clap::ValueEnum;
-use puppy_core::types::EngineDetail;
+use puppy_core::types::{EngineDetail, MirrorState, MirrorView};
 use puppy_proto::{DownloadSnapshot, ErrorCode, ReplyData, Request, UpdateStatus, WireAttention};
 use puppy_proto::{Verification, WireState};
 use puppy_tui::format::{bytes, eta, speed};
@@ -300,6 +300,7 @@ pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
             segments,
             connections,
             resumable,
+            mirrors,
         }) => {
             let active = segments.iter().filter(|s| s.active).count();
             kv("segments", format!("{} ({active} active)", segments.len()));
@@ -308,6 +309,13 @@ pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
                 "resumable",
                 if resumable { "yes" } else { "no" }.to_string(),
             );
+            for (i, m) in mirrors.iter().enumerate() {
+                let key = if i == 0 { "mirrors" } else { "" };
+                kv(key, mirror_text(m));
+            }
+            if mirrors.is_empty() {
+                configured_mirrors(&d, &kv);
+            }
         }
         Some(EngineDetail::Torrent {
             piece_count,
@@ -325,7 +333,47 @@ pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
             );
             kv("ratio", format!("{ratio:.2}"));
         }
-        Some(EngineDetail::Unknown) | None => {}
+        Some(EngineDetail::Unknown) | None => configured_mirrors(&d, &kv),
     }
     Ok(())
+}
+
+/// The mirrors as added, when the engine has nothing to say about them (queued, done).
+fn configured_mirrors(d: &DownloadSnapshot, kv: &dyn Fn(&str, String)) {
+    if d.mirrors.is_empty() {
+        return;
+    }
+    kv("mirrors", format!("{} (primary)", display_safe(&d.source)));
+    for m in &d.mirrors {
+        kv("", display_safe(m).into_owned());
+    }
+}
+
+/// `URL (primary): in use, 3 connections, 1.2 MiB/s, 40 MiB from it`, `URL: dropped: …`.
+fn mirror_text(m: &MirrorView) -> String {
+    let url = display_safe(&m.url);
+    let tag = if m.primary { " (primary)" } else { "" };
+    let got = match m.done_bytes {
+        0 => String::new(),
+        n => format!(", {} from it", bytes(n)),
+    };
+    let how = match &m.state {
+        MirrorState::InUse => {
+            let plural = if m.connections == 1 { "" } else { "s" };
+            match m.connections {
+                0 => format!("in use{got}"),
+                n => format!("in use, {n} connection{plural}, {}{got}", speed(m.bps)),
+            }
+        }
+        MirrorState::Benched {
+            reason,
+            retry_in_secs,
+        } => format!(
+            "failed, retried in {retry_in_secs} s: {}{got}",
+            display_safe(reason)
+        ),
+        MirrorState::Dropped { reason } => format!("dropped: {}{got}", display_safe(reason)),
+        MirrorState::Unknown => "unknown".into(),
+    };
+    format!("{url}{tag}: {how}")
 }

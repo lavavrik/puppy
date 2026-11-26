@@ -81,6 +81,7 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let added = engine
         .add(1, req, StartMode::Fresh, AddOptions::default())

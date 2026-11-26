@@ -169,6 +169,7 @@ impl Env {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 }
@@ -374,6 +375,7 @@ async fn daemon_restart_restores_magnet_offline_with_its_name() {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let id = c.add(req, false, None).await.unwrap();
     let seen = watch(&c, id, "transferring", |s| {
@@ -418,6 +420,7 @@ async fn http_only_daemon_never_starts_the_torrent_session() {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
@@ -617,6 +620,7 @@ async fn file_requests_on_http_downloads_are_unsupported() {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
@@ -802,6 +806,7 @@ async fn slots_ignore_choosing_and_seeding() {
         files: FileChoice::Ask,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let idb = c.add(req, false, None).await.unwrap();
     watch(&c, idb, "choosing files", |s| {
@@ -1096,6 +1101,7 @@ async fn restart_keeps_magnet_choosing() {
         files: FileChoice::Ask,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "choosing files", |s| {

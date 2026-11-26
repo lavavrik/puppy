@@ -51,6 +51,7 @@ impl Env {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 

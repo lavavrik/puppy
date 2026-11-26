@@ -3221,6 +3221,7 @@ mod tests {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         };
         engine
             .add(1, req, StartMode::Fresh, AddOptions::default())

@@ -36,6 +36,8 @@ fn make_ctx(s: &TestServer, file: std::fs::File, if_range: Option<&str>) -> Work
         limiters: [TokenBucket::new(None), TokenBucket::new(None)],
         cfg,
         cancel: CancellationToken::new(),
+        failover: false,
+        got: Default::default(),
     }
 }
 
@@ -288,7 +290,7 @@ async fn worker_refuses_compressed_body() {
     let exit = run_segment(&ctx, 0, seg(0, 5000)).await;
     assert_eq!(
         exit,
-        WorkerExit::Fatal("server sent compressed content (gzip)".into())
+        WorkerExit::Refused("server sent compressed content (gzip)".into())
     );
     assert!(
         read_all(&dir).iter().all(|b| *b == 0),

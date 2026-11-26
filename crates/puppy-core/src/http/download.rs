@@ -20,9 +20,10 @@ use crate::http::worker::{SegmentShared, is_url_rejected};
 use crate::limiter::TokenBucket;
 use crate::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, DownloadStatus, EngineDetail,
-    RequestContext, SegmentView, Source,
+    SegmentView, Source,
 };
 use files::{blocking, open_part, prepare};
+use mirrors::{DropKind, Health, MirrorRt, Validators};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use transfer::spawn_run;
 
 mod files;
+mod mirrors;
 mod restore;
 mod transfer;
 mod verify;
@@ -55,7 +57,8 @@ struct Inner {
     global: TokenBucket,
     limit: TokenBucket,
     events: broadcast::Sender<EngineEvent>,
-    /// Facts from the probe; `final_url` is only the initial value of `Shared::final_url`.
+    /// Facts about the file from the probe (size, range support, name). Each location's
+    /// own final URL and validators are in `Shared::mirrors`.
     remote: RemoteInfo,
     final_path: PathBuf,
     name: String,
@@ -73,8 +76,9 @@ struct Inner {
 struct Shared {
     state: DownloadState,
     plan: Plan,
-    /// Where segment requests go; replaced when an expired redirect target is re-resolved.
-    final_url: url::Url,
+    /// The primary URL first, then the mirrors. A location's final URL (where its
+    /// requests go) is replaced when an expired redirect target is re-resolved.
+    mirrors: Vec<MirrorRt>,
     /// Where the finished file is (or will be): `final_path` unless finalizing found that
     /// name taken.
     path: PathBuf,
@@ -213,6 +217,7 @@ impl Env {
         self,
         request: AddRequest,
         remote: RemoteInfo,
+        mirrors: Vec<MirrorRt>,
         final_path: PathBuf,
         plan: Plan,
     ) -> (Arc<Inner>, Added) {
@@ -222,7 +227,6 @@ impl Env {
             path: final_path.clone(),
             total_bytes: remote.total,
         };
-        let final_url = remote.final_url.clone();
         let path = final_path.clone();
         let inner = Arc::new(Inner {
             id: self.id,
@@ -239,7 +243,7 @@ impl Env {
             st: Mutex::new(Shared {
                 state: DownloadState::Starting,
                 plan,
-                final_url,
+                mirrors,
                 path,
                 finalized: false,
             }),
@@ -272,14 +276,13 @@ impl HttpDownload {
         global: TokenBucket,
         events: broadcast::Sender<EngineEvent>,
     ) -> Result<(Self, Added), EngineError> {
-        let Source::Http { url } = &req.source else {
+        if !matches!(req.source, Source::Http { .. }) {
             return Err(EngineError::Unsupported("not an HTTP source"));
-        };
-        let url = url.clone();
+        }
         let start_paused = opts.start_paused;
         let env = Env::new(id, opts, client, cfg, global, events);
         env.emit(DownloadState::Starting);
-        let (remote, final_path) = match prepare(&env.client, &url, &req, &env.cfg).await {
+        let (remote, mirrors, final_path) = match prepare(&env.client, &req, &env.cfg).await {
             Ok(v) => v,
             Err(e) => {
                 env.emit(DownloadState::Failed {
@@ -290,7 +293,7 @@ impl HttpDownload {
             }
         };
         let plan = Plan::new(remote.total, remote.accepts_ranges, &env.cfg);
-        let (inner, added) = env.build(req, remote, final_path, plan);
+        let (inner, added) = env.build(req, remote, mirrors, final_path, plan);
         if start_paused {
             // Recorded so a restart can restore it, although nothing was transferred.
             if let Err(e) = inner.write_sidecar().await {
@@ -348,6 +351,13 @@ impl HttpDownload {
                 ));
             }
             _ => {}
+        }
+        {
+            // A resume tries every mirror again; validation decides which are used.
+            let mut st = self.inner.lock();
+            if !st.plan.single {
+                mirrors::reset(&mut st.mirrors);
+            }
         }
         if !self.inner.validate(interrupt).await? {
             return Ok(());
@@ -449,10 +459,16 @@ impl HttpDownload {
             })
             .collect();
         let connections = segments.iter().filter(|s| s.active).count();
+        let now = std::time::Instant::now();
+        let mirrors = match st.mirrors.as_slice() {
+            [_] | [] => Vec::new(),
+            all => all.iter().map(|m| m.view(now)).collect(),
+        };
         EngineDetail::Http {
             segments,
             connections: u16::try_from(connections).unwrap_or(u16::MAX),
             resumable: !st.plan.single,
+            mirrors,
         }
     }
 
@@ -465,15 +481,6 @@ impl HttpDownload {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The request context for a request to `target` (the final URL, possibly on another
-    /// origin than the source): see [`RequestContext::for_target`].
-    fn context_for(&self, target: &url::Url) -> RequestContext {
-        match &self.request.source {
-            Source::Http { url } => self.request.context.for_target(url, target),
-            _ => RequestContext::default(),
-        }
     }
 
     /// Records a transition and emits `StateChanged` (repeated states are not re-emitted).
@@ -503,8 +510,15 @@ impl Inner {
         }
         let state = self.resume_state();
         let part = part_path(&self.final_path);
+        let several = self.lock().mirrors.len() > 1;
         let result = tokio::select! {
-            r = self.validate_or_reresolve(&state, &part) => r,
+            r = async {
+                if several {
+                    self.validate_mirrors(&state, &part).await
+                } else {
+                    self.validate_or_reresolve(&state, &part).await
+                }
+            } => r,
             Ok(()) = interrupt.changed() => {
                 self.set_state(DownloadState::Paused);
                 return Ok(false);
@@ -535,10 +549,13 @@ impl Inner {
         state: &HttpResumeState,
         part: &Path,
     ) -> Result<Validation, EngineError> {
-        let ctx = &self.request.context;
-        match validate_remote(&self.client, ctx, state, part, &self.cfg).await {
+        let (ctx, origin) = {
+            let st = self.lock();
+            (st.mirrors[0].context.clone(), st.mirrors[0].url.clone())
+        };
+        match validate_remote(&self.client, &ctx, &origin, state, part, &self.cfg).await {
             Err(EngineError::Http { status }) if is_url_rejected(status) => {
-                Ok(match self.reresolve().await? {
+                Ok(match self.reresolve(0, true).await? {
                     true => Validation::Ok,
                     false => Validation::Changed,
                 })
@@ -547,40 +564,148 @@ impl Inner {
         }
     }
 
-    /// The final URL refused a request (401/403/404/410), as an expired signed redirect
-    /// target does. Probes the original source again and adopts its new final URL, in
-    /// memory and in the sidecar, if it serves the same file: same total and the same
-    /// strong ETag, or (no strong ETag) the bytes already downloaded check out.
-    /// `Ok(false)`: the source now serves a different file. `Err`: the probe failed.
-    async fn reresolve(&self) -> Result<bool, EngineError> {
-        let Source::Http { url } = &self.request.source else {
-            return Ok(false);
+    /// Validates every location of a download with mirrors on its own (concurrently),
+    /// keeping the ones that still serve the file `.part` holds bytes of and dropping the
+    /// others with their reason. `Ok` if at least one is usable; otherwise an error if
+    /// any failed to answer (a retry may find it working), else `Changed` if any serves
+    /// another file now, else `NotResumable`.
+    async fn validate_mirrors(
+        &self,
+        state: &HttpResumeState,
+        part: &Path,
+    ) -> Result<Validation, EngineError> {
+        let n = self.lock().mirrors.len();
+        let checks =
+            futures_util::future::join_all((0..n).map(|i| self.check_mirror(i, state, part))).await;
+        let mut usable = false;
+        let mut error = None;
+        let mut changed = false;
+        for (m, check) in self.lock().mirrors.iter_mut().zip(checks) {
+            match check {
+                Check::Ok(learned) => {
+                    usable = true;
+                    m.health = Health::Usable;
+                    if let Some(v) = learned {
+                        m.v = v;
+                    }
+                }
+                Check::Changed(why) => {
+                    changed = true;
+                    m.drop_with(DropKind::Changed, why);
+                }
+                Check::NoRanges => {
+                    m.drop_with(DropKind::RangeUnsupported, "does not honour range requests")
+                }
+                Check::Failed(e) => {
+                    let kind = mirrors::kind_of(&e);
+                    m.drop_with(kind, format!("validation failed: {e}"));
+                    error = error.or(Some(e));
+                }
+            }
+        }
+        if usable {
+            if let Err(e) = self.write_sidecar().await {
+                // The old sidecar only makes a restore validate the mirrors again.
+                tracing::warn!(id = self.id, "resume sidecar flush failed: {e}");
+            }
+            return Ok(Validation::Ok);
+        }
+        match error {
+            Some(e) => Err(e),
+            None if changed => Ok(Validation::Changed),
+            None => Ok(Validation::NotResumable),
+        }
+    }
+
+    /// Whether location `i` still serves the file. With recorded validators it is
+    /// validated like a download without mirrors (re-resolving an expired redirect).
+    /// Without any (it never answered, or offers neither ETag nor Last-Modified) it is
+    /// probed (same size and range support, as for a fresh start) and the bytes already
+    /// downloaded are compared against it, whichever location they came from.
+    async fn check_mirror(&self, i: usize, base: &HttpResumeState, part: &Path) -> Check {
+        let (url, ctx, v) = {
+            let st = self.lock();
+            let m = &st.mirrors[i];
+            (m.url.clone(), m.context.clone(), m.v.clone())
+        };
+        let mut learned = None;
+        let state = if v.is_empty() {
+            let read_timeout = Duration::from_millis(self.cfg.read_timeout_ms);
+            let info = match probe(&self.client, &url, &ctx, read_timeout).await {
+                Ok(info) => info,
+                Err(e) => return Check::Failed(e),
+            };
+            if info.total != base.total {
+                return Check::Changed(mirrors::size_differs(info.total, base.total));
+            }
+            if !info.accepts_ranges {
+                return Check::NoRanges;
+            }
+            // Compare bytes: no validator is trusted for bytes it did not serve.
+            let state = state_with(base, &Validators::unknown(&info.final_url));
+            learned = Some(Validators::of(&info));
+            state
+        } else {
+            state_with(base, &v)
+        };
+        let result = validate_remote(&self.client, &ctx, &url, &state, part, &self.cfg).await;
+        let result = match result {
+            Err(EngineError::Http { status })
+                if is_url_rejected(status) && state.final_url != url =>
+            {
+                match self.reresolve(i, false).await {
+                    Ok(true) => Ok(Validation::Ok),
+                    Ok(false) => Ok(Validation::Changed),
+                    Err(e) => Err(e),
+                }
+            }
+            r => r,
+        };
+        match result {
+            Ok(Validation::Ok) => Check::Ok(learned),
+            Ok(Validation::Changed) => {
+                Check::Changed("the file changed since the download started".into())
+            }
+            Ok(Validation::NotResumable) => Check::NoRanges,
+            Err(e) => Check::Failed(e),
+        }
+    }
+
+    /// Location `i`'s final URL refused a request (401/403/404/410), as an expired
+    /// signed redirect target does. Probes its URL again and adopts the new final URL,
+    /// in memory and (with `persist`) in the sidecar, if it serves the same file: same
+    /// total and the same strong ETag, or (no strong ETag) the bytes already downloaded
+    /// check out. `Ok(false)`: it now serves a different file. `Err`: the probe failed.
+    async fn reresolve(&self, i: usize, persist: bool) -> Result<bool, EngineError> {
+        let (url, ctx, v) = {
+            let st = self.lock();
+            let m = &st.mirrors[i];
+            (m.url.clone(), m.context.clone(), m.v.clone())
         };
         let read_timeout = Duration::from_millis(self.cfg.read_timeout_ms);
-        let info = probe(&self.client, url, &self.request.context, read_timeout).await?;
-        let r = &self.remote;
-        if info.total != r.total {
+        let info = probe(&self.client, &url, &ctx, read_timeout).await?;
+        if info.total != self.remote.total {
             return Ok(false);
         }
-        if r.etag_strong {
-            if !(info.etag_strong && info.etag == r.etag) {
+        if v.etag_strong {
+            if !(info.etag_strong && info.etag == v.etag) {
                 return Ok(false);
             }
         } else if !self.lock().plan.single {
             // No strong validator: compare the downloaded bytes against the new URL. (A
             // single stream restarts from zero and checks its length, reusing nothing.)
-            let mut state = self.resume_state();
+            let mut state = state_with(&self.resume_state(), &v);
             state.final_url = info.final_url.clone();
             let part = part_path(&self.final_path);
-            let ctx = &self.request.context;
-            if validate_remote(&self.client, ctx, &state, &part, &self.cfg).await? != Validation::Ok
+            if validate_remote(&self.client, &ctx, &url, &state, &part, &self.cfg).await?
+                != Validation::Ok
             {
                 return Ok(false);
             }
         }
         tracing::info!(id = self.id, url = %info.final_url, "re-resolved the download URL");
-        self.lock().final_url = info.final_url;
-        if let Err(e) = self.write_sidecar().await {
+        self.lock().mirrors[i].v.final_url = info.final_url;
+        if persist && let Err(e) = self.write_sidecar().await {
             // The old sidecar only makes a restore re-resolve again.
             tracing::warn!(id = self.id, "resume sidecar flush failed: {e}");
         }
@@ -633,30 +758,40 @@ impl Inner {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         };
-        env.build(req, remote, PathBuf::from("f"), Plan::single(None, false))
-            .0
+        let mirrors = mirrors::locations(&req);
+        env.build(
+            req,
+            remote,
+            mirrors,
+            PathBuf::from("f"),
+            Plan::single(None, false),
+        )
+        .0
     }
 
     fn resume_state(&self) -> HttpResumeState {
-        let (segments, single_stream, final_url) = {
+        let (segments, single_stream, primary, mirrors) = {
             let st = self.lock();
             let segs = st.plan.segments.iter().map(SegEntry::snapshot).collect();
-            (segs, st.plan.single, st.final_url.clone())
+            let primary = st.mirrors[0].v.clone();
+            let mirrors = st.mirrors[1..].iter().map(MirrorRt::record).collect();
+            (segs, st.plan.single, primary, mirrors)
         };
-        let r = &self.remote;
         HttpResumeState {
             version: VERSION,
             request: without_context(&self.request),
             context_hash: context_hash(&self.request.context),
-            final_url,
-            total: r.total,
-            etag: r.etag.clone(),
-            etag_strong: r.etag_strong,
-            last_modified: r.last_modified.clone(),
+            final_url: primary.final_url,
+            total: self.remote.total,
+            etag: primary.etag,
+            etag_strong: primary.etag_strong,
+            last_modified: primary.last_modified,
             final_path: self.final_path.clone(),
             segments,
             single_stream,
+            mirrors,
         }
     }
 
@@ -687,6 +822,26 @@ impl Inner {
         if let Err(e) = self.resume_state().flush(file).await {
             tracing::warn!(id = self.id, "resume sidecar flush failed: {e}");
         }
+    }
+}
+
+/// How one location fared in [`Inner::validate_mirrors`].
+enum Check {
+    /// Still serves the file; the validators it was found to have, if newly learned.
+    Ok(Option<Validators>),
+    Changed(String),
+    NoRanges,
+    Failed(EngineError),
+}
+
+/// `base` (the sidecar state) with the final URL and validators of one location.
+fn state_with(base: &HttpResumeState, v: &Validators) -> HttpResumeState {
+    HttpResumeState {
+        final_url: v.final_url.clone(),
+        etag: v.etag.clone(),
+        etag_strong: v.etag_strong,
+        last_modified: v.last_modified.clone(),
+        ..base.clone()
     }
 }
 

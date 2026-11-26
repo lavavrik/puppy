@@ -1645,6 +1645,148 @@ async fn add_checksum_wait_verifies_or_fails() {
     assert_eq!(status.code(), Some(4));
 }
 
+// ---- mirrors ----
+
+/// `add --mirror`: both locations serve the file; `--json` snapshots list the mirror,
+/// `info` shows the locations; without a checksum `add` warns on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_with_mirrors_downloads_and_shows_them() {
+    let env = Env::new();
+    let a = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let b = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let (ua, ub) = (
+        a.url("/file.bin").to_string(),
+        b.url("/file.bin").to_string(),
+    );
+    let dir = env.dl_dir();
+    let dir = dir.to_str().unwrap();
+    let (status, out, err) = env.run(&["--json", "add", "--wait", "-o", dir, "--mirror", &ub, &ua]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.contains("mirrors without a checksum"), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(v["final"][0]["state"]["kind"], "completed", "{out}");
+    assert_eq!(v["final"][0]["mirrors"], serde_json::json!([ub]), "{out}");
+    let (status, out, err) = env.run(&["info", "1"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        out.contains(&format!("mirrors     {ua} (primary)")),
+        "{out}"
+    );
+    assert!(out.contains(&ub), "{out}");
+
+    // With a checksum: no warning.
+    let sum = format!("sha-256={}", puppy_testserver::body_sha256(256 * KIB, 0));
+    let (status, _, err) = env.run(&[
+        "add",
+        "--wait",
+        "-o",
+        dir,
+        "--name",
+        "c.bin",
+        "--checksum",
+        &sum,
+        "--mirror",
+        &ub,
+        &ua,
+    ]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+}
+
+/// The engine's live view of the mirrors, while the download runs: `info --json` has
+/// them in the detail, the text `info` one line each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn info_shows_live_mirror_state() {
+    let env = Env::new();
+    let a = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let b = puppy_testserver::TestServer::start(puppy_testserver::ServerCfg {
+        len: 256 * KIB + 1,
+        ..Default::default()
+    })
+    .await;
+    // Slow, so it is still running when asked.
+    a.set_cfg(|c| c.bytes_per_sec = Some(16 * KIB));
+    let (ua, ub) = (
+        a.url("/file.bin").to_string(),
+        b.url("/file.bin").to_string(),
+    );
+    let (status, _, err) = env.run(&["add", "--mirror", &ub, &ua]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let (_, out, _) = env.run(&["--json", "info", "1"]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let m = &v["detail"]["mirrors"];
+        if m.as_array().is_some_and(|m| m.len() == 2) {
+            assert_eq!(m[0]["primary"], true, "{v}");
+            assert_eq!(m[0]["state"]["kind"], "in_use", "{v}");
+            assert_eq!(m[1]["state"]["kind"], "dropped", "{v}");
+            let why = m[1]["state"]["reason"].as_str().unwrap();
+            assert!(why.contains("differs"), "{why}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no mirror detail: {v}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (_, out, _) = env.run(&["info", "1"]);
+    assert!(out.contains(&format!("{ub}: dropped: its size")), "{out}");
+    let _ = env.run(&["rm", "1", "--delete-files"]);
+}
+
+/// `--mirror` needs one HTTP(S) source and HTTP(S) mirror URLs: usage errors otherwise,
+/// before any daemon starts.
+#[test]
+fn add_mirror_usage_errors() {
+    let env = Env::new();
+    let (a, b) = (url_of(&env, "a"), url_of(&env, "b"));
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    for (args, needle) in [
+        (vec!["add", "--mirror", &b, &a, &b], "exactly one source"),
+        (
+            vec!["add", "--mirror", "ftp://h/f", &a],
+            "only HTTP(S) mirrors",
+        ),
+        (vec!["add", "--mirror", "not a url", &a], "not a URL"),
+        (
+            vec!["add", "--mirror", &b, magnet],
+            "only applies to HTTP(S)",
+        ),
+    ] {
+        let (status, _, err) = env.run(&args);
+        assert_eq!(status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(needle), "{args:?}: {err}");
+    }
+    assert!(!env.lock_held(), "a usage error must not start a daemon");
+}
+
+/// An input-file line with TAB-separated URIs is one download with mirrors.
+#[test]
+fn add_input_file_tabs_are_mirrors() {
+    let env = Env::new();
+    let (a, b, c) = (url_of(&env, "a"), url_of(&env, "b"), url_of(&env, "c"));
+    let list = env.home.path().join("mirrors.txt");
+    std::fs::write(&list, format!("{a}\t{b}\t{c}\n  out=x.bin\n{b}\n")).unwrap();
+    let (status, out, err) = env.run(&["add", "--paused", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out, format!("added 1 x.bin\nadded 2 {b}\n"));
+    assert!(err.contains("mirrors without a checksum"), "{err}");
+    let all = snapshots(&env, &["--json", "ls"]);
+    assert_eq!(all[0]["source"], a.as_str());
+    assert_eq!(all[0]["mirrors"], serde_json::json!([b, c]));
+    assert!(all[1].get("mirrors").is_none(), "{:?}", all[1]);
+    let (_, out, _) = env.run(&["info", "1"]);
+    assert!(out.contains(&format!("mirrors     {a} (primary)")), "{out}");
+    // A torrent cannot have mirrors.
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    std::fs::write(&list, format!("{magnet}\t{a}\n")).unwrap();
+    let (status, _, err) = env.run(&["add", "--paused", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("mirrors only apply to HTTP(S)"), "{err}");
+}
+
 // ---- add -i (aria2-style input file) ----
 
 /// Runs `puppy <args>` in `cwd` with `input` on stdin: (status, stdout, stderr).
@@ -1804,7 +1946,7 @@ fn add_input_file_invalid_entry_rejects_the_batch() {
         &list,
         format!(
             "  out=early\n{a}\n  max-download-limit=fast\n  bogus=1\n{b}\n  out=b.bin\n\
-             not a url\n{a}\t{b}\n{b}\n  seed-ratio=2\n"
+             not a url\n{a}\tftp://h/f\n{b}\n  seed-ratio=2\n"
         ),
     )
     .unwrap();
@@ -1816,8 +1958,7 @@ fn add_input_file_invalid_entry_rejects_the_batch() {
         "bad.txt: line 3: bad max-download-limit \"fast\"",
         "bad.txt: line 4: ignoring unsupported option `bogus`",
         "bad.txt: line 7: not a url",
-        "bad.txt: line 8: 2 TAB-separated URIs: mirrors",
-        "not supported yet",
+        "bad.txt: line 8: mirror ftp://h/f: only HTTP(S) mirrors are supported",
         "bad.txt: line 9: seed-ratio only applies to torrents",
         "bad.txt: 5 problems, nothing was added",
     ] {

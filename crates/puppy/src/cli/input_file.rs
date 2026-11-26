@@ -17,11 +17,6 @@ use puppy_tui::app::forms::expand_tilde;
 use puppy_tui::format::parse_rate;
 use std::path::PathBuf;
 
-/// Several URIs on one line are mirrors of one file. Not supported yet: the entry
-/// keeps them all ([`Entry::uris`]) and `add` refuses such a line. Flip this (and give
-/// `AddRequest` the mirrors) to support them.
-pub const MIRRORS_SUPPORTED: bool = false;
-
 /// One `key=value` line under a URI line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionLine {

@@ -77,6 +77,21 @@ impl Manager {
                     .into(),
             ));
         }
+        if !req.mirrors.is_empty() && !matches!(req.source, Source::Http { .. }) {
+            return Err(ManagerError::BadRequest(
+                "mirrors only apply to HTTP(S) downloads".into(),
+            ));
+        }
+        if let Some(m) = req
+            .mirrors
+            .iter()
+            .find(|m| !matches!(m.url.scheme(), "http" | "https"))
+        {
+            return Err(ManagerError::BadRequest(format!(
+                "mirror {}: only HTTP(S) mirrors are supported",
+                puppy_core::types::masked_url(&m.url)
+            )));
+        }
         let engine = inner
             .engines
             .iter()

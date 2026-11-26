@@ -80,6 +80,7 @@ impl Env {
             files: Default::default(),
             seed: None,
             checksum: None,
+            mirrors: Vec::new(),
         }
     }
 }
@@ -479,6 +480,7 @@ async fn unsupported_source_is_bad_request() {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     };
     let err = m.add(req, false, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::BadRequest(_)), "{err:?}");
@@ -1880,5 +1882,77 @@ async fn stored_mismatch_resumes_into_a_new_check() {
     );
     m.resume(id).await.unwrap();
     wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
+    m.shutdown().await;
+}
+
+// ---- mirrors ----
+
+/// The mirrors are part of the stored request: a daemon restart in the middle of the
+/// download restores it with them, and both locations serve the rest.
+#[tokio::test]
+async fn mirrors_survive_a_daemon_restart() {
+    let env = Env::new();
+    let len = 4 * 1024 * KIB;
+    let a = server(|c| {
+        c.len = len;
+        c.bytes_per_sec = Some(256 * KIB);
+    })
+    .await;
+    let b = server(|c| {
+        c.len = len;
+        c.bytes_per_sec = Some(256 * KIB);
+    })
+    .await;
+    let m = env.manager(3).await;
+    let mut req = env.req(&a, "a.bin");
+    req.mirrors = vec![puppy_core::types::Mirror::new(b.url("/file.bin"))];
+    let id = m.add(req, false, None).await.unwrap();
+    wait_until(&m, "some progress", |d| {
+        d.iter().any(|d| d.done_bytes >= 1024 * KIB)
+    })
+    .await;
+    assert_eq!(snap(&m, id).mirrors, vec![b.url("/file.bin").to_string()]);
+    m.shutdown().await;
+    drop(m);
+    let (a_before, b_before) = (a.range_requests(), b.range_requests());
+    for s in [&a, &b] {
+        s.set_cfg(|c| c.bytes_per_sec = Some(2 * 1024 * KIB));
+    }
+    let m = env.manager(3).await;
+    wait_completed(&m, id).await;
+    assert_file(&env.dl_dir().join("a.bin"), len, 0);
+    assert!(
+        a.range_requests() > a_before,
+        "primary unused after the restart"
+    );
+    assert!(
+        b.range_requests() > b_before,
+        "mirror unused after the restart"
+    );
+    assert_eq!(snap(&m, id).mirrors, vec![b.url("/file.bin").to_string()]);
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn mirrors_with_a_torrent_or_ftp_are_refused() {
+    let env = Env::new();
+    let m = env.manager(3).await;
+    let s = server(|_| {}).await;
+    let mut torrent = env.req(&s, "a.bin");
+    torrent.source = Source::Magnet {
+        uri: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    torrent.mirrors = vec![puppy_core::types::Mirror::new(s.url("/file.bin"))];
+    let mut ftp = env.req(&s, "a.bin");
+    ftp.mirrors = vec![puppy_core::types::Mirror::new("ftp://h/f".parse().unwrap())];
+    for req in [torrent, ftp] {
+        match m.add(req, false, None).await {
+            Err(e @ ManagerError::BadRequest(_)) => {
+                assert!(e.to_string().contains("mirror"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(m.snapshot().0.is_empty());
     m.shutdown().await;
 }

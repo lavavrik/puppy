@@ -52,6 +52,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         note: None,
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 
@@ -442,6 +443,7 @@ async fn detail_fetched_on_tick() {
         segments: Vec::new(),
         connections: 4,
         resumable: true,
+        mirrors: Vec::new(),
     };
     let reply = detail.clone();
     let api = Arc::new(

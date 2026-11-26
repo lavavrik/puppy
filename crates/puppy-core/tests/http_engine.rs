@@ -30,6 +30,7 @@ fn request(s: &TestServer, dir: &Path) -> AddRequest {
         files: Default::default(),
         seed: None,
         checksum: None,
+        mirrors: Vec::new(),
     }
 }
 

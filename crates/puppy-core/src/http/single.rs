@@ -144,6 +144,7 @@ async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMet
                 Err(e) => return Attempt::Exit(WorkerExit::Fatal(e.to_string())),
             }
             seg.done.store(next, Ordering::Release);
+            ctx.got.fetch_add(n, Ordering::Relaxed);
             let now = Instant::now();
             meter.record(n, now);
             seg.bps.store(meter.bps(now), Ordering::Relaxed);

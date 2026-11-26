@@ -33,6 +33,24 @@ pub struct HttpResumeState {
     /// server ignored ranges): cannot be continued, only restarted.
     #[serde(default)]
     pub single_stream: bool,
+    /// What identified the file at each mirror (`request.mirrors`) when last seen; the
+    /// fields above are the primary's. Absent for a download without mirrors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<MirrorResume>,
+}
+
+/// One mirror's validators in a sidecar. A mirror that never answered has none (and its
+/// own URL as `final_url`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorResume {
+    pub url: url::Url,
+    pub final_url: url::Url,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub etag_strong: bool,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 /// The request as recorded in a sidecar: everything but its context.
@@ -150,6 +168,7 @@ mod tests {
                 files: Default::default(),
                 seed: None,
                 checksum: None,
+                mirrors: Vec::new(),
             },
             context_hash: context_hash(&RequestContext::default()),
             final_url: url,
@@ -160,6 +179,7 @@ mod tests {
             final_path: final_path.to_path_buf(),
             segments,
             single_stream: false,
+            mirrors: Vec::new(),
         }
     }
 
@@ -171,6 +191,28 @@ mod tests {
         tokio::fs::write(sidecar_path(final_path), serde_json::to_vec(s).unwrap())
             .await
             .unwrap();
+    }
+
+    /// A sidecar without mirrors has no `mirrors` key (an older puppy reads it as is);
+    /// one with mirrors keeps their validators.
+    #[tokio::test]
+    async fn mirror_records_are_optional_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("a.iso");
+        let mut s = state(&final_path, vec![seg(0, 100, 10)]);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("mirrors"), "{json}");
+        let m = url::Url::parse("https://mirror.example/a.iso").unwrap();
+        s.request.mirrors = vec![crate::types::Mirror::new(m.clone())];
+        s.mirrors = vec![MirrorResume {
+            url: m.clone(),
+            final_url: m,
+            etag: Some("\"m\"".into()),
+            etag_strong: true,
+            last_modified: None,
+        }];
+        write_raw(&final_path, &s).await;
+        assert_eq!(HttpResumeState::load(&final_path).await.unwrap(), s);
     }
 
     #[test]
@@ -269,6 +311,7 @@ mod tests {
                 ..RequestContext::default()
             },
             checksum: None,
+            mirrors: Vec::new(),
         };
         let s = without_context(&req);
         assert_eq!(s.context, RequestContext::default());

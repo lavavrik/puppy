@@ -244,6 +244,7 @@ impl AddForm {
                 files,
                 seed: None,
                 checksum,
+                mirrors: Vec::new(),
             },
             start_paused: self.start_paused,
         })

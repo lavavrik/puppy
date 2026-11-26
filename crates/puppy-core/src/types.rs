@@ -46,6 +46,55 @@ impl RequestContext {
             basic_auth: None,
         }
     }
+
+    /// The context for requests to `mirror`, another location of the file at `primary`
+    /// (whose context this is). Cookies and headers given for a download (by a browser
+    /// or `-H`/`--cookie`/`--referer`) belong to the primary's site: a mirror on the same
+    /// origin gets them all, a mirror on another origin only the user agent.
+    pub fn for_mirror(&self, primary: &url::Url, mirror: &url::Url) -> RequestContext {
+        if primary.origin() == mirror.origin() {
+            return self.clone();
+        }
+        RequestContext {
+            user_agent: self.user_agent.clone(),
+            ..RequestContext::default()
+        }
+    }
+}
+
+/// `url` for display: a password in it is shown as `***`.
+pub fn masked_url(url: &url::Url) -> String {
+    if url.password().is_none() {
+        return url.to_string();
+    }
+    let mut shown = url.clone();
+    // Only fails for URLs that cannot have credentials, which this one has.
+    let _ = shown.set_password(Some("***"));
+    shown.to_string()
+}
+
+/// Another location of an HTTP(S) download's file (aria2's TAB-separated URIs, a
+/// Metalink `<url>`). The download's source stays its primary URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mirror {
+    pub url: url::Url,
+    /// Preference as in Metalink: lower is preferred (1 is the highest); mirrors without
+    /// one come after every numbered one, in the order given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// Where the mirror is (Metalink `location`, an ISO 3166-1 country code); shown only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+impl Mirror {
+    pub fn new(url: url::Url) -> Self {
+        Mirror {
+            url,
+            priority: None,
+            location: None,
+        }
+    }
 }
 
 /// Header values, cookies and passwords are never printed: a stray `{:?}` in a log line
@@ -84,6 +133,11 @@ pub struct AddRequest {
     /// (state `Verifying`); a mismatch fails the download and keeps the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<crate::checksum::Checksum>,
+    /// Other locations of the same file (HTTP only), besides `source` (the primary). The
+    /// engine probes them, uses the ones that agree with the primary on size and range
+    /// support, spreads connections over them and fails over between them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<Mirror>,
 }
 
 /// Which files of a multi-file torrent to download.
@@ -213,6 +267,36 @@ pub struct SegmentView {
     pub active: bool,
 }
 
+/// One location of an HTTP download's file and how the download uses it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorView {
+    /// Display form (a password masked).
+    pub url: String,
+    /// The download's source; the others are mirrors.
+    pub primary: bool,
+    pub state: MirrorState,
+    /// Connections open to it now.
+    pub connections: u16,
+    /// Current speed from it.
+    pub bps: u64,
+    /// Bytes this download received from it (this session).
+    pub done_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MirrorState {
+    /// Agrees with the file and may get connections.
+    InUse,
+    /// Failed recently; tried again after `retry_in_secs`.
+    Benched { reason: String, retry_in_secs: u64 },
+    /// Not used any more by this run of the download (a resume tries it again).
+    Dropped { reason: String },
+    /// A state this build does not know (newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineDetail {
@@ -220,6 +304,10 @@ pub enum EngineDetail {
         segments: Vec<SegmentView>,
         connections: u16,
         resumable: bool,
+        /// Every location of the file, the primary first, when the download has mirrors
+        /// (empty otherwise).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mirrors: Vec<MirrorView>,
     },
     Torrent {
         piece_count: u32,
@@ -379,6 +467,7 @@ mod tests {
             segments: Vec::new(),
             connections: 2,
             resumable: true,
+            mirrors: Vec::new(),
         };
         let back: EngineDetail =
             serde_json::from_str(&serde_json::to_string(&http).unwrap()).unwrap();
