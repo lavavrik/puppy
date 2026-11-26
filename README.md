@@ -1,8 +1,8 @@
 # puppy
 
 A modern terminal download manager written in Rust, meant as a fresh successor
-to [aria2](https://aria2.github.io/). It downloads over HTTP(S) and BitTorrent
-(magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
+to [aria2](https://aria2.github.io/). It downloads over HTTP(S), FTP(S) and
+BitTorrent (magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
 owns every download and the queue, so downloads keep going when no client is
 open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
@@ -18,6 +18,10 @@ Early development (v0.1.1). What works today:
   Retries with backoff, per-download and global speed limits, proxies. One
   file can come from several mirrors at once, with failover between them
   (see [Mirrors](#mirrors)).
+- **FTP and FTPS**: the same segmented downloads over `ftp://`, `ftps://`
+  (implicit TLS) and `ftpes://` (explicit TLS) URLs, with `REST` resume,
+  passive mode, TLS tried by default, and the same guarantee: a file whose
+  size or modification time changed is never continued. See [FTP](#ftp).
 - **Daemon**: a single instance per user owns the queue (3 active at a time by
   default), with atomically persisted state, a versioned JSON protocol,
   graceful shutdown, and an idle exit when started on demand.
@@ -97,7 +101,7 @@ Download the archive for your platform from the
 Each archive holds the `puppy` binary, the browser extension (`extension/`),
 the service files (`packaging/`), this README and the licenses. The Linux
 builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
-HTTPS trusts the system's CA certificates; on a system without any (a minimal
+HTTPS and FTPS trust the system's CA certificates; on a system without any (a minimal
 container without `ca-certificates`), the daemon falls back to Mozilla's root
 list built into puppy and says so in its log.
 `SHA256SUMS` in the release lists every archive's checksum.
@@ -209,6 +213,7 @@ terminal), go to stderr.
 
 ```sh
 puppy add https://example.com/a.iso         # add a URL, magnet link or .torrent path
+puppy add ftp://ftp.example.org/pub/a.iso   # FTP (anonymous); ftps:// and ftpes:// for FTPS
 puppy add -o ~/isos --limit 2M URL1 URL2    # into a folder, at most 2 MiB/s each
 puppy add --name b.iso --paused URL         # under another name, without starting
 puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
@@ -310,7 +315,7 @@ files` on a download that is not a torrent, or one that already completed
 `add --checksum ALGO=HEX` checks the finished file against a digest:
 `md5`, `sha-1`, `sha-224`, `sha-256`, `sha-384` or `sha-512` (written as
 aria2 and Metalink do, `sha-256=…`; `sha256=…` works too; algorithm and hex
-digits in any case). It needs exactly one HTTP(S) source (also on stdin):
+digits in any case). It needs exactly one HTTP(S) or FTP(S) source (also on stdin):
 torrents are refused, since BitTorrent already checks every piece. A
 malformed digest, an unknown algorithm or a wrong number of hex digits is a
 usage error (exit 2). The dashboard's add form (`a`) has an optional
@@ -336,8 +341,8 @@ removes the download again and fails, asking you to `puppy stop` it.
 `add -i FILE` (`--input-file`) reads downloads from a file in aria2's
 input-file format; `-i -` reads it from stdin (not together with a `-`
 source). Each line that does not start with whitespace is one download: a
-URL, magnet link or `.torrent` path (a relative one is relative to the
-current directory). The lines under it that start with a
+URL (`http`, `https`, `ftp`, `ftps`, `ftpes`), magnet link or `.torrent` path
+(a relative one is relative to the current directory). The lines under it that start with a
 space or a TAB are options for that download, written `key=value` as aria2's
 options without the `--` (spaces around the key and the value are ignored; the
 value may contain `=`). Lines starting with `#` are comments, blank lines are
@@ -363,7 +368,7 @@ https://example.com/b.iso
 |--------|---------|
 | `dir` | the folder, as `-o`; a relative one is relative to the current directory |
 | `out` | the file name, as `--name` (a name only: put folders in `dir`) |
-| `checksum` | `ALGO=HEX`, as `--checksum` (HTTP(S) only) |
+| `checksum` | `ALGO=HEX`, as `--checksum` (HTTP(S) and FTP(S) only) |
 | `header` | `Name: value`, as `-H` (repeatable) |
 | `referer` | as `--referer` |
 | `user-agent` | the `User-Agent` header |
@@ -375,9 +380,9 @@ https://example.com/b.iso
 
 A URI line may hold several URIs of the same file separated by TABs, as in
 aria2: the first is the download's source and the others are its mirrors, as
-with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an `http://` or
-`https://` URL and the first URI an HTTP(S) one; anything else is a usage
-error for that line. `--mirror` on the command line adds its URLs after the
+with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an HTTP(S) or
+FTP(S) URL and the first URI one of these too; anything else is a usage error
+for that line. `--mirror` on the command line adds its URLs after the
 line's own.
 
 The flags on the command line are defaults for every download of the file,
@@ -385,7 +390,7 @@ and an entry's options override them: `-o`, `--limit`, `--paused`, `--files`,
 `--seed-ratio`/`--seed-time` and `--referer` are replaced, and an entry's
 `header` replaces a `-H` of the same name and adds to the others. `--name` and
 `--checksum` still need exactly one download in all, and the torrent-only
-flags still refuse an HTTP(S) download anywhere on the line. Sources given as
+flags still refuse an HTTP(S) or FTP(S) download anywhere on the line. Sources given as
 arguments are added first, then the file's, in order; `--json` and `--wait`
 treat them as one list, as for several sources.
 
@@ -394,7 +399,7 @@ with a warning on stderr naming it and its line. Everything else wrong with the
 file is a usage error (exit 2) that adds nothing at all, so a script never ends
 up with half a list queued: an option line before the first URI, one without
 `=`, an empty or bad value for one of the options above, an unknown source, `checksum` on a torrent, a
-torrent option on an HTTP(S) download, or `pause=true` with `--wait`. Every
+torrent option on an HTTP(S) or FTP(S) download, or `pause=true` with `--wait`. Every
 problem is reported with its line (`puppy: list.txt: line 7: bad
 max-download-limit "fast": ...`). `seed-time=0`, which in aria2 means "do not seed", is
 refused as well, since puppy's `0` would mean the opposite (never stop). What
@@ -403,10 +408,12 @@ past a torrent's last file) fails that download only, as with several sources.
 
 ### Mirrors
 
-`add --mirror URL` (repeatable) gives an HTTP(S) download other places to get
-the same file from; the source stays its primary URL. It needs exactly one
-HTTP(S) source, like `--name`. Mirrors are `http://` or `https://` URLs; a
-torrent with mirrors is refused.
+`add --mirror URL` (repeatable) gives an HTTP(S) or FTP(S) download other places
+to get the same file from; the source stays its primary URL. It needs exactly
+one such source, like `--name`. Mirrors are `http://`, `https://`, `ftp://`,
+`ftps://` or `ftpes://` URLs, whatever the source's protocol: an HTTP download
+can take ranges from an FTP mirror and the other way round. A torrent with
+mirrors is refused.
 
 When the download starts, puppy probes the primary and every mirror at once.
 The file is what the primary says it is (its size and name); if the primary
@@ -448,7 +455,7 @@ otherwise for good. `resume` (and the automatic retry of a transient failure)
 tries every mirror again.
 
 Each location is validated on its own, since mirrors have their own ETag and
-Last-Modified. Every request to a location carries that location's own
+Last-Modified (an FTP location: its size and `MDTM`, see [FTP](#ftp)). Every request to a location carries that location's own
 validator as `If-Range`, and the resume sidecar records each location's
 final URL and validators. On resume (also after a restart) every location is
 checked against the partial file as a download without mirrors is: with a
@@ -510,6 +517,81 @@ Exit codes (with several ids, the highest wins):
 | `5`  | waited download needs attention |
 | `6`  | update not possible here (not a release build, or a folder puppy cannot write) |
 
+### FTP
+
+FTP URLs are `ftp://[user[:password]@]host[:port]/path`. Without a user name
+puppy logs in as `anonymous` (password `anonymous@`). The path is relative to
+the directory the server puts you in after login, as RFC 1738 says; most
+servers put anonymous users at `/`, so `ftp://host/pub/a.iso` is `/pub/a.iso`.
+Start the path with `%2F` for an absolute one (`ftp://host/%2Fsrv/a.iso`).
+Percent-encoded characters in the path, user and password are decoded, and a
+trailing `;type=i` is ignored (transfers are always binary). A URL ending in
+`/` names a directory and is refused: puppy downloads files, not directories.
+
+FTPS comes in two forms:
+
+| URL | Port | TLS |
+|-----|------|-----|
+| `ftp://` | 21 | as `[ftp] tls` says (below); `try` by default |
+| `ftpes://` | 21 | explicit (`AUTH TLS`), required |
+| `ftps://` | 990 | implicit: TLS from the first byte |
+
+The `tls` setting only applies to `ftp://` URLs:
+
+```toml
+[ftp]
+tls = "try"       # "try" (the default), "require" or "off"
+```
+
+With `try`, puppy sends `AUTH TLS` before logging in. If the server refuses
+it, the session goes on in plain FTP, user name and password
+included. If the server agrees but its certificate does not verify, the
+download fails: puppy never falls back to plain FTP over a failed handshake.
+With `require` (and always for `ftpes://`), a server that refuses `AUTH TLS`
+fails the download (`TLS: the server refused AUTH TLS (...), and TLS is
+required`) before any credentials are sent. With `off`, puppy never asks. A
+TLS session also protects the data connections (`PROT P`). Certificates are
+verified as for HTTPS (the system's CA certificates, or puppy's bundled ones on
+a system without any); there is no option to skip the check or to add a CA.
+
+puppy uses passive mode only: `EPSV`, then `PASV` once a server refuses
+`EPSV`. The address in a `PASV` reply is ignored and the data connection goes
+to the server's own address, so a NATed server's private address (or a hostile
+one) never matters. Active mode (`PORT`/`EPRT`) is not supported.
+
+When the server tells the size (`SIZE`) and can restart transfers (its `FEAT`
+lists `REST STREAM`, or it does not answer `FEAT`), a download is segmented as
+over HTTP: up to `connections` sessions, each one control and one data
+connection, each starting its range with `REST <offset>`, with the same work
+stealing. A session whose range ends with the file is reused for the next
+range; one whose range ends earlier logs out (`QUIT`), since its transfer is
+cut short. A server that cannot tell the size or restart a transfer gets one
+stream, which, as over HTTP, cannot be resumed and restarts from zero. A
+server that turns a session away with 421 or 530 while others are logged in
+(a per-client or per-user limit) caps the download at the sessions it got;
+the refused range waits for one of them, and the cap holds until the
+download is paused or retried.
+
+Before every transfer puppy asks for the file's `SIZE` and `MDTM`
+(modification time) again; a different answer means the file changed, and the
+download needs attention (`remote changed`) without taking another byte of
+it. Resuming (also after a restart) checks the same: the size must match, and
+with a recorded `MDTM` that is enough. A server without `MDTM` gets the byte
+comparison HTTP servers without validators get: up to three pieces of what is
+downloaded are fetched again and compared with the partial file.
+
+A password in an FTP URL (like one in an HTTP URL or a mirror) is kept only in
+the daemon's state file, which only your user can read. It is shown as `***`
+everywhere else: `puppy add`'s output, `ls`, `info` and their `--json` forms,
+the dashboard. It is never written to the daemon's log or to the resume
+sidecar next to the download. `~/.netrc` is not read.
+
+FTP connections never go through the `proxy` setting, which is an HTTP proxy:
+an FTP download connects to the server directly, and the daemon's log says so
+when a proxy is set. Retries, backoff, speed limits, `--checksum`, pause,
+resume and restart work as for HTTP; `info` and the dashboard show an FTP
+download's connections and segment map as for HTTP.
+
 ### Configuration
 
 Settings go in `config.toml` (where it lives: see below). Keys:
@@ -517,7 +599,8 @@ Settings go in `config.toml` (where it lives: see below). Keys:
 `global_down_limit`, `global_up_limit` (bytes per second), `theme`
 (`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and
 `proxy`. `NO_COLOR` switches to monochrome; without `COLORTERM=truecolor` the
-16 ANSI colors are used. `--theme` overrides the file.
+16 ANSI colors are used. `--theme` overrides the file. `[ftp]` holds the TLS
+setting for `ftp://` URLs (see [FTP](#ftp)).
 
 Torrents have their own section:
 
@@ -717,12 +800,12 @@ so no network port is opened. Firefox is not supported yet.
 |---------------------------|-----------------------------------------------------------------|
 | `crates/puppy`            | The `puppy` binary: dashboard, subcommands and native host.     |
 | `crates/puppy-tui`        | The full-screen dashboard (ratatui).                            |
-| `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S) engine.        |
+| `crates/puppy-core`       | The `Engine` trait, shared types and the HTTP(S)/FTP(S) engine. |
 | `crates/puppy-torrent`    | The BitTorrent engine (librqbit behind the `Engine` trait).     |
 | `crates/puppy-daemon`     | The daemon: paths, config, queue manager, state store, server.  |
 | `crates/puppy-proto`      | The daemon ↔ client protocol types and framing.                 |
 | `crates/puppy-client`     | Client library: connecting, requests, events, auto-spawning.    |
-| `crates/puppy-testserver` | An HTTP server for tests (ranges, throttling, failures).        |
+| `crates/puppy-testserver` | HTTP and FTP(S) servers for tests (throttling, failures).       |
 | `extension/`              | The browser extension (MV3) that hands downloads to puppy.      |
 
 ## Releasing
