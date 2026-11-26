@@ -283,7 +283,11 @@ pub(crate) fn is_url_scheme(scheme: &str) -> bool {
 /// Applies a sidecar's records (by URL; the sidecar's have no password) to `mirrors`.
 pub(super) fn restore_records(mirrors: &mut [MirrorRt], records: &[MirrorResume]) {
     for m in mirrors.iter_mut().filter(|m| !m.primary) {
-        if let Some(r) = records.iter().find(|r| r.url == without_password(&m.url)) {
+        // An older puppy recorded the password too.
+        if let Some(r) = records
+            .iter()
+            .find(|r| r.url == without_password(&m.url) || r.url == m.url)
+        {
             m.v = Validators {
                 final_url: with_password_of(&r.final_url, &m.url),
                 etag: r.etag.clone(),

@@ -87,7 +87,7 @@ impl HttpDownload {
         let final_path = final_path.to_path_buf();
         let sidecar = sidecar_path(&final_path);
         let loaded = HttpResumeState::load(&final_path).await;
-        let foreign = matches!(&loaded, Ok(s) if s.request.source != without_context(&req).source);
+        let foreign = matches!(&loaded, Ok(s) if !same_source(s, &req));
         let loaded = loaded.and_then(|state| check_source(state, &req));
         let part_len = file_len(&part_path(&final_path)).await?;
 
@@ -195,10 +195,15 @@ impl HttpDownload {
     }
 }
 
+/// Whether the sidecar records `req`'s source: without its password (or, written by an
+/// older puppy, with it).
+fn same_source(state: &HttpResumeState, req: &AddRequest) -> bool {
+    state.request.source == without_context(req).source || state.request.source == req.source
+}
+
 /// The sidecar must belong to the caller's request.
 fn check_source(state: HttpResumeState, req: &AddRequest) -> Result<HttpResumeState, EngineError> {
-    // The sidecar's URLs have no password.
-    if state.request.source != without_context(req).source {
+    if !same_source(&state, req) {
         return Err(EngineError::Invalid(
             "resume sidecar belongs to a different source".into(),
         ));
