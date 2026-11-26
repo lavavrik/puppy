@@ -463,7 +463,7 @@ fn add_popup_submits_add_cmd() {
     match &a.mode {
         Mode::Popup(Popup::Add(f)) => assert_eq!(
             f.error.as_deref(),
-            Some("enter a URL, magnet link or .torrent path")
+            Some("enter a URL, magnet link, .torrent or .meta4")
         ),
         m => panic!("unexpected {m:?}"),
     }

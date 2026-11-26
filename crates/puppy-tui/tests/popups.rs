@@ -703,7 +703,7 @@ fn parse_source_variants() {
     ] {
         assert_eq!(
             parse_source(bad),
-            Err("not a URL, magnet link or .torrent file".to_string()),
+            Err("not a URL, magnet link, .torrent or .meta4".to_string()),
             "{bad:?}"
         );
     }

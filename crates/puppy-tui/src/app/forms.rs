@@ -13,10 +13,11 @@ use super::Cmd;
 use super::input::TextInput;
 use crate::format::{parse_rate, rate_input};
 
-pub const ADD_EMPTY_SOURCE: &str = "enter a URL, magnet link or .torrent path";
-pub const ADD_BAD_SOURCE: &str = "not a URL, magnet link or .torrent file";
+pub const ADD_EMPTY_SOURCE: &str = "enter a URL, magnet link, .torrent or .meta4";
+pub const ADD_BAD_SOURCE: &str = "not a URL, magnet link, .torrent or .meta4";
 pub const ADD_BAD_DIR: &str = "use an absolute folder path";
 pub const ADD_CHECKSUM_NOT_HTTP: &str = "a checksum only applies to HTTP(S), FTP(S) and SFTP downloads (BitTorrent verifies its pieces)";
+pub const ADD_CHECKSUM_METALINK: &str = "a metalink brings its own hashes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddField {
@@ -141,6 +142,19 @@ pub fn parse_source(s: &str) -> Result<Source, String> {
     Err(bad())
 }
 
+/// The add form's source as a metalink: an http(s) URL ending in `.meta4` or
+/// `.metalink`, or such a file (or one whose content is a metalink), made absolute.
+pub fn metalink_source(s: &str) -> Option<puppy_core::metalink::Location> {
+    let path = expand_tilde(unquote(s));
+    match puppy_core::metalink::detect(&path.to_string_lossy(), false) {
+        Ok(Some(puppy_core::metalink::Location::Path(p))) => Some(
+            puppy_core::metalink::Location::Path(std::path::absolute(&p).unwrap_or(p)),
+        ),
+        Ok(other) => other,
+        Err(_) => None,
+    }
+}
+
 /// Interprets "Save to": empty ⇒ `None` (the daemon's default); otherwise an absolute
 /// folder after `~` expansion.
 pub fn parse_dir(s: &str) -> Result<Option<PathBuf>, String> {
@@ -211,6 +225,20 @@ impl AddForm {
     pub fn submit(&mut self) -> Option<Cmd> {
         if unquote(&self.source.value).is_empty() {
             return self.fail(AddField::Source, ADD_EMPTY_SOURCE.into());
+        }
+        if let Some(location) = metalink_source(&self.source.value) {
+            let output_dir = match parse_dir(&self.dir.value) {
+                Ok(d) => d,
+                Err(e) => return self.fail(AddField::Dir, e),
+            };
+            if !unquote(&self.checksum.value).is_empty() {
+                return self.fail(AddField::Checksum, ADD_CHECKSUM_METALINK.into());
+            }
+            return Some(Cmd::AddMetalink {
+                location,
+                output_dir,
+                start_paused: self.start_paused,
+            });
         }
         let source = match parse_source(&self.source.value) {
             Ok(s) => s,
@@ -579,6 +607,41 @@ mod tests {
         f.source = TextInput::with_value("nonsense");
         assert_eq!(f.submit(), None);
         assert_eq!(f.error.as_deref(), Some(ADD_BAD_SOURCE));
+    }
+
+    /// A metalink path or URL submits `AddMetalink`; a checksum does not go with one.
+    #[test]
+    fn add_metalink_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.meta4");
+        std::fs::write(&p, "<metalink/>").unwrap();
+        let mut f = AddForm::with_source(&format!("'{}'", p.display()));
+        f.dir = TextInput::with_value(&dir.path().display().to_string());
+        f.start_paused = true;
+        assert_eq!(
+            f.submit(),
+            Some(Cmd::AddMetalink {
+                location: puppy_core::metalink::Location::Path(p.clone()),
+                output_dir: Some(dir.path().to_path_buf()),
+                start_paused: true,
+            })
+        );
+        let mut f = AddForm::with_source("https://x.org/list.META4");
+        match f.submit() {
+            Some(Cmd::AddMetalink {
+                location: puppy_core::metalink::Location::Url(u),
+                output_dir: None,
+                start_paused: false,
+            }) => assert_eq!(u.as_str(), "https://x.org/list.META4"),
+            other => panic!("{other:?}"),
+        }
+        f.checksum = TextInput::with_value("sha-256=00");
+        assert_eq!(f.submit(), None);
+        assert_eq!(f.error.as_deref(), Some(ADD_CHECKSUM_METALINK));
+        assert_eq!(f.error_on, AddField::Checksum);
+        // Not a metalink: an ordinary URL download.
+        let mut f = AddForm::with_source("https://x.org/a.iso");
+        assert!(matches!(f.submit(), Some(Cmd::Add { .. })));
     }
 
     #[test]

@@ -270,6 +270,13 @@ pub enum Cmd {
         request: AddRequest,
         start_paused: bool,
     },
+    /// Read or fetch the metalink and add each of its files (into `output_dir`, the
+    /// daemon's folder if `None`, keeping their subdirectories).
+    AddMetalink {
+        location: puppy_core::metalink::Location,
+        output_dir: Option<std::path::PathBuf>,
+        start_paused: bool,
+    },
     Pause(DownloadId),
     Resume(DownloadId),
     Remove {

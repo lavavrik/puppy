@@ -39,7 +39,7 @@ const HELP: &[(&str, &str)] = &[
     ("/", "filter by name or source"),
     ("Esc", "close popup / clear filter"),
     ("", "Downloads"),
-    ("a", "add a URL, magnet link or .torrent"),
+    ("a", "add a URL, magnet link, .torrent or .meta4"),
     ("p", "pause"),
     ("r", "resume (also retries a failed one)"),
     ("d, Delete", "delete (asks first)"),

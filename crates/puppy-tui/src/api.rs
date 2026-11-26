@@ -6,6 +6,9 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use puppy_client::{Client, ClientError, Paths};
+use puppy_core::config::HttpConfig;
+use puppy_core::metalink::{self, Location};
+use puppy_core::types::RequestContext;
 use puppy_proto::{DownloadSnapshot, ErrorCode, Event, ReplyData, Request, Settings, UpdateStatus};
 use tokio::sync::{Mutex, mpsc};
 
@@ -62,6 +65,8 @@ pub struct ClientApi {
     client: RwLock<Option<Arc<Client>>>,
     /// Its events, apart from the client so waiting for one never blocks a call.
     events: Mutex<Option<mpsc::Receiver<Event>>>,
+    /// For fetching metalinks (the configured proxy).
+    http: HttpConfig,
 }
 
 impl ClientApi {
@@ -71,7 +76,14 @@ impl ClientApi {
             exe,
             client: RwLock::new(None),
             events: Mutex::new(None),
+            http: HttpConfig::default(),
         }
+    }
+
+    /// Fetches metalinks with `http`'s settings (the daemon's configuration).
+    pub fn with_http(mut self, http: HttpConfig) -> Self {
+        self.http = http;
+        self
     }
 
     fn client(&self) -> Result<Arc<Client>, String> {
@@ -149,6 +161,15 @@ impl DaemonApi for ClientApi {
         }
         let client = self.client()?;
         let request = match cmd {
+            Cmd::AddMetalink {
+                location,
+                output_dir,
+                start_paused,
+            } => {
+                return add_metalink(&client, &self.http, &location, output_dir, start_paused)
+                    .await
+                    .map(|()| None);
+            }
             Cmd::Add {
                 request,
                 start_paused,
@@ -209,6 +230,57 @@ impl DaemonApi for ClientApi {
         };
         client.call(request).await.map(|_| None).map_err(call_error)
     }
+}
+
+/// Reads or fetches a metalink and adds each of its files, as `puppy add` does. Stops
+/// at the first file the daemon refuses, saying how many were added.
+async fn add_metalink(
+    client: &Client,
+    http: &HttpConfig,
+    location: &Location,
+    output_dir: Option<PathBuf>,
+    start_paused: bool,
+) -> Result<(), CmdError> {
+    let context = RequestContext::default();
+    let loaded = metalink::load(location, http, &context)
+        .await
+        .map_err(CmdError::Failed)?;
+    let files = &loaded.metalink.files;
+    let base = match output_dir {
+        Some(d) => Some(d),
+        None if files.iter().any(|f| f.path.has_dirs()) => {
+            match client.call(Request::GetSettings).await {
+                Ok(ReplyData::Settings { settings }) => Some(settings.download_dir),
+                Ok(d) => return Err(CmdError::Failed(format!("unexpected reply: {d:?}"))),
+                Err(e) => return Err(call_error(e)),
+            }
+        }
+        None => None,
+    };
+    for (n, f) in files.iter().enumerate() {
+        let dir = match &base {
+            Some(b) if f.path.has_dirs() => Some(f.path.dir_in(b)),
+            b => b.clone(),
+        };
+        let request = Request::Add {
+            request: f.request(dir, &context, loaded.document.as_ref()),
+            start_paused,
+            limit: None,
+        };
+        if let Err(e) = client.call(request).await {
+            let e = call_error(e);
+            if n == 0 {
+                return Err(e);
+            }
+            return Err(CmdError::Failed(format!(
+                "{} of {} files added; {}: {e}",
+                n,
+                files.len(),
+                f.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A failed call, for a toast: the daemon's own message when it refused.

@@ -367,7 +367,7 @@ fn spawn_cmd(
 /// What a command attempted, for its error toast (`pause: …`).
 fn label(cmd: &Cmd) -> &'static str {
     match cmd {
-        Cmd::Add { .. } => "add",
+        Cmd::Add { .. } | Cmd::AddMetalink { .. } => "add",
         Cmd::Pause(_) => "pause",
         Cmd::Resume(_) => "resume",
         Cmd::Remove { .. } => "delete",
