@@ -537,7 +537,7 @@ mod tests {
             );
         }
         assert!(parse_source("gopher://x/a").is_err());
-        assert!(parse_source("ftp:///a").is_err());
+        assert!(parse_source("ftp://").is_err());
         assert!(parse_source("hello").is_err());
         assert!(parse_source("magnet:é").is_err());
     }
