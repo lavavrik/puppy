@@ -742,3 +742,29 @@ async fn oversized_read_answers_are_refused() {
     let path = completed(&e, 1).await;
     assert!(std::fs::read(path).unwrap() == data(len, 0), "wrong bytes");
 }
+
+/// A host known only with keys of other types, presenting a key of a new type: refused
+/// as a possible attack, pointing at `--replace-type`.
+#[tokio::test]
+async fn a_host_offering_only_an_unknown_key_type_is_refused() {
+    let fx = Fx::new(|_| {}).await;
+    std::fs::write(
+        fx.path().join("known_hosts"),
+        fx.s.known_hosts_line(HostKey::Ecdsa),
+    )
+    .unwrap();
+    fx.s.set_file("/f", data(KIB, 0), MTIME);
+    let err = fx.add_error(fx.s.url("/f"), fx.cfg()).await;
+    let msg = err.to_string();
+    assert!(!err.is_transient(), "{msg}");
+    assert!(msg.contains("man-in-the-middle"), "{msg}");
+    assert!(msg.contains("--replace-type"), "{msg}");
+    assert!(fx.s.logins().is_empty());
+    let (_, verdict) = puppy_core::sftp::fetch_host_key("127.0.0.1", fx.s.port(), &fx.cfg())
+        .await
+        .unwrap();
+    assert!(
+        matches!(verdict, Verdict::Unknown { other_types: true }),
+        "{verdict:?}"
+    );
+}

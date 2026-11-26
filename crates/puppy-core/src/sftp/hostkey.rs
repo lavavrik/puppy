@@ -242,9 +242,29 @@ fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
         .into()
 }
 
+/// Whether `host` may be written into a `known_hosts` file as a plain name: letters,
+/// digits, `.`, `_` and `-` (a host name or IPv4 address), or an IPv6 address. Anything
+/// else could turn into a pattern (`*`, `?`, `!`, `,`), a hashed entry or a marker.
+pub fn valid_host(host: &str) -> bool {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    !host.is_empty()
+        && !host.starts_with(['-', '.'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Adds `host:port`'s `key` to the `known_hosts` file at `path` (created, private, with
-/// its directory if missing).
+/// its directory if missing). `host` must be [`valid_host`].
 pub fn trust(path: &Path, host: &str, port: u16, key: &PublicKey) -> std::io::Result<()> {
+    if !valid_host(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{host:?} is not a host name or IP address"),
+        ));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -349,10 +369,31 @@ mod tests {
         trust(&path, "::1", 22, &key(ED2)).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, format!("[example.org]:2222 {ED}\n::1 {ED2}\n"));
-        let k = Known::lookup(&[path], "example.org", 2222);
+        let k = Known::lookup(std::slice::from_ref(&path), "example.org", 2222);
         assert!(matches!(k.verdict(&key(ED)), Verdict::Trusted));
         assert_eq!(host_arg("::1", 2222), "[::1]:2222");
         assert_eq!(host_arg("h", 2222), "h:2222");
         assert!(fingerprint(&key(ED)).starts_with("SHA256:"));
+        for bad in [
+            "a,b",
+            "*.x",
+            "!x",
+            "|1|abc|def",
+            "@revoked",
+            "",
+            "-x",
+            "a b",
+            "h\nx",
+        ] {
+            assert!(!valid_host(bad), "{bad:?}");
+            assert!(trust(&path, bad, 22, &key(ED)).is_err(), "{bad:?}");
+        }
+        for good in ["example.org", "10.0.0.1", "::1", "fe80::1", "my_host-2"] {
+            assert!(valid_host(good), "{good:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("[example.org]:2222 {ED}\n::1 {ED2}\n")
+        );
     }
 }

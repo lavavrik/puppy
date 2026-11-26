@@ -30,7 +30,7 @@ pub mod hostkey;
 pub(crate) mod validate;
 pub(crate) mod worker;
 
-pub use conn::fetch_host_key;
+pub use conn::{fetch_host_key, known_hosts_files};
 
 use crate::config::HttpConfig;
 use crate::engine::EngineError;

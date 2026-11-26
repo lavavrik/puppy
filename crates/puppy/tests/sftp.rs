@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use puppy_testserver::body_byte;
-use puppy_testserver::sftp::{SftpCfg, SftpServer, key_path, start_agent};
+use puppy_testserver::sftp::{HostKey, SftpCfg, SftpServer, key_path, start_agent};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
@@ -281,4 +281,35 @@ async fn the_daemon_uses_the_agent_a_client_offers() {
         s.logins(),
         vec!["publickey:puppy-test-agent_ed25519".to_string()]
     );
+}
+
+/// `puppy ssh trust` refuses a host that offers only a key of a type not known for it
+/// (keys of other types are), unless `--replace-type` says the change is expected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trust_refuses_a_new_key_type_without_replace_type() {
+    let env = env(Some("user_ed25519"));
+    let s = SftpServer::start(SftpCfg::default()).await;
+    s.set_file("/f", data(10 * KIB, 4), MTIME);
+    std::fs::write(
+        env.home.path().join("home/.ssh/known_hosts"),
+        s.known_hosts_line(HostKey::Ecdsa),
+    )
+    .unwrap();
+    let target = format!("127.0.0.1:{}", s.port());
+    let (status, out, err) = env.run(&["ssh", "trust", "--yes", &target]);
+    assert_eq!(status.code(), Some(1), "{out}\n{err}");
+    assert!(err.contains("WARNING"), "{err}");
+    assert!(err.contains("ecdsa-sha2-nistp256 in "), "{err}");
+    assert!(err.contains("--replace-type"), "{err}");
+    assert!(!env.paths().known_hosts().exists());
+    let (status, out, err) = env.run(&["ssh", "trust", "--yes", "--replace-type", &target]);
+    assert!(status.success(), "{out}\n{err}");
+    assert!(err.contains("WARNING"), "{err}");
+    let dl = env.dl_dir();
+    let url = s.url("/f").to_string();
+    let (status, out, err) = env.run(&["add", "--wait", "-o", dl.to_str().unwrap(), &url]);
+    assert!(status.success(), "{out}\n{err}");
+    // A target that would be a pattern in known_hosts is refused.
+    let (status, _, err) = env.run(&["ssh", "trust", "--yes", "*.example,127.0.0.1"]);
+    assert_eq!(status.code(), Some(2), "{err}");
 }

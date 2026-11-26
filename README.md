@@ -680,9 +680,19 @@ whether to trust it; check the fingerprint with whoever runs the server (on
 the server: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). `--yes`
 trusts without asking (in scripts, where it refuses to ask otherwise). The key
 goes into puppy's own `known_hosts`, never into `~/.ssh/known_hosts`. A host
-already known is left as it is, and a changed key is refused as above.
-`--json` prints the host, port, key type, fingerprint and what happened
-(`added`, `known`, `changed`, `revoked`).
+already known is left as it is, and a changed key is refused as above. HOST
+must be a plain host name (letters, digits, `.`, `_`, `-`) or an IP address:
+patterns, lists and markers are refused, as they would mean more in
+`known_hosts`.
+
+A host known only with keys of other types that now offers a key of a new
+type (puppy asks for the known types first, so it offers none of them) looks
+like an attack as well: downloads from it fail, and `puppy ssh trust` refuses
+it with a warning naming the keys it is known with. If the server's keys
+really changed, `--replace-type` trusts the new key anyway (after the usual
+question, or with `--yes`). `--json` prints the host, port, key type,
+fingerprint and what happened (`added`, `known`, `changed`, `other-type`,
+`revoked`).
 
 Downloads are segmented as over HTTP: up to `connections` SSH connections to
 the server, each logged in once, with one SFTP session that reads its range

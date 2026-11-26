@@ -143,7 +143,7 @@ impl client::Handler for Client {
 }
 
 /// The `known_hosts` files to check: the configured ones, then puppy's own.
-pub(crate) fn known_hosts_files(cfg: &SftpConfig) -> Vec<PathBuf> {
+pub fn known_hosts_files(cfg: &SftpConfig) -> Vec<PathBuf> {
     let mut files = cfg.known_hosts.clone();
     files.extend(cfg.trusted_hosts.clone());
     files
@@ -213,14 +213,15 @@ fn host_key_error(host: &str, port: u16, key: &PublicKey, verdict: &Verdict) -> 
     let shown = hostkey::describe(key);
     EngineError::Ssh(match verdict {
         Verdict::Trusted => format!("SSH: the host key of {name} was not accepted"),
-        Verdict::Unknown { other_types } => format!(
-            "SSH: the host key of {name} is not known ({shown}{}). Check the fingerprint \
-             with the server's administrator; to trust it, run `puppy ssh trust {arg}`",
-            if *other_types {
-                "; keys of other types are known for it"
-            } else {
-                ""
-            }
+        Verdict::Unknown { other_types: false } => format!(
+            "SSH: the host key of {name} is not known ({shown}). Check the fingerprint \
+             with the server's administrator; to trust it, run `puppy ssh trust {arg}`"
+        ),
+        Verdict::Unknown { other_types: true } => format!(
+            "SSH: {name} offers only a key of a type not known for it ({shown}), while \
+             keys of other types are: this can be a man-in-the-middle attack. Nothing was \
+             sent to it. If the server's keys really changed, check the fingerprint with \
+             its administrator and run `puppy ssh trust --replace-type {arg}`"
         ),
         Verdict::Changed { file, line } => format!(
             "SSH: REMOTE HOST IDENTIFICATION HAS CHANGED for {name}: it presents {shown}, \

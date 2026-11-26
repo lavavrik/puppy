@@ -9,7 +9,7 @@
 //! throttled, shortened or failed once.
 //!
 //! Test keys (OpenSSH format, `keys/`): `host_ed25519` (the server's), `host_ed25519_other`
-//! (a "changed" host key), `user_ed25519` and `user_rsa` (unencrypted), `agent_ed25519`
+//! (a "changed" host key), `host_ecdsa` (a host key of another type), `user_ed25519` and `user_rsa` (unencrypted), `agent_ed25519`
 //! (for a test agent), `user_encrypted_ed25519` (passphrase `puppy-test-passphrase`).
 
 use std::collections::HashMap;
@@ -52,6 +52,8 @@ pub enum HostKey {
     Main,
     /// `keys/host_ed25519_other`.
     Other,
+    /// `keys/host_ecdsa` (another key type).
+    Ecdsa,
 }
 
 impl HostKey {
@@ -59,6 +61,7 @@ impl HostKey {
         match self {
             HostKey::Main => "host_ed25519",
             HostKey::Other => "host_ed25519_other",
+            HostKey::Ecdsa => "host_ecdsa",
         }
     }
 }

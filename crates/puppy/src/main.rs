@@ -276,6 +276,10 @@ enum SshAction {
         /// Trust it without asking (check the fingerprint first: it is printed).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Trust a key of a type not known for a host that has keys of other types
+        /// (refused otherwise: that is what an attack looks like).
+        #[arg(long)]
+        replace_type: bool,
     },
 }
 
@@ -449,8 +453,13 @@ fn main() -> ExitCode {
                 BrowserAction::Status => cli::browser::status(cli.json).await,
             },
             Some(Command::Ssh {
-                action: SshAction::Trust { host, yes },
-            }) => cli::ssh::trust(&Ctx::from_env(cli.json)?, &host, yes).await,
+                action:
+                    SshAction::Trust {
+                        host,
+                        yes,
+                        replace_type,
+                    },
+            }) => cli::ssh::trust(&Ctx::from_env(cli.json)?, &host, yes, replace_type).await,
             Some(Command::NativeHost { browser_args: _ }) => native_host::run().await,
             None => dashboard(cli.theme).await.map_err(Into::into),
         }

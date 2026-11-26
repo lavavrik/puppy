@@ -20,7 +20,7 @@ pub fn parse_target(s: &str) -> Result<(String, u16), String> {
             Some(h) => h.to_string(),
             None => return Err(bad()),
         };
-        return Ok((host, url.port().unwrap_or(22)));
+        return finish(&host, url.port().unwrap_or(22), bad);
     }
     let port = |p: &str| p.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(bad);
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
@@ -37,7 +37,13 @@ pub fn parse_target(s: &str) -> Result<(String, u16), String> {
             None => (s, 22),
         }
     };
-    if host.is_empty() || host.contains(char::is_whitespace) {
+    finish(host, port, bad)
+}
+
+/// Only plain host names, IPv4 and IPv6 addresses: anything else would be written into
+/// `known_hosts` as a pattern or marker.
+fn finish(host: &str, port: u16, bad: impl Fn() -> String) -> Result<(String, u16), String> {
+    if !hostkey::valid_host(host) {
         return Err(bad());
     }
     Ok((host.to_ascii_lowercase(), port))
@@ -57,7 +63,9 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
     ))
 }
 
-pub async fn trust(ctx: &Ctx, target: &str, yes: bool) -> Result<(), CliError> {
+/// `replace_type`: trust a key of a type not known for a host that has keys of other
+/// types (else refused: a server offering only a new type is how an attack looks).
+pub async fn trust(ctx: &Ctx, target: &str, yes: bool, replace_type: bool) -> Result<(), CliError> {
     let (host, port) = parse_target(target).map_err(CliError::Usage)?;
     let cfg = puppy_daemon::Config::load(&ctx.paths.config_file())
         .map_err(|e| CliError::Other(anyhow!("{e}")))?;
@@ -112,7 +120,39 @@ pub async fn trust(ctx: &Ctx, target: &str, yes: bool) -> Result<(), CliError> {
                 file.display()
             )));
         }
-        Verdict::Unknown { .. } => {}
+        Verdict::Unknown { other_types: true } => {
+            let files = puppy_core::sftp::known_hosts_files(&http.sftp);
+            let known = hostkey::Known::lookup(&files, &host, port);
+            let listed: Vec<String> = known
+                .entries
+                .iter()
+                .filter(|e| !e.revoked)
+                .map(|e| {
+                    format!(
+                        "{} in {}:{}",
+                        e.key.algorithm().as_str(),
+                        e.file.display(),
+                        e.line
+                    )
+                })
+                .collect();
+            let warning = format!(
+                "WARNING: {name} is known with other key types ({}), but now offers only {}. \
+                 This can be a man-in-the-middle attack",
+                listed.join(", "),
+                hostkey::describe(&key)
+            );
+            if !replace_type {
+                report(false, "other-type");
+                return Err(CliError::Other(anyhow!(
+                    "{warning}. Not trusted: if the server's keys really changed, check the \
+                     fingerprint with its administrator and run this again with \
+                     --replace-type"
+                )));
+            }
+            err(format_args!("{warning}."));
+        }
+        Verdict::Unknown { other_types: false } => {}
     }
     if !ctx.json || !yes {
         err(format_args!(
@@ -163,5 +203,17 @@ mod tests {
         assert!(t("h:x").is_err());
         assert!(t("").is_err());
         assert!(t("[::1]x").is_err());
+        for bad in [
+            "a,b",
+            "*.x",
+            "!x",
+            "|1|a|b",
+            "@revoked",
+            "h?",
+            "sftp://a,b/x",
+            "sftp://%2A/x",
+        ] {
+            assert!(t(bad).is_err(), "{bad}");
+        }
     }
 }
