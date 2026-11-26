@@ -54,6 +54,49 @@ pub async fn validate_remote(
         .unwrap_or_else(|_| Err(EngineError::Network("validation timed out".into())))
 }
 
+/// Compares `[start, end)` of `part` with the same bytes at `url` (no `If-Range`), and
+/// the total its `Content-Range` reports with `total`: how a location without validators
+/// is checked before it serves a range. `ctx` is already the context for `url`.
+#[allow(clippy::too_many_arguments)]
+pub async fn spot_check(
+    client: &reqwest::Client,
+    ctx: &RequestContext,
+    url: &url::Url,
+    total: u64,
+    start: u64,
+    end: u64,
+    part: &Path,
+    cfg: &HttpConfig,
+) -> Result<Validation, EngineError> {
+    let net = Net {
+        client,
+        ctx,
+        url,
+        read_timeout: Duration::from_millis(cfg.read_timeout_ms),
+    };
+    let check = async {
+        let got = match fetch(&net, None, start, end).await? {
+            Fetched::Range { total: t, .. } if t != Some(total) => return Ok(Validation::Changed),
+            Fetched::Range { data, .. } => data,
+            Fetched::Unsatisfiable { .. } => return Ok(Validation::Changed),
+            Fetched::Other(v) => return Ok(v),
+        };
+        let path = part.to_path_buf();
+        let local = tokio::task::spawn_blocking(move || read_range(&path, start, end))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(if got == local {
+            Validation::Ok
+        } else {
+            Validation::Changed
+        })
+    };
+    let limit = Duration::from_millis(cfg.validate_timeout_ms);
+    tokio::time::timeout(limit, check)
+        .await
+        .unwrap_or_else(|_| Err(EngineError::Network("check timed out".into())))
+}
+
 /// Where and how validation requests are sent.
 struct Net<'a> {
     client: &'a reqwest::Client,

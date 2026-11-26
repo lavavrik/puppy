@@ -580,6 +580,8 @@ impl Inner {
         let mut usable = false;
         let mut error = None;
         let mut changed = false;
+        let mut primary_changed = false;
+        let now = std::time::Instant::now();
         for (m, check) in self.lock().mirrors.iter_mut().zip(checks) {
             match check {
                 Check::Ok(learned) => {
@@ -591,10 +593,19 @@ impl Inner {
                 }
                 Check::Changed(why) => {
                     changed = true;
+                    // The primary had validators, so its file did change: as without
+                    // mirrors, that needs attention.
+                    primary_changed |= m.primary && !m.v.is_empty();
                     m.drop_with(DropKind::Changed, why);
                 }
                 Check::NoRanges => {
                     m.drop_with(DropKind::RangeUnsupported, "does not honour range requests")
+                }
+                // It may answer later: benched, and checked again before it gets a range
+                // (`If-Range`, or a byte comparison without validators).
+                Check::Failed(e) if e.is_transient() => {
+                    m.failed(format!("validation failed: {e}"), false, &self.cfg, now);
+                    error = error.or(Some(e));
                 }
                 Check::Failed(e) => {
                     let kind = mirrors::kind_of(&e);
@@ -602,6 +613,9 @@ impl Inner {
                     error = error.or(Some(e));
                 }
             }
+        }
+        if primary_changed {
+            return Ok(Validation::Changed);
         }
         if usable {
             if let Err(e) = self.write_sidecar().await {
@@ -654,7 +668,13 @@ impl Inner {
                 if is_url_rejected(status) && state.final_url != url =>
             {
                 match self.reresolve(i, false).await {
-                    Ok(true) => Ok(Validation::Ok),
+                    Ok(true) => {
+                        // Keep the URL re-resolution found, not the probe's stale one.
+                        if let Some(v) = &mut learned {
+                            v.final_url = self.lock().mirrors[i].v.final_url.clone();
+                        }
+                        Ok(Validation::Ok)
+                    }
                     Ok(false) => Ok(Validation::Changed),
                     Err(e) => Err(e),
                 }

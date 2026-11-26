@@ -516,3 +516,192 @@ async fn mirrors_are_ordered_by_priority() {
         .collect();
     assert_eq!(urls, want);
 }
+
+// ---- review fixes ----
+
+/// A mirror without validators (no ETag, no Last-Modified) cannot be checked by
+/// `If-Range`: before each range it gets, a window of bytes already downloaded is
+/// compared against it. One whose file changed is dropped instead of mixing another
+/// version into the file.
+#[tokio::test]
+async fn validator_less_mirror_that_changes_is_never_mixed_in() {
+    let a = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    let b = server(|c| {
+        c.bytes_per_sec = Some(512 * KIB);
+        c.etag = false;
+        c.last_modified = false;
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, added) = start(request(&a, &[&b], dir.path()), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= 512 * KIB, TIMEOUT).await;
+    b.set_version(1);
+    b.set_cfg(|c| c.bytes_per_sec = None);
+    a.set_cfg(|c| c.fail_status = Some(503));
+    let dropped = |m: &MirrorView| matches!(&m.state, MirrorState::Dropped { .. });
+    wait_status(&dl, |_| dropped(&mirrors(&dl)[1]), TIMEOUT).await;
+    assert!(
+        dropped_reason(&mirrors(&dl)[1]).contains("changed"),
+        "{:?}",
+        mirrors(&dl)
+    );
+    a.set_cfg(|c| {
+        c.fail_status = None;
+        c.bytes_per_sec = None;
+    });
+    let st = wait_status(
+        &dl,
+        |s| {
+            matches!(
+                s.state,
+                DownloadState::Completed | DownloadState::Failed { .. }
+            )
+        },
+        TIMEOUT,
+    )
+    .await;
+    if matches!(st.state, DownloadState::Failed { .. }) {
+        dl.resume().await.unwrap();
+        wait_completed(&dl).await;
+    }
+    assert_file(&added.path, LEN, 0);
+}
+
+/// Before any byte is downloaded from a location with validators, a validator-less
+/// mirror has nothing to be compared against: it waits for the first bytes.
+#[tokio::test]
+async fn validator_less_mirror_waits_for_checked_bytes() {
+    let a = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    let b = server(|c| {
+        c.etag = false;
+        c.last_modified = false;
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    // A mirror serving another version from the start.
+    b.set_version(1);
+    let (dl, added) = start(request(&a, &[&b], dir.path()), cfg(dir.path())).await;
+    let dropped = |m: &MirrorView| matches!(&m.state, MirrorState::Dropped { .. });
+    wait_status(&dl, |_| dropped(&mirrors(&dl)[1]), TIMEOUT).await;
+    a.set_cfg(|c| c.bytes_per_sec = None);
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+    assert_eq!(mirrors(&dl)[1].done_bytes, 0);
+}
+
+/// The primary's file changed while the download was stopped: it needs attention, as
+/// without mirrors, even though a mirror still serves the old file.
+#[tokio::test]
+async fn primary_changed_on_resume_needs_attention() {
+    let a = server(|c| c.bytes_per_sec = Some(256 * KIB)).await;
+    let b = server(|c| c.bytes_per_sec = Some(256 * KIB)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = request(&a, &[&b], dir.path());
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    a.set_version(1);
+    let dl = restore(req, &added.path, cfg(dir.path())).await;
+    assert_eq!(
+        dl.status().state,
+        DownloadState::NeedsAttention {
+            reason: AttentionReason::RemoteChanged
+        }
+    );
+}
+
+/// The primary's file changing mid-download needs attention too.
+#[tokio::test]
+async fn primary_changing_mid_download_needs_attention() {
+    let a = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    let b = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (dl, _) = start(request(&a, &[&b], dir.path()), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= 512 * KIB, TIMEOUT).await;
+    a.set_version(1);
+    // Its running responses end, so its next requests carry `If-Range`.
+    a.set_cfg(|c| c.fail_status = Some(503));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    a.set_cfg(|c| c.fail_status = None);
+    wait_status(
+        &dl,
+        |s| {
+            s.state
+                == DownloadState::NeedsAttention {
+                    reason: AttentionReason::RemoteChanged,
+                }
+        },
+        TIMEOUT,
+    )
+    .await;
+}
+
+/// A mirror's expired redirect target is re-resolved on its own, mid-download, and it
+/// gets connections again at its new URL. (That the other location's connections are
+/// not stopped meanwhile is checked by a unit test in `transfer.rs`.)
+#[tokio::test]
+async fn mirror_reresolves_without_stopping_the_others() {
+    let a = server(|c| c.bytes_per_sec = Some(64 * KIB)).await;
+    let b = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = request(&a, &[], dir.path());
+    req.mirrors = vec![Mirror::new(b.url("/expiring"))];
+    // Small enough that the fast mirror steals ranges from the slow primary.
+    let mut c = cfg(dir.path());
+    c.min_segment_bytes = 64 * KIB;
+    let (dl, added) = start(req, c).await;
+    wait_status(
+        &dl,
+        |_| mirrors(&dl).iter().all(|m| m.connections > 0),
+        TIMEOUT,
+    )
+    .await;
+    // Its next request (once one of its ranges is done) is refused and re-resolved.
+    b.rotate_signed();
+    let deadline = Instant::now() + TIMEOUT;
+    while !b.paths_seen().iter().any(|p| p == "/signed/1") {
+        assert!(
+            Instant::now() < deadline,
+            "{:?} {:?} {:?}",
+            b.paths_seen(),
+            dl.status(),
+            dl.detail()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    wait_status(&dl, |_| mirrors(&dl)[1].connections > 0, TIMEOUT).await;
+    a.set_cfg(|c| c.bytes_per_sec = None);
+    b.set_cfg(|c| c.bytes_per_sec = None);
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+}
+
+/// A mirror that cannot be checked on resume (it is down for now) is benched, not
+/// dropped: it is checked and used again once it answers.
+#[tokio::test]
+async fn mirror_down_on_resume_is_benched_and_comes_back() {
+    let a = server(|c| c.bytes_per_sec = Some(256 * KIB)).await;
+    let b = server(|c| c.bytes_per_sec = Some(256 * KIB)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = request(&a, &[&b], dir.path());
+    let (dl, added) = start(req.clone(), cfg(dir.path())).await;
+    wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
+    dl.pause().await;
+    drop(dl);
+    b.set_cfg(|c| c.fail_status = Some(503));
+    let dl = restore(req, &added.path, cfg(dir.path())).await;
+    let shown = mirrors(&dl);
+    assert!(
+        matches!(&shown[1].state, MirrorState::Benched { reason, .. } if reason.contains("503")),
+        "{shown:?}"
+    );
+    let b_before = b.range_requests();
+    b.set_cfg(|c| {
+        c.fail_status = None;
+        c.bytes_per_sec = None;
+    });
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+    assert!(b.range_requests() > b_before, "the mirror never came back");
+}

@@ -77,6 +77,7 @@ impl SegmentShared {
     }
 }
 
+#[derive(Clone)]
 pub struct WorkerCtx {
     pub client: reqwest::Client,
     pub url: url::Url,

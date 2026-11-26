@@ -105,6 +105,8 @@ pub(super) struct MirrorRt {
     /// Progress (bytes done) when its URL was last re-resolved: a fresh URL that is
     /// refused again before any progress is not re-resolved again.
     pub reresolved_at: Option<u64>,
+    /// Its URL is being re-resolved: no new connections meanwhile.
+    pub busy: bool,
     meter: SpeedMeter,
     last_got: u64,
 }
@@ -122,6 +124,7 @@ impl MirrorRt {
             got: Arc::new(AtomicU64::new(0)),
             bps: 0,
             reresolved_at: None,
+            busy: false,
             meter: SpeedMeter::new(),
             last_got: 0,
         }
@@ -151,6 +154,15 @@ impl MirrorRt {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Usable now, without lifting anything.
+    pub fn available_now(&self, now: Instant) -> bool {
+        match &self.health {
+            Health::Usable => true,
+            Health::Benched { until, .. } => *until <= now,
+            Health::Dropped { .. } => false,
         }
     }
 
@@ -262,13 +274,17 @@ pub(super) fn restore_records(mirrors: &mut [MirrorRt], records: &[MirrorResume]
     }
 }
 
-/// The mirror a new connection goes to: among the usable ones, the one with the fewest
-/// connections, ties broken by the faster one per connection, then by order. `None` if
-/// every mirror is benched or dropped.
-pub(super) fn pick(mirrors: &mut [MirrorRt], now: Instant) -> Option<usize> {
+/// The mirror a new connection goes to: among the usable ones that `allowed` lets
+/// through (and that are not being re-resolved), the one with the fewest connections,
+/// ties broken by the faster one per connection, then by order. `None` if there is none.
+pub(super) fn pick(
+    mirrors: &mut [MirrorRt],
+    now: Instant,
+    allowed: impl Fn(&MirrorRt) -> bool,
+) -> Option<usize> {
     let mut best: Option<usize> = None;
     for i in 0..mirrors.len() {
-        if !mirrors[i].available(now) {
+        if !mirrors[i].available(now) || mirrors[i].busy || !allowed(&mirrors[i]) {
             continue;
         }
         best = match best {
@@ -301,6 +317,7 @@ pub(super) fn reset(mirrors: &mut [MirrorRt]) {
     for m in mirrors {
         m.failures = 0;
         m.reresolved_at = None;
+        m.busy = false;
         m.health = Health::Usable;
     }
 }
