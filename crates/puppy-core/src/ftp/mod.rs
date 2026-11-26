@@ -159,8 +159,6 @@ pub struct Site {
 struct SiteState {
     /// Logged-in sessions: in use or idle.
     connected: usize,
-    /// The most sessions that were logged in at once (this transfer).
-    peak: usize,
     /// Sessions being opened.
     connecting: usize,
     /// At most this many sessions: learned when the server turned one away.
@@ -282,7 +280,6 @@ impl Site {
         let closed = st.idle.len();
         st.idle.clear();
         st.connected = st.connected.saturating_sub(closed);
-        st.peak = st.connected;
         st.cap = None;
     }
 
@@ -294,6 +291,8 @@ impl Site {
     /// or closed. Cancel-safe.
     pub(crate) async fn session(self: &Arc<Self>, cfg: &HttpConfig) -> Result<Lease, EngineError> {
         let ep = self.endpoint()?.clone();
+        // Refusals of this call so far: each retry waits longer (the usual backoff).
+        let mut refusals: u32 = 0;
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
@@ -335,7 +334,6 @@ impl Site {
                     let mut st = self.lock();
                     st.connecting -= 1;
                     st.connected += 1;
-                    st.peak = st.peak.max(st.connected);
                     if let Some(c) = st.cap
                         && st.connected > c
                     {
@@ -363,10 +361,10 @@ impl Site {
                     EngineError::Ftp {
                         code: 421 | 530, ..
                     } if connected > 0 => {
-                        // As many as were ever logged in at once got in: that many are
-                        // allowed (fewer may be logged in now, closing ones not yet
-                        // counted out by the server).
-                        let allowed = connected.max(st.peak);
+                        // The sessions logged in now are what the server allows now (it
+                        // may have lowered its limit since more got in). A successful
+                        // login raises the cap again.
+                        let allowed = connected;
                         if st.cap.is_none_or(|c| c > allowed) {
                             tracing::info!(
                                 host = %ep.host,
@@ -388,9 +386,14 @@ impl Site {
                     e => Err(e),
                 }
             };
-            self.freed.notify_one();
+            // The failed attempt no longer counts as connecting: others gated on it may
+            // try. (This task's own `freed` is never awaited again: the next round
+            // registers anew, so this cannot wake it.)
+            self.freed.notify_waiters();
             wait?;
-            freed.await;
+            // Never straight back at a server that just turned a session away.
+            tokio::time::sleep(crate::http::worker::backoff(cfg, refusals)).await;
+            refusals = refusals.saturating_add(1);
         }
     }
 

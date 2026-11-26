@@ -745,3 +745,106 @@ async fn an_ftp_mirror_without_mdtm_is_checked_before_use() {
     assert_eq!(std::fs::read(path).unwrap(), data(len, 0));
     assert!(ftp.retrs() > 0, "the FTP mirror was never used");
 }
+
+/// A server that lowers its session limit while sessions are open: the download backs
+/// off to what it allows now, without hammering it with refused connections.
+#[tokio::test]
+async fn a_lowered_session_limit_is_followed_without_a_reconnect_storm() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = server(|c| {
+        c.max_sessions = Some(2);
+        c.bytes_per_sec = Some(256 * KIB);
+    })
+    .await;
+    let len = 1024 * KIB;
+    s.set_file("f", data(len, 20), MDTM);
+    let mut c = cfg(dir.path());
+    c.connections = 4;
+    let e = HttpEngine::new(c).unwrap();
+    e.add(
+        1,
+        request(s.url("f"), dir.path()),
+        StartMode::Fresh,
+        AddOptions::default(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    s.set_cfg(|c| c.max_sessions = Some(1));
+    let path = completed(&e, 1).await;
+    assert_eq!(std::fs::read(path).unwrap(), data(len, 20));
+    assert!(
+        s.turned_away() <= 40,
+        "{} refused connections",
+        s.turned_away()
+    );
+}
+
+/// A server that accepts `AUTH TLS` and then refuses to protect the session is not one
+/// without TLS: with TLS only tried, the download still fails rather than log in in the
+/// clear.
+#[tokio::test]
+async fn a_failure_after_auth_tls_never_falls_back_to_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = server(|c| {
+        c.tls = ServerTls::Explicit;
+        c.refuse_prot = true;
+    })
+    .await;
+    s.set_file("f", data(10 * KIB, 0), MDTM);
+    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let r = e
+        .add(
+            1,
+            request(s.url("f"), dir.path()),
+            StartMode::Fresh,
+            AddOptions::default(),
+        )
+        .await;
+    let err = r.expect_err("TLS set-up fails");
+    assert!(
+        matches!(&err, EngineError::Tls(m) if m.contains("accepted AUTH TLS")),
+        "{err:?}"
+    );
+    let cmds = s.commands();
+    assert!(!cmds.iter().any(|c| c.starts_with("USER")), "{cmds:?}");
+    assert_eq!(
+        cmds.iter().filter(|c| *c == "AUTH TLS").count(),
+        1,
+        "{cmds:?}"
+    );
+}
+
+/// A server that stops reporting the modification time it reported before cannot vouch
+/// for the file: the next transfer treats it as changed.
+#[tokio::test]
+async fn mdtm_disappearing_mid_download_needs_attention() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = server(|c| {
+        c.bytes_per_sec = Some(256 * KIB);
+        c.fail_after_bytes_once = Some(200 * KIB);
+    })
+    .await;
+    s.set_file("f", data(1024 * KIB, 21), MDTM);
+    let mut c = cfg(dir.path());
+    c.connections = 1;
+    let e = HttpEngine::new(c).unwrap();
+    e.add(
+        1,
+        request(s.url("f"), dir.path()),
+        StartMode::Fresh,
+        AddOptions::default(),
+    )
+    .await
+    .unwrap();
+    wait(&e, 1, |st| st.done_bytes > 64 * KIB).await;
+    // `set_cfg` re-arms the one-time failure: the retry after it asks for MDTM again.
+    s.set_cfg(|c| c.mdtm = false);
+    let st = wait(&e, 1, done).await;
+    assert_eq!(
+        st.state,
+        DownloadState::NeedsAttention {
+            reason: AttentionReason::RemoteChanged
+        }
+    );
+}

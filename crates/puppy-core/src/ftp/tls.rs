@@ -7,8 +7,40 @@ use crate::engine::EngineError;
 use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::CertificateDer;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use suppaftp::tokio::AsyncRustlsConnector;
+use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsStream, AsyncTlsConnector};
+
+/// A session's connector that records whether a handshake was started: suppaftp's
+/// `into_secure` only starts one once the server accepted `AUTH TLS`, so a failure after
+/// that (`PBSZ`/`PROT` refused, a bad certificate) is never mistaken for a server
+/// without TLS.
+#[derive(Debug)]
+pub(super) struct Connector {
+    inner: AsyncRustlsConnector,
+    started: Arc<AtomicBool>,
+}
+
+impl Connector {
+    /// Set once the first handshake starts.
+    pub fn started(&self) -> Arc<AtomicBool> {
+        self.started.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncTlsConnector for Connector {
+    type Stream = AsyncRustlsStream;
+
+    async fn connect(
+        &self,
+        domain: &str,
+        stream: tokio::net::TcpStream,
+    ) -> suppaftp::FtpResult<AsyncRustlsStream> {
+        self.started.store(true, Ordering::SeqCst);
+        self.inner.connect(domain, stream).await
+    }
+}
 
 static DEFAULT: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
 
@@ -37,7 +69,7 @@ fn build(extra_roots: &[Vec<u8>]) -> Result<Arc<ClientConfig>, String> {
 /// opens). Each session gets its own resumption cache: servers that insist on data
 /// connections resuming the control connection's TLS session (vsftpd's
 /// `require_ssl_reuse`, ProFTPD's default) then find exactly that session offered.
-pub(super) fn connector(cfg: &HttpConfig) -> Result<AsyncRustlsConnector, EngineError> {
+pub(super) fn connector(cfg: &HttpConfig) -> Result<Connector, EngineError> {
     let base = if cfg.ftp.extra_roots.is_empty() {
         DEFAULT.get_or_init(|| build(&[])).clone()
     } else {
@@ -46,7 +78,10 @@ pub(super) fn connector(cfg: &HttpConfig) -> Result<AsyncRustlsConnector, Engine
     .map_err(EngineError::Tls)?;
     let mut session = (*base).clone();
     session.resumption = Resumption::in_memory_sessions(8);
-    Ok(AsyncRustlsConnector::from(tokio_rustls_connector(session)))
+    Ok(Connector {
+        inner: AsyncRustlsConnector::from(tokio_rustls_connector(session)),
+        started: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 fn tokio_rustls_connector(cfg: ClientConfig) -> suppaftp::tokio_rustls::TlsConnector {

@@ -170,11 +170,13 @@ async fn check(
     {
         return Ok(false);
     }
-    if let Some(recorded) = &target.mdtm
-        && let Some(now) = s.mdtm(path, &ctx.cfg).await?
-        && &now != recorded
-    {
-        return Ok(false);
+    if let Some(recorded) = &target.mdtm {
+        // A server that told the modification time and no longer does cannot vouch for
+        // the file any more.
+        match s.mdtm(path, &ctx.cfg).await? {
+            Some(now) if &now == recorded => {}
+            _ => return Ok(false),
+        }
     }
     Ok(true)
 }

@@ -68,6 +68,9 @@ pub struct FtpCfg {
     pub bytes_per_sec: Option<u64>,
     /// Abort one data connection after this many bytes (once; re-armed by `set_cfg`).
     pub fail_after_bytes_once: Option<u64>,
+    /// Accept `AUTH TLS` but refuse `PROT P` (534), as servers whose TLS is set up for
+    /// the control connection only do.
+    pub refuse_prot: bool,
 }
 
 impl Default for FtpCfg {
@@ -84,6 +87,7 @@ impl Default for FtpCfg {
             limit_reply: LimitReply::Greeting421,
             bytes_per_sec: None,
             fail_after_bytes_once: None,
+            refuse_prot: false,
         }
     }
 }
@@ -405,6 +409,9 @@ impl Session {
                 self.ctrl = Conn::Tls(Box::new(self.s.acceptor.accept(tcp).await?));
             }
             "PBSZ" if cfg.tls != FtpTls::Off => self.reply("200 PBSZ=0").await?,
+            "PROT" if cfg.refuse_prot => {
+                self.reply("534 Request denied for policy reasons").await?
+            }
             "PROT" if cfg.tls != FtpTls::Off => {
                 self.protect = arg.trim().eq_ignore_ascii_case("P");
                 self.reply("200 Protection level set").await?;

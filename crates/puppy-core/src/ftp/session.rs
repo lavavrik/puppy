@@ -93,9 +93,29 @@ impl Session {
                 None => ftp,
                 Some(required) => {
                     let connector = tls::connector(cfg)?;
-                    match timed(read, ftp.into_secure(connector, &ep.host)).await? {
-                        Ok(ftp) => ftp,
-                        Err(e) if refuses_tls(&e) && !required => {
+                    let started = connector.started();
+                    let secured = timed(read, ftp.into_secure(connector, &ep.host)).await;
+                    // Only a refusal of `AUTH TLS` itself means "no TLS here"; anything
+                    // failing once the handshake started is a TLS failure.
+                    let refused_auth = |e: &FtpError| {
+                        !started.load(std::sync::atomic::Ordering::SeqCst) && refuses_tls(e)
+                    };
+                    match secured {
+                        // Timed out: network trouble, never a reason to drop TLS.
+                        Err(e) => return Err(e),
+                        Ok(Ok(ftp)) => ftp,
+                        Ok(Err(e)) if started.load(std::sync::atomic::Ordering::SeqCst) => {
+                            return Err(match ftp_err(e) {
+                                EngineError::Ftp { code, message } => EngineError::Tls(format!(
+                                    "the server accepted AUTH TLS but then refused to protect \
+                                     the session ({code} {message})"
+                                )),
+                                // A bad certificate, or the connection dropped mid-way
+                                // (transient): either way, no plain FTP.
+                                other => other,
+                            });
+                        }
+                        Ok(Err(e)) if refused_auth(&e) && !required => {
                             tracing::info!(
                                 host = %ep.host,
                                 "the FTP server does not offer TLS; continuing without"
@@ -105,7 +125,7 @@ impl Session {
                             // another one.
                             Self::greet(ep, connect, read).await?
                         }
-                        Err(e) if refuses_tls(&e) => {
+                        Ok(Err(e)) if refused_auth(&e) => {
                             let EngineError::Ftp { code, message } = ftp_err(e) else {
                                 unreachable!("a refusal is a reply");
                             };
@@ -114,7 +134,7 @@ impl Session {
                                  required"
                             )));
                         }
-                        Err(e) => return Err(ftp_err(e)),
+                        Ok(Err(e)) => return Err(ftp_err(e)),
                     }
                 }
             }
