@@ -96,14 +96,15 @@ struct Shared {
     version: AtomicU32,
     fail_used: AtomicBool,
     get_503_used: AtomicBool,
-    requests: Mutex<Vec<HeaderMap>>,
-    /// Request paths, in order.
-    paths: Mutex<Vec<String>>,
+    /// Every request's path and headers, in order.
+    requests: Mutex<Vec<(String, HeaderMap)>>,
     range_requests: Mutex<usize>,
     /// The only valid `/signed/<n>` (see `/expiring`).
     signed: AtomicU32,
     /// Fixed documents by path: (`Content-Type`, body), served before anything else.
     docs: Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
+    /// Redirects by path: the `Location` a `302` sends, checked before anything else.
+    redirects: Mutex<std::collections::HashMap<String, String>>,
 }
 
 pub struct TestServer {
@@ -126,10 +127,10 @@ impl TestServer {
             fail_used: AtomicBool::new(false),
             get_503_used: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
-            paths: Mutex::new(Vec::new()),
             range_requests: Mutex::new(0),
             signed: AtomicU32::new(0),
             docs: Mutex::default(),
+            redirects: Mutex::default(),
         });
         let app = Router::new().fallback(handle).with_state(shared.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -181,13 +182,28 @@ impl TestServer {
             .insert(path.to_string(), (content_type.to_string(), body.into()));
     }
 
+    /// Answers requests for `path` (GET and HEAD) with `302 Found` to `location` (e.g.
+    /// another server's URL: a different origin).
+    pub fn set_redirect(&self, path: &str, location: impl Into<String>) {
+        self.shared
+            .redirects
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), location.into());
+    }
+
     /// Paths of every request received, in order.
     pub fn paths_seen(&self) -> Vec<String> {
-        self.shared.paths.lock().unwrap().clone()
+        self.seen().into_iter().map(|(p, _)| p).collect()
     }
 
     /// Headers of every request received, in order.
     pub fn requests_seen(&self) -> Vec<http::HeaderMap> {
+        self.seen().into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// The path and headers of every request received, in order.
+    pub fn seen(&self) -> Vec<(String, http::HeaderMap)> {
         self.shared.requests.lock().unwrap().clone()
     }
 }
@@ -237,9 +253,19 @@ fn parse_range(v: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
 }
 
 async fn handle(State(sh): State<Arc<Shared>>, req: Request) -> Response {
-    sh.requests.lock().unwrap().push(req.headers().clone());
     let path = req.uri().path().to_string();
-    sh.paths.lock().unwrap().push(path.clone());
+    sh.requests
+        .lock()
+        .unwrap()
+        .push((path.clone(), req.headers().clone()));
+    let to = sh.redirects.lock().unwrap().get(&path).cloned();
+    if let Some(to) = to {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, to)
+            .body(Body::empty())
+            .unwrap();
+    }
     let doc = sh.docs.lock().unwrap().get(&path).cloned();
     if let Some((content_type, body)) = doc {
         let builder = Response::builder()
