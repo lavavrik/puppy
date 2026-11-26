@@ -724,9 +724,15 @@ async fn http_and_ftp_locations_mix() {
 async fn an_ftp_mirror_without_mdtm_is_checked_before_use() {
     let dir = tempfile::tempdir().unwrap();
     let len = 2048 * KIB;
+    let mut c = cfg(dir.path());
+    c.connections = 4;
+    // The HTTP primary alone needs 8 s (4 connections at 64 KiB/s each, the server's
+    // limit is per response): the mirror is only checked once downloaded bytes exist,
+    // and that check (connect, login, SIZE, RETR a window) must not race the end of
+    // the download on a slow runner.
     let http = TestServer::start(ServerCfg {
         len,
-        bytes_per_sec: Some(512 * KIB),
+        bytes_per_sec: Some(64 * KIB),
         ..ServerCfg::default()
     })
     .await;
@@ -738,13 +744,18 @@ async fn an_ftp_mirror_without_mdtm_is_checked_before_use() {
     ftp.set_file("file.bin", data(len, 0), MDTM);
     let mut req = request(http.url("/file.bin"), dir.path());
     req.mirrors = vec![Mirror::new(ftp.url("file.bin"))];
-    let e = HttpEngine::new(cfg(dir.path())).unwrap();
+    let e = HttpEngine::new(c).unwrap();
     e.add(1, req, StartMode::Fresh, AddOptions::default())
         .await
         .unwrap();
     let path = completed(&e, 1).await;
     assert_eq!(std::fs::read(path).unwrap(), data(len, 0));
-    assert!(ftp.retrs() > 0, "the FTP mirror was never used");
+    // The check's own RETR is one; the ranges it then served are more.
+    assert!(ftp.retrs() >= 2, "the FTP mirror was never used");
+    let EngineDetail::Http { mirrors, .. } = e.detail(1).unwrap() else {
+        panic!("not a segmented download");
+    };
+    assert!(mirrors[1].done_bytes > 0, "{mirrors:?}");
 }
 
 /// A server that lowers its session limit while sessions are open: the download backs

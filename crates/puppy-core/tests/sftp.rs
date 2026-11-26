@@ -7,7 +7,8 @@ use puppy_core::http::engine::HttpEngine;
 use puppy_core::http::resume::{part_path, sidecar_path};
 use puppy_core::sftp::hostkey::{self, Verdict};
 use puppy_core::types::{
-    AddRequest, AttentionReason, DownloadState, DownloadStatus, Mirror, RequestContext, Source,
+    AddRequest, AttentionReason, DownloadState, DownloadStatus, EngineDetail, Mirror,
+    RequestContext, Source,
 };
 use puppy_testserver::sftp::{HostKey, SftpCfg, SftpServer, key_path};
 use puppy_testserver::{ServerCfg, TestServer, body_byte};
@@ -669,16 +670,20 @@ async fn an_sftp_mirror_without_mtime_is_checked_before_use() {
     })
     .await;
     let len = 2048 * KIB;
+    // The HTTP primary alone needs 8 s (4 connections at 64 KiB/s each, the server's
+    // limit is per response): the mirror is only checked once downloaded bytes exist,
+    // and that check (SSH handshake, login, stat, read a window) must not race the end
+    // of the download on a slow runner.
     let http = TestServer::start(ServerCfg {
         len,
-        bytes_per_sec: Some(512 * KIB),
+        bytes_per_sec: Some(64 * KIB),
         ..ServerCfg::default()
     })
     .await;
     fx.s.set_file("/file.bin", data(len, 0), MTIME);
     let mut req = fx.request(http.url("/file.bin"));
     req.mirrors = vec![Mirror::new(fx.s.url("/file.bin"))];
-    let e = HttpEngine::new(fx.cfg()).unwrap();
+    let e = HttpEngine::new(fx.cfg_with(|c| c.connections = 4)).unwrap();
     e.add(1, req, StartMode::Fresh, AddOptions::default())
         .await
         .unwrap();
@@ -688,6 +693,10 @@ async fn an_sftp_mirror_without_mtime_is_checked_before_use() {
         !fx.s.read_offsets().is_empty(),
         "the SFTP mirror was never used"
     );
+    let EngineDetail::Http { mirrors, .. } = e.detail(1).unwrap() else {
+        panic!("not a segmented download");
+    };
+    assert!(mirrors[1].done_bytes > 0, "{mirrors:?}");
 }
 
 /// A server answering a read with more bytes than asked for breaks the protocol: none

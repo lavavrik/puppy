@@ -697,7 +697,9 @@ async fn validator_less_mirror_that_changes_is_never_mixed_in() {
 /// mirror has nothing to be compared against: it waits for the first bytes.
 #[tokio::test]
 async fn validator_less_mirror_waits_for_checked_bytes() {
-    let a = server(|c| c.bytes_per_sec = Some(512 * KIB)).await;
+    // The primary alone needs 4 s (8 connections at 128 KiB/s each): the mirror is
+    // checked (and dropped) only once bytes exist, which must not race the end.
+    let a = server(|c| c.bytes_per_sec = Some(128 * KIB)).await;
     let b = server(|c| {
         c.etag = false;
         c.last_modified = false;
@@ -816,6 +818,9 @@ async fn mirror_down_on_resume_is_benched_and_comes_back() {
     dl.pause().await;
     drop(dl);
     b.set_cfg(|c| c.fail_status = Some(503));
+    // The primary alone needs 3 s for the rest (8 connections at 128 KiB/s each), so
+    // the mirror's bench runs out and it is checked again well before the end.
+    a.set_cfg(|c| c.bytes_per_sec = Some(128 * KIB));
     let dl = restore(req, &added.path, cfg(dir.path())).await;
     let shown = mirrors(&dl);
     assert!(
