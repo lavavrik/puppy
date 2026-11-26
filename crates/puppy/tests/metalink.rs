@@ -572,3 +572,40 @@ async fn credentials_with_a_local_metalink_are_refused() {
         "{seen:?}"
     );
 }
+
+/// A subdirectory of the output folder that is a symbolic link is not followed: the
+/// metalink is refused and nothing lands where the link points.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn symlinked_subdirectory_is_refused() {
+    let env = Env::new();
+    let s = server(64 * KIB).await;
+    let dl = env.dl_dir();
+    let outside = env.home.path().join("outside");
+    std::fs::create_dir_all(&dl).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, dl.join("iso")).unwrap();
+    let ml = write(
+        &env,
+        "linked.meta4",
+        &meta4(&[
+            (
+                "top.bin",
+                64 * KIB,
+                None,
+                vec![s.url("/file.bin").to_string()],
+            ),
+            (
+                "iso/x86_64/deep.bin",
+                64 * KIB,
+                None,
+                vec![s.url("/file.bin").to_string()],
+            ),
+        ]),
+    );
+    let (status, _, err) = env.run(&["add", "-o", dl.to_str().unwrap(), ml.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(ids(&env), 0);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

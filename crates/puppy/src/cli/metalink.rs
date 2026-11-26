@@ -182,7 +182,10 @@ pub(super) async fn expand(
                 Some(b) => b.clone(),
                 None => env.download_dir().await?,
             };
-            Some(f.path.dir_in(&base))
+            match f.path.checked_dir_in(&base) {
+                Ok(d) => Some(d),
+                Err(e) => return Ok(Err(format!("{}: {e}", f.path))),
+            }
         };
         let mut req = loaded.request(f, output_dir, &context);
         if let Some(n) = &name {

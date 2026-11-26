@@ -59,6 +59,8 @@ rustls-platform-verifier = "0.7"
 # Metalink documents (puppy-core's `metalink` module). Never expands entities beyond XML's
 # predefined ones and reports a DOCTYPE as an event, which the parser refuses.
 quick-xml = "0.41"
+# NFC for comparing metalink file names (puppy-core's `metalink`).
+unicode-normalization = "0.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 # SFTP (puppy-core's `sftp` module): a pure-Rust SSH client. Crypto is RustCrypto plus
 # aws-lc-rs (the aws-lc-sys rustls already builds), never OpenSSL or libssh2. No `flate2`

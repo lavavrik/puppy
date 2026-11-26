@@ -258,6 +258,13 @@ fn malicious_names() {
     let dup = v4(r#"<file name="d/A.bin"><url>http://h/1</url></file>
                    <file name="./d/a.bin"><url>http://h/2</url></file>"#);
     assert!(file_error(&dup).contains("same name"));
+    // ... or only by Unicode normalization (NFC é against e + combining acute).
+    let nfc = v4("<file name=\"caf\u{e9}.bin\"><url>http://h/1</url></file>\
+                  <file name=\"cafe\u{301}.bin\"><url>http://h/2</url></file>");
+    assert!(file_error(&nfc).contains("same name"));
+    // A right-to-left override in a name.
+    let rlo = v4("<file name=\"invoice\u{202e}fdp.exe\"><url>http://h/1</url></file>");
+    assert!(file_error(&rlo).contains("formatting character"));
 }
 
 #[test]

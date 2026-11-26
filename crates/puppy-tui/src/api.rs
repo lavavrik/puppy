@@ -257,14 +257,25 @@ async fn add_metalink(
         }
         None => None,
     };
-    for (n, f) in files.iter().enumerate() {
+    // Every file's folder is checked before the first is added.
+    let mut requests = Vec::with_capacity(files.len());
+    for f in files {
         let dir = match &base {
-            Some(b) if f.path.has_dirs() => Some(f.path.dir_in(b)),
+            Some(b) if f.path.has_dirs() => Some(
+                f.path
+                    .checked_dir_in(b)
+                    .map_err(|e| CmdError::Failed(format!("{}: {e}", f.path)))?,
+            ),
             b => b.clone(),
         };
+        // SFTP logins try this terminal's agent first.
+        requests.push(puppy_client::with_ssh_agent(
+            loaded.request(f, dir, &context),
+        ));
+    }
+    for (n, (f, request)) in files.iter().zip(requests).enumerate() {
         let request = Request::Add {
-            // SFTP logins try this terminal's agent first.
-            request: puppy_client::with_ssh_agent(loaded.request(f, dir, &context)),
+            request,
             start_paused,
             limit: None,
         };

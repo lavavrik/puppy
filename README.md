@@ -806,12 +806,16 @@ How a `<file>` is used:
   a metalink is refused, whole, if any of its names could leave that folder:
   an absolute path, a drive letter or UNC prefix, a `..` component (or one of
   dots and spaces only, which Windows reads as `.` or `..`), a control
-  character (NUL included), more than 32 components or more than 4096 bytes.
+  character (NUL included), an invisible Unicode formatting character (bidi
+  overrides such as U+202E, zero-width characters, U+FEFF), more than 32
+  components or more than 4096 bytes.
   Each component is then cleaned like any downloaded file name: `<>:"|?*`
   become `_`, trailing dots and spaces are dropped, Windows device names
   (`CON`, `nul.txt`, `COM1`, …) get a leading `_`, and components longer than
-  200 bytes are shortened. Two files with the same path (ignoring case) refuse
-  the metalink. As for any download, an existing file is never overwritten:
+  200 bytes are shortened. Two files with the same path (ignoring case and
+  Unicode normalization) refuse the metalink. A subdirectory that already
+  exists below the output folder as a symbolic link (or as a file) refuses it
+  too, so creating the folders never follows a link out of it. As for any download, an existing file is never overwritten:
   the new one gets a free name next to it.
 
 Options:
