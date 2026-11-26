@@ -35,25 +35,42 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    /// The context for a request to `target` on behalf of a download of `original` (e.g.
-    /// its redirect target). On another origin (scheme, host or port) the original host's
-    /// cookies and credentials are dropped, including `Cookie`, `Authorization` and
-    /// `Proxy-Authorization` given as headers; the referer, user agent and other headers
-    /// are kept.
+    /// The context for a request to `target` on behalf of a download of `original` (a
+    /// redirect hop, or the final URL its segments go to). The context was given for
+    /// `original`'s origin (scheme, host and port), which keeps all of it. Another origin
+    /// gets, as a browser would send it:
+    ///
+    /// - of the headers, only [`CROSS_ORIGIN_HEADERS`] (`Accept`, `Accept-Language`,
+    ///   `User-Agent`): a custom header such as an API key is the original site's;
+    /// - no cookies or credentials (`Cookie`, `Authorization` and `Proxy-Authorization`
+    ///   given as headers included);
+    /// - the referer cut down to its origin (`https://example.com/`), or none if the
+    ///   request goes to plain HTTP from HTTPS (either the original URL or the referer's);
+    /// - the user agent.
+    ///
+    /// Always judged against `original`, never against the previous hop: a redirect
+    /// back to the original origin gets everything again. Headers puppy sets itself
+    /// (`Range`, `If-Range`, …) are not part of the context and go everywhere.
     pub fn for_target(&self, original: &url::Url, target: &url::Url) -> RequestContext {
         if original.origin() == target.origin() {
             return self.clone();
         }
-        const SENSITIVE: [&str; 3] = ["cookie", "authorization", "proxy-authorization"];
         RequestContext {
             headers: self
                 .headers
                 .iter()
-                .filter(|(n, _)| !SENSITIVE.iter().any(|s| n.trim().eq_ignore_ascii_case(s)))
+                .filter(|(n, _)| {
+                    CROSS_ORIGIN_HEADERS
+                        .iter()
+                        .any(|h| n.trim().eq_ignore_ascii_case(h))
+                })
                 .cloned()
                 .collect(),
             cookies: None,
-            referer: self.referer.clone(),
+            referer: self
+                .referer
+                .as_deref()
+                .and_then(|r| cross_origin_referer(r, original, target)),
             user_agent: self.user_agent.clone(),
             basic_auth: None,
             ssh_agent: self.ssh_agent.clone(),
@@ -74,6 +91,26 @@ impl RequestContext {
             ..RequestContext::default()
         }
     }
+}
+
+/// The headers of a download's context that go to every origin it is redirected to
+/// (see [`RequestContext::for_target`]); any other is dropped there.
+pub const CROSS_ORIGIN_HEADERS: [&str; 3] = ["accept", "accept-language", "user-agent"];
+
+/// What a request to `target`, on another origin than `original`, sends as the referer
+/// `referer`: its origin alone, and nothing when that would take an HTTPS URL's referer
+/// to plain HTTP, or when it has no origin to send (not a URL, `data:`, `file:`).
+fn cross_origin_referer(referer: &str, original: &url::Url, target: &url::Url) -> Option<String> {
+    let referer = url::Url::parse(referer.trim()).ok()?;
+    if !matches!(referer.scheme(), "http" | "https") {
+        return None;
+    }
+    let downgrade =
+        target.scheme() == "http" && (original.scheme() == "https" || referer.scheme() == "https");
+    if downgrade {
+        return None;
+    }
+    Some(format!("{}/", referer.origin().ascii_serialization()))
 }
 
 /// `url` for display: a password in it is shown as `***`.
@@ -362,16 +399,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn for_target_drops_credentials_across_origins() {
+    fn for_target_keeps_only_harmless_context_across_origins() {
         let c = RequestContext {
             headers: vec![
                 ("Authorization".into(), "Bearer a".into()),
                 ("cookie".into(), "c=1".into()),
                 ("PROXY-AUTHORIZATION".into(), "p".into()),
-                ("X-Other".into(), "keep".into()),
+                ("X-Api-Key".into(), "secret".into()),
+                ("Referer".into(), "https://example.com/hdr".into()),
+                (" accept ".into(), "a/b".into()),
+                ("Accept-Language".into(), "uk".into()),
+                ("user-agent".into(), "HdrUA/1".into()),
             ],
             cookies: Some("sid=1".into()),
-            referer: Some("https://example.com/p".into()),
+            referer: Some("https://example.com/p?token=t".into()),
             user_agent: Some("UA/1".into()),
             basic_auth: Some(("alice".into(), Some("pw".into()))),
             ssh_agent: Some("/run/agent.sock".into()),
@@ -385,13 +426,70 @@ mod tests {
             "https://a.example:8443/f",
         ] {
             let t = c.for_target(&orig, &u(other));
-            assert_eq!(t.headers, vec![("X-Other".to_string(), "keep".to_string())]);
+            let names: Vec<&str> = t.headers.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                [" accept ", "Accept-Language", "user-agent"],
+                "{other}"
+            );
             assert_eq!(t.cookies, None);
             assert_eq!(t.basic_auth, None);
-            assert_eq!(t.referer, c.referer);
             assert_eq!(t.user_agent, c.user_agent);
             assert_eq!(t.ssh_agent, c.ssh_agent);
+            // Down to plain HTTP: no referer at all; otherwise its origin only.
+            let referer = (!other.starts_with("http:")).then(|| "https://example.com/".into());
+            assert_eq!(t.referer, referer, "{other}");
             assert_eq!(c.for_mirror(&orig, &u(other)).ssh_agent, c.ssh_agent);
+        }
+    }
+
+    #[test]
+    fn for_target_referer_downgrades() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let with = |r: &str| RequestContext {
+            referer: Some(r.into()),
+            ..RequestContext::default()
+        };
+        let referer =
+            |c: &RequestContext, from: &str, to: &str| c.for_target(&u(from), &u(to)).referer;
+        // From plain HTTP to another plain-HTTP origin: the origin (and port) only.
+        let http = with("http://example.com:8080/page?q=1");
+        assert_eq!(
+            referer(&http, "http://a.example/f", "http://b.example/f").as_deref(),
+            Some("http://example.com:8080/")
+        );
+        // An HTTPS referer never goes to a plain-HTTP origin, whatever the user's URL.
+        let https = with("https://example.com/page");
+        assert_eq!(
+            referer(&https, "http://a.example/f", "http://b.example/f"),
+            None
+        );
+        assert_eq!(
+            referer(&https, "https://a.example/f", "http://b.example/f"),
+            None
+        );
+        // Nor does any referer once the user's HTTPS URL redirects to plain HTTP.
+        assert_eq!(
+            referer(&http, "https://a.example/f", "http://b.example/f"),
+            None
+        );
+        // Up to HTTPS is fine.
+        assert_eq!(
+            referer(&http, "http://a.example/f", "https://b.example/f").as_deref(),
+            Some("http://example.com:8080/")
+        );
+        // On the user's own origin the referer goes as given.
+        assert_eq!(
+            referer(&https, "http://a.example/f", "http://a.example/g").as_deref(),
+            Some("https://example.com/page")
+        );
+        // A referer that is not a URL with an origin is dropped across origins.
+        for bad in ["not a url", "data:text/plain,x", "file:///etc/passwd"] {
+            assert_eq!(
+                referer(&with(bad), "https://a.example/f", "https://b.example/f"),
+                None,
+                "{bad}"
+            );
         }
     }
 

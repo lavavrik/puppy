@@ -4,7 +4,8 @@
 //! cannot continue mid-file, so every attempt (retry or resume) restarts at offset 0.
 
 use crate::fsutil::write_at;
-use crate::http::probe::{apply_context, timed};
+use crate::http::probe::timed;
+use crate::http::redirect::send;
 use crate::http::worker::{
     SegmentShared, WorkerCtx, WorkerExit, backoff, compressed, is_url_rejected,
 };
@@ -67,11 +68,13 @@ fn restart(seg: &SegmentShared) {
 }
 
 async fn attempt_once(ctx: &WorkerCtx, seg: &SegmentShared, meter: &mut SpeedMeter) -> Attempt {
-    let rb = apply_context(ctx.client.get(ctx.url.clone()), &ctx.context);
+    let request = send(&ctx.url, &ctx.origin, &ctx.context, |u, _| {
+        ctx.client.get(u.clone())
+    });
     let read_timeout = Duration::from_millis(ctx.cfg.read_timeout_ms);
     let resp = tokio::select! {
         _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-        r = timed(read_timeout, rb.send()) => match r {
+        r = timed(read_timeout, request) => match r {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Attempt::Retry(e.to_string()),
             Err(e) => return Attempt::Retry(e.to_string()),

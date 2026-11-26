@@ -3,7 +3,8 @@
 
 use crate::config::HttpConfig;
 use crate::engine::EngineError;
-use crate::http::probe::{apply_context, timed};
+use crate::http::probe::timed;
+use crate::http::redirect::send;
 use crate::http::resume::HttpResumeState;
 use crate::http::worker::{compressed, parse_content_range};
 use crate::types::RequestContext;
@@ -31,8 +32,8 @@ pub enum Validation {
 /// `Changed`; so is exceeding `cfg.validate_timeout_ms`.
 ///
 /// `ctx` is the context of requests to `origin` (the source, or a mirror's URL); the
-/// requests go to `state.final_url`, possibly another origin (see
-/// [`RequestContext::for_target`]).
+/// requests go to `state.final_url`, possibly another origin, and get it scoped to each
+/// hop (see [`crate::http::redirect::send`]).
 pub async fn validate_remote(
     client: &reqwest::Client,
     ctx: &RequestContext,
@@ -42,10 +43,10 @@ pub async fn validate_remote(
     cfg: &HttpConfig,
 ) -> Result<Validation, EngineError> {
     let limit = Duration::from_millis(cfg.validate_timeout_ms);
-    let ctx = &ctx.for_target(origin, &state.final_url);
     let net = Net {
         client,
         ctx,
+        origin,
         url: &state.final_url,
         read_timeout: Duration::from_millis(cfg.read_timeout_ms),
     };
@@ -56,11 +57,13 @@ pub async fn validate_remote(
 
 /// Compares `[start, end)` of `part` with the same bytes at `url` (no `If-Range`), and
 /// the total its `Content-Range` reports with `total`: how a location without validators
-/// is checked before it serves a range. `ctx` is already the context for `url`.
+/// is checked before it serves a range. `ctx` is the context given for `origin` (the
+/// location's URL; `url` is where it led), scoped to each hop.
 #[allow(clippy::too_many_arguments)]
 pub async fn spot_check(
     client: &reqwest::Client,
     ctx: &RequestContext,
+    origin: &url::Url,
     url: &url::Url,
     total: u64,
     start: u64,
@@ -71,6 +74,7 @@ pub async fn spot_check(
     let net = Net {
         client,
         ctx,
+        origin,
         url,
         read_timeout: Duration::from_millis(cfg.read_timeout_ms),
     };
@@ -100,7 +104,9 @@ pub async fn spot_check(
 /// Where and how validation requests are sent.
 struct Net<'a> {
     client: &'a reqwest::Client,
+    /// The context given for `origin`.
     ctx: &'a RequestContext,
+    origin: &'a url::Url,
     url: &'a url::Url,
     read_timeout: Duration,
 }
@@ -191,16 +197,17 @@ async fn fetch(
     end: u64,
 ) -> Result<Fetched, EngineError> {
     let read_timeout = net.read_timeout;
-    let mut rb = net
-        .client
-        .get(net.url.clone())
-        .header(header::RANGE, format!("bytes={}-{}", start, end - 1));
-    if let Some(v) = if_range {
-        rb = rb.header(header::IF_RANGE, v);
-    }
-    let resp = timed(read_timeout, apply_context(rb, net.ctx).send())
-        .await?
-        .map_err(|e| EngineError::Network(e.to_string()))?;
+    let request = send(net.url, net.origin, net.ctx, |u, _| {
+        let rb = net
+            .client
+            .get(u.clone())
+            .header(header::RANGE, format!("bytes={}-{}", start, end - 1));
+        match if_range {
+            Some(v) => rb.header(header::IF_RANGE, v),
+            None => rb,
+        }
+    });
+    let resp = timed(read_timeout, request).await??;
     if let Some(why) = compressed(resp.headers()) {
         return Err(EngineError::Invalid(why));
     }

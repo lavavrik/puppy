@@ -873,6 +873,8 @@ fn secret_context() -> RequestContext {
             ("authorization".into(), "Bearer hdr-secret".into()),
             ("Proxy-Authorization".into(), "Basic proxy-secret".into()),
             ("COOKIE".into(), "hdr=cookie".into()),
+            ("Accept".into(), "application/octet-stream".into()),
+            ("accept-language".into(), "uk".into()),
         ],
         referer: Some("https://example.com/page".into()),
         user_agent: Some("TestAgent/1".into()),
@@ -881,8 +883,9 @@ fn secret_context() -> RequestContext {
 }
 
 /// A redirect to another origin (host and port) must not carry the original host's
-/// cookies or credentials to the target: not on the probe, not on segment requests, not
-/// on the validation after a restart.
+/// context to the target: not on the probe, not on segment requests, not on the
+/// validation after a restart. Only `Accept`, `Accept-Language` and the user agent go
+/// there (`http_redirect.rs` checks the rest of the rule).
 #[tokio::test]
 async fn cross_origin_redirect_target_gets_no_credentials() {
     let target = server(|_| {}).await;
@@ -909,25 +912,22 @@ async fn cross_origin_redirect_target_gets_no_credentials() {
     assert!(seen.len() > before_restore, "no request after the restore");
     assert!(seen.len() >= 3, "{} requests", seen.len());
     for h in &seen {
-        assert!(h.get("cookie").is_none(), "cookie leaked: {h:?}");
-        assert!(h.get("authorization").is_none(), "auth leaked: {h:?}");
-        assert!(h.get("proxy-authorization").is_none(), "proxy auth leaked");
+        for name in ["cookie", "authorization", "proxy-authorization", "x-token"] {
+            assert!(h.get(name).is_none(), "{name} leaked: {h:?}");
+        }
         assert_eq!(h.get("user-agent").unwrap(), "TestAgent/1");
-        assert_eq!(h.get("x-token").unwrap(), "tok");
+        assert_eq!(h.get("accept").unwrap(), "application/octet-stream");
+        assert_eq!(h.get("accept-language").unwrap(), "uk");
+        // The user's referer is an HTTPS page's: never sent to a plain-HTTP origin, and
+        // neither is the redirecting URL (whose query may hold a signed token).
+        assert!(h.get("referer").is_none(), "referer: {h:?}");
     }
-    // Every request to the target carries the user's referer, never the redirecting URL
-    // (whose query may hold a signed token), including the redirect hop itself.
-    for h in &seen {
-        assert_eq!(
-            h.get("referer").and_then(|v| v.to_str().ok()),
-            Some("https://example.com/page"),
-            "referer: {h:?}"
-        );
-    }
-    // The original host did get them.
+    // The original host did get everything.
     let first = &origin.requests_seen()[0];
     assert!(first.get("cookie").is_some());
     assert!(first.get("authorization").is_some());
+    assert_eq!(first.get("x-token").unwrap(), "tok");
+    assert_eq!(first.get("referer").unwrap(), "https://example.com/page");
 }
 
 #[tokio::test]
@@ -938,11 +938,7 @@ async fn same_origin_redirect_keeps_credentials() {
     req.source = Source::Http {
         url: s.url("/redirect"),
     };
-    req.context = RequestContext {
-        cookies: Some("session=topsecret".into()),
-        basic_auth: Some(("user".into(), Some("hunter2".into()))),
-        ..RequestContext::default()
-    };
+    req.context = secret_context();
     let (dl, added) = start(req.clone(), cfg(dir.path())).await;
     wait_status(&dl, |s| s.done_bytes >= MIB, TIMEOUT).await;
     dl.pause().await;
@@ -960,7 +956,11 @@ async fn same_origin_redirect_keeps_credentials() {
         .collect();
     assert!(to_file.len() >= 3);
     for (_, h) in to_file {
-        assert_eq!(h.get("cookie").unwrap(), "session=topsecret");
+        let cookies: Vec<_> = h.get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["hdr=cookie", "session=topsecret"]);
         assert!(h.get("authorization").is_some());
+        assert!(h.get("proxy-authorization").is_some());
+        assert_eq!(h.get("x-token").unwrap(), "tok");
+        assert_eq!(h.get("referer").unwrap(), "https://example.com/page");
     }
 }

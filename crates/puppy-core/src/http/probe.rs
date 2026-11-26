@@ -3,6 +3,7 @@
 use crate::config::HttpConfig;
 use crate::engine::EngineError;
 use crate::fsutil::sanitize_filename;
+use crate::http::redirect::send;
 use crate::types::RequestContext;
 use percent_encoding::percent_decode_str;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -20,13 +21,15 @@ pub struct RemoteInfo {
     pub filename: String,
 }
 
+/// The client for requests that carry a download's context. It does not follow
+/// redirects: [`crate::http::redirect::send`] does, scoping the context to each hop.
 pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
-    build_client_with(cfg, reqwest::redirect::Policy::limited(10))
+    build_client_with(cfg, reqwest::redirect::Policy::none())
 }
 
-/// [`build_client`] with another redirect policy (a metalink fetch follows redirects
-/// itself, to decide what each hop gets).
-pub(crate) fn build_client_with(
+/// [`build_client`] with another redirect policy, for requests without any user context
+/// (the self-update's, say), which reqwest may follow itself.
+pub fn build_client_with(
     cfg: &HttpConfig,
     redirect: reqwest::redirect::Policy,
 ) -> Result<Client, EngineError> {
@@ -41,9 +44,9 @@ pub(crate) fn build_client_with(
         // multi-connection downloads (per-connection throttling is what they work around).
         .http1_only()
         .redirect(redirect)
-        // On a redirect reqwest would replace the caller's Referer with the full previous
-        // URL, query included (a signed token, say), and send it to the next host. Keep
-        // the caller's own Referer header instead (browsers send at most the origin).
+        // Where reqwest follows redirects, it would replace the caller's Referer with the
+        // full previous URL, query included (a signed token, say), and send it to the
+        // next host. Never: the Referer is the caller's (see `RequestContext::for_target`).
         .referer(false)
         // No client-level read timeout: its deadline keeps running while a caller is not
         // polling the body (e.g. waiting on a rate limiter) and then fires spuriously.
@@ -83,7 +86,9 @@ pub(crate) async fn timed<F: std::future::Future>(
         .map_err(|_| EngineError::Network("timed out waiting for the server".into()))
 }
 
-/// Applies per-download request context. Invalid header names/values are skipped.
+/// Applies per-download request context. Invalid header names/values are skipped. It is
+/// for one request only: one that may be redirected goes through
+/// [`crate::http::redirect::send`], which scopes the context to each hop.
 pub fn apply_context(mut rb: RequestBuilder, ctx: &RequestContext) -> RequestBuilder {
     for (name, value) in &ctx.headers {
         if let (Ok(n), Ok(v)) = (
@@ -106,10 +111,6 @@ pub fn apply_context(mut rb: RequestBuilder, ctx: &RequestContext) -> RequestBui
         rb = rb.basic_auth(user, pass.as_deref());
     }
     rb
-}
-
-fn net_err(e: reqwest::Error) -> EngineError {
-    EngineError::Network(e.to_string())
 }
 
 fn header_str(h: &HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -150,7 +151,9 @@ fn collect(resp: &Response) -> Partial {
     }
 }
 
-/// Probes `url`; `read_timeout` bounds each wait for response headers.
+/// Probes `url` with `ctx` (given for `url`; redirect hops get it scoped, see
+/// [`crate::http::redirect`]); `read_timeout` bounds each wait for response headers
+/// (redirects included).
 pub async fn probe(
     client: &Client,
     url: &url::Url,
@@ -159,7 +162,7 @@ pub async fn probe(
 ) -> Result<RemoteInfo, EngineError> {
     let head = timed(
         read_timeout,
-        apply_context(client.head(url.clone()), ctx).send(),
+        send(url, url, ctx, |u, _| client.head(u.clone())),
     )
     .await;
     let mut final_url = url.clone();
@@ -219,11 +222,10 @@ async fn range_probe(
     ctx: &RequestContext,
     read_timeout: Duration,
 ) -> Result<(url::Url, Partial), EngineError> {
-    let rb = apply_context(
-        client.get(url.clone()).header(header::RANGE, "bytes=0-0"),
-        ctx,
-    );
-    let resp = timed(read_timeout, rb.send()).await?.map_err(net_err)?;
+    let request = send(url, url, ctx, |u, _| {
+        client.get(u.clone()).header(header::RANGE, "bytes=0-0")
+    });
+    let resp = timed(read_timeout, request).await??;
     let status = resp.status();
     if !status.is_success() {
         return Err(EngineError::Http {

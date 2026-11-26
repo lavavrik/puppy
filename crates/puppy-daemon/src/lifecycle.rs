@@ -201,7 +201,12 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
         cfg.shutdown_pause_timeout = cfg.shutdown_pause_timeout.saturating_sub(NOTIFY_FLUSH);
     }
     let update_setup = match opts.update {
-        Some(u) => match puppy_core::http::probe::build_client(&cfg.http_config()) {
+        // The update requests carry no user context, and the release assets redirect to
+        // a CDN: reqwest may follow redirects itself.
+        Some(u) => match puppy_core::http::probe::build_client_with(
+            &cfg.http_config(),
+            reqwest::redirect::Policy::limited(10),
+        ) {
             Ok(client) => Some((u, cfg.update.clone(), client)),
             Err(e) => {
                 warn!("cannot create the update client, updates are off: {e}");

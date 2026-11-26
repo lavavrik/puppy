@@ -247,6 +247,7 @@ async fn pre_check(ctx: &WorkerCtx, c: &PreCheck) -> Option<WorkerExit> {
                 spot_check(
                     &ctx.client,
                     &ctx.context,
+                    &ctx.origin,
                     &ctx.url,
                     c.total,
                     start,
@@ -498,7 +499,8 @@ impl Inner {
         let url = m.v.final_url.clone();
         WorkerCtx {
             client: self.client.clone(),
-            context: m.context_for(&url),
+            context: m.context.clone(),
+            origin: m.url.clone(),
             url,
             if_range: m.v.if_range(),
             expected_total: self.remote.total,

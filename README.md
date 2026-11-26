@@ -283,10 +283,23 @@ JSON value (`watch` excepted):
   `puppy --json watch | jq` works; without `--json` it prints lines like
   `14:02:11 completed 3 a.iso` and leaves out snapshots.
 
-`-H` and `--cookie` are sent to the URL you give and to redirect targets on
-the same origin (scheme, host and port). A redirect to another origin gets no
-cookies and no `Cookie`, `Authorization` or `Proxy-Authorization` header; the
-referer, user agent and other headers still go along.
+`-H`, `--cookie` and `--referer` are sent to the URL you give and to redirect
+targets on the same origin (scheme, host and port). A redirect to another origin
+gets what a browser would send there:
+
+- of the `-H` headers, only `Accept`, `Accept-Language` and `User-Agent`; any
+  other (an API key, say) is not sent;
+- no cookies, no basic-auth credentials, and no `Cookie`, `Authorization` or
+  `Proxy-Authorization` header;
+- the referer cut down to its origin (`https://example.com/`), or none when the
+  redirect leads from HTTPS (the URL you gave, or the referer) to plain HTTP;
+- the user agent.
+
+This is judged against the URL you gave on every hop, not the previous one: a
+redirect back to its origin gets everything again. The same goes for segment
+requests, resume checks and the re-resolution of an expired redirect. It is
+stricter than curl, which keeps custom headers on another host: a header that
+a CDN needs after a redirect must be given with the final URL instead.
 
 `ls --state` takes `queued`, `starting`, `active`, `verifying`, `paused`, `completed`
 (completed only, not seeding), `done` (finished downloading: completed or
@@ -1038,9 +1051,12 @@ so no network port is opened. Firefox is not supported yet.
 - POST-backed (form) downloads can't be detected, and may fail in puppy. Use
   the bypass (toolbar button or Alt+Shift+B) for them.
 - Cookies are read for the original URL only. If that URL redirects to another
-  origin (a different scheme, host or port), the target gets none of them, and
-  no basic-auth credentials or `Cookie`/`Authorization` headers either. A
-  download whose redirect target needs a login fails in puppy. The extension
+  origin (a different scheme, host or port), the target gets what a browser
+  would send it: no cookies, credentials or page headers other than `Accept`,
+  `Accept-Language` and `User-Agent`, and the page's referer cut down to its
+  origin (none from HTTPS to plain HTTP). See
+  [Command line](#command-line) for the whole rule. A download whose redirect
+  target needs a login or a header of its own fails in puppy. The extension
   never adds mirrors; a mirror added otherwise gets none of a download's
   cookies unless it is on the same origin.
 - A metalink the browser hands over is downloaded as a file, not read: add

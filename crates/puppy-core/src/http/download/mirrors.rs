@@ -140,11 +140,6 @@ impl MirrorRt {
         }
     }
 
-    /// The context for a request to `target` (its final URL, possibly another origin).
-    pub fn context_for(&self, target: &url::Url) -> RequestContext {
-        self.context.for_target(&self.url, target)
-    }
-
     pub fn is_dropped(&self) -> bool {
         matches!(self.health, Health::Dropped { .. })
     }

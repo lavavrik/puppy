@@ -2,7 +2,8 @@
 
 use crate::config::HttpConfig;
 use crate::fsutil::write_at;
-use crate::http::probe::{apply_context, timed};
+use crate::http::probe::timed;
+use crate::http::redirect::send;
 use crate::limiter::TokenBucket;
 use crate::meter::SpeedMeter;
 use crate::types::RequestContext;
@@ -80,7 +81,12 @@ impl SegmentShared {
 #[derive(Clone)]
 pub struct WorkerCtx {
     pub client: reqwest::Client,
+    /// Where segment requests go: the location's final URL (after the probe's redirects).
     pub url: url::Url,
+    /// The location's URL as given, which `context` was given for: each request (and
+    /// each of its redirect hops) gets `context` scoped to its URL against this one (see
+    /// [`crate::http::redirect::send`]).
+    pub origin: url::Url,
     pub context: RequestContext,
     /// Strong ETag or Last-Modified, sent as `If-Range`.
     pub if_range: Option<String>,
@@ -269,19 +275,21 @@ async fn attempt_once(
     if cursor >= end {
         return Attempt::Exit(WorkerExit::Done);
     }
-    let mut rb = ctx
-        .client
-        .get(ctx.url.clone())
-        .header(header::RANGE, format!("bytes={}-{}", cursor, end - 1));
-    if let Some(v) = &ctx.if_range {
-        rb = rb.header(header::IF_RANGE, v);
-    }
-    let rb = apply_context(rb, &ctx.context);
+    let request = send(&ctx.url, &ctx.origin, &ctx.context, |u, _| {
+        let rb = ctx
+            .client
+            .get(u.clone())
+            .header(header::RANGE, format!("bytes={}-{}", cursor, end - 1));
+        match &ctx.if_range {
+            Some(v) => rb.header(header::IF_RANGE, v),
+            None => rb,
+        }
+    });
 
     let read_timeout = Duration::from_millis(ctx.cfg.read_timeout_ms);
     let resp = tokio::select! {
         _ = ctx.cancel.cancelled() => return Attempt::Exit(WorkerExit::Cancelled),
-        r = timed(read_timeout, rb.send()) => match r {
+        r = timed(read_timeout, request) => match r {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Attempt::Retry { progress: false, why: e.to_string() },
             Err(e) => return Attempt::Retry { progress: false, why: e.to_string() },

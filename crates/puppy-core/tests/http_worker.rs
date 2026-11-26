@@ -29,6 +29,7 @@ fn make_ctx(s: &TestServer, file: std::fs::File, if_range: Option<&str>) -> Work
     WorkerCtx {
         client: build_client(&cfg).unwrap(),
         url: s.url("/file.bin"),
+        origin: s.url("/file.bin"),
         context: RequestContext::default(),
         if_range: if_range.map(str::to_string),
         expected_total: Some(LEN),

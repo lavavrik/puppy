@@ -1,23 +1,22 @@
 //! Fetching a metalink document over HTTP(S), bounded in size and time.
 //!
-//! Redirects are followed here, not by the HTTP client, so that each hop gets only what
-//! it may: the user's headers, cookies, referer and credentials go to the origin of the
+//! Redirects are followed by [`crate::http::redirect`], as for downloads, but scoped more
+//! strictly: the user's headers, cookies, referer and credentials go to the origin of the
 //! URL the user gave, and a hop on any other origin gets the user agent alone (as a
-//! download's mirror on another origin does). A redirect from HTTPS to plain HTTP is
-//! refused: the document supplies the hashes the downloads are checked against.
+//! download's mirror on another origin does), since the document it serves decides where
+//! the downloads go. A redirect from HTTPS to plain HTTP is refused: the document
+//! supplies the hashes the downloads are checked against.
 
 use super::{ACCEPT, MAX_DOCUMENT_BYTES, MetalinkError};
 use crate::config::HttpConfig;
-use crate::http::probe::{apply_context, build_client_with};
+use crate::http::probe::build_client;
+use crate::http::redirect::{RedirectError, follow};
 use crate::types::{RequestContext, masked_url};
 use reqwest::header;
 use std::time::Duration;
 
 /// The whole fetch (connecting, redirects, the body) must finish within this.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// At most this many redirects are followed.
-const MAX_REDIRECTS: usize = 10;
 
 /// A fetched document.
 #[derive(Debug, Clone)]
@@ -73,47 +72,31 @@ async fn fetch_inner(
     url: &url::Url,
     context: &RequestContext,
 ) -> Result<Fetched, String> {
-    let client =
-        build_client_with(cfg, reqwest::redirect::Policy::none()).map_err(|e| e.to_string())?;
-    let mut current = url.clone();
-    let mut redirects = 0;
-    let mut resp = loop {
+    let client = build_client(cfg).map_err(|e| e.to_string())?;
+    let mut resp = follow(
+        url,
+        |hop, ctx| {
+            let rb = client.get(hop.clone());
+            // The user's own Accept (on the given origin) replaces ours.
+            if ctx
+                .headers
+                .iter()
+                .any(|(n, _)| n.trim().eq_ignore_ascii_case("accept"))
+            {
+                rb
+            } else {
+                rb.header(header::ACCEPT, ACCEPT)
+            }
+        },
         // Everything on the given URL's origin; the user agent alone elsewhere.
-        let ctx = context.for_mirror(url, &current);
-        let mut rb = client.get(current.clone());
-        if !ctx
-            .headers
-            .iter()
-            .any(|(n, _)| n.trim().eq_ignore_ascii_case("accept"))
-        {
-            rb = rb.header(header::ACCEPT, ACCEPT);
-        }
-        let resp = apply_context(rb, &ctx)
-            .send()
-            .await
-            .map_err(|e| format!("cannot fetch the metalink: {e}"))?;
-        if !resp.status().is_redirection() {
-            break resp;
-        }
-        let Some(location) = resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-        else {
-            break resp;
-        };
-        let next = current
-            .join(location.trim())
-            .map_err(|e| format!("cannot fetch the metalink: bad redirect ({e})"))?;
-        check_redirect(url, &current, &next)?;
-        redirects += 1;
-        if redirects > MAX_REDIRECTS {
-            return Err(format!(
-                "cannot fetch the metalink: more than {MAX_REDIRECTS} redirects"
-            ));
-        }
-        current = next;
-    };
+        |hop| context.for_mirror(url, hop),
+        |current, next| check_redirect(url, current, next),
+    )
+    .await
+    .map_err(|e| match e {
+        RedirectError::Refused(why) => why,
+        e => format!("cannot fetch the metalink: {e}"),
+    })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!(

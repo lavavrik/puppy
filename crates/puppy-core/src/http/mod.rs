@@ -3,6 +3,7 @@
 pub mod download;
 pub mod engine;
 pub mod probe;
+pub mod redirect;
 pub mod resume;
 pub mod segments;
 pub mod single;
