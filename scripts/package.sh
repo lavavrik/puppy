@@ -6,7 +6,8 @@
 #
 # Expects `cargo build --profile <profile> --target <target> -p puppy` to have run
 # (profile defaults to dist). Honours CARGO_TARGET_DIR. Runs on Linux, macOS and
-# the Git Bash shell of GitHub's Windows runners.
+# the Git Bash shell of GitHub's Windows runners. A *-linux-musl binary must be
+# statically linked (checked with `file`).
 set -euo pipefail
 
 target=${1:?usage: scripts/package.sh <target> [profile]}
@@ -22,6 +23,17 @@ exe=puppy
 case $target in *windows*) exe=puppy.exe ;; esac
 bin=${CARGO_TARGET_DIR:-target}/$target/$profile/$exe
 [[ -f $bin ]] || { echo "error: $bin not found; build it first" >&2; exit 1; }
+# The musl archives are for systems without a usable glibc: refuse a binary that
+# still loads shared libraries.
+case $target in
+  *-linux-musl*)
+    if ! file "$bin" | grep -q 'static'; then
+      echo "error: $bin is not statically linked:" >&2
+      file "$bin" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 name=puppy-$version-$target
 stage=$(mktemp -d)

@@ -67,6 +67,10 @@ jobs:
           # glibc 2.35 and newer (Ubuntu 22.04, Debian 12, ...).
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          # Static builds for older glibc, Alpine and minimal containers. Built
+          # natively; musl-gcc (musl-tools) compiles aws-lc-sys's C code.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm }
           - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
@@ -79,6 +83,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: dist-${{ matrix.target }}
+      - name: Install the musl C toolchain
+        if: contains(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "TARGET_CC=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         env:
           PUPPY_RELEASE_BUILD: "1"
