@@ -51,6 +51,34 @@ async fn no_asset_for_target_is_none() {
     assert!(lookup(&unsummed, "0.1.0").await.unwrap().is_none());
 }
 
+/// Linux releases carry a glibc (`-gnu`) and a static (`-musl`) archive per CPU. Each
+/// install keeps to its own: the archive is picked by the exact target triple.
+#[tokio::test]
+async fn gnu_and_musl_installs_each_pick_their_own_archive() {
+    let targets = [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+    ];
+    let mut release = FakeRelease::new("0.2.0", targets[0]);
+    for t in &targets[1..] {
+        release = release.also_for(t);
+    }
+    let fake = FakeGitHub::start(release).await;
+    for target in targets {
+        let r = latest(&client(), &fake.api_base(), &v("0.1.0"), target)
+            .await
+            .unwrap()
+            .expect("a release");
+        assert_eq!(r.archive.name, format!("puppy-0.2.0-{target}.tar.gz"));
+        assert_eq!(r.checksum.name, format!("{}.sha256", r.archive.name));
+        let work = tempfile::tempdir().unwrap();
+        let bin = fetch(&client(), &r, work.path()).await.unwrap();
+        assert_eq!(bin, work.path().join(BIN), "{target}");
+    }
+}
+
 #[tokio::test]
 async fn api_error_is_failed() {
     let fake = FakeGitHub::start(FakeRelease::new("0.2.0", TARGET)).await;

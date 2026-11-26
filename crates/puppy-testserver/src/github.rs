@@ -21,6 +21,8 @@ pub struct FakeRelease {
     prints: Option<String>,
     script: Option<String>,
     no_binary: bool,
+    /// More targets published in the same release, each with its own archive.
+    also: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,7 +43,15 @@ impl FakeRelease {
             prints: None,
             script: None,
             no_binary: false,
+            also: Vec::new(),
         }
+    }
+
+    /// Also publishes an archive (and checksum) for `target`, built the same way, as
+    /// real releases carry one per platform.
+    pub fn also_for(mut self, target: &str) -> Self {
+        self.also.push(target.to_string());
+        self
     }
 
     /// The archive holds everything but the `puppy` binary.
@@ -185,24 +195,31 @@ impl FakeGitHub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
 
-        let name = release.archive_name();
-        let archive = release.archive();
         let mut assets = HashMap::new();
-        let mut listed = vec![name.clone()];
-        match release.checksum {
-            Checksum::Missing => {}
-            c => {
-                let hex = if c == Checksum::Good {
-                    hex(&Sha256::digest(&archive))
-                } else {
-                    "0".repeat(64)
-                };
-                let sum_name = format!("{name}.sha256");
-                assets.insert(sum_name.clone(), format!("{hex}  {name}\n").into_bytes());
-                listed.push(sum_name);
+        let mut listed = Vec::new();
+        let others = release.also.iter().map(|target| FakeRelease {
+            target: target.clone(),
+            ..release.clone()
+        });
+        for r in std::iter::once(release.clone()).chain(others) {
+            let name = r.archive_name();
+            let archive = r.archive();
+            listed.push(name.clone());
+            match r.checksum {
+                Checksum::Missing => {}
+                c => {
+                    let hex = if c == Checksum::Good {
+                        hex(&Sha256::digest(&archive))
+                    } else {
+                        "0".repeat(64)
+                    };
+                    let sum_name = format!("{name}.sha256");
+                    assets.insert(sum_name.clone(), format!("{hex}  {name}\n").into_bytes());
+                    listed.push(sum_name);
+                }
             }
+            assets.insert(name, archive);
         }
-        assets.insert(name, archive);
         let json = serde_json::json!({
             "tag_name": format!("v{}", release.version),
             "assets": listed.iter().map(|n| serde_json::json!({
