@@ -2,6 +2,7 @@
 
 pub mod ftp;
 pub mod github;
+pub mod sftp;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
