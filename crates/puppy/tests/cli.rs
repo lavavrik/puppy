@@ -36,6 +36,91 @@ fn help_and_version_exit_0() {
     }
 }
 
+/// Every shell's script generates without a daemon, offers the subcommands (nested
+/// ones too) and leaves out the hidden ones.
+#[test]
+fn completions_for_every_shell() {
+    let env = Env::new();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let (status, out, err) = env.run(&["completions", shell]);
+        assert_eq!(status.code(), Some(0), "{shell}: {err}");
+        assert!(err.is_empty(), "{shell}: {err}");
+        for word in [
+            "add",
+            "max-active",
+            "completions",
+            "browser",
+            "uninstall",
+            "output-dir",
+        ] {
+            assert!(out.contains(word), "{shell}: no {word:?} in the script");
+        }
+        assert!(
+            !out.contains("native-host"),
+            "{shell}: offers a hidden command"
+        );
+        assert!(
+            !out.contains("one page per command"),
+            "{shell}: offers `man`"
+        );
+    }
+    assert_eq!(env.daemon_pid(), None, "completions started a daemon");
+}
+
+#[test]
+fn completions_unknown_shell_exit_2() {
+    let env = Env::new();
+    let (status, out, err) = env.run(&["completions", "tcsh"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("bash"), "lists the shells: {err}");
+}
+
+/// `puppy man` prints puppy.1 as roff, listing the visible subcommands.
+#[test]
+fn man_page_renders() {
+    let env = Env::new();
+    let (status, out, err) = env.run(&["man"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains(".TH puppy 1"), "{out}");
+    assert!(out.contains(".SH SUBCOMMANDS"), "{out}");
+    assert!(out.contains(r"puppy\-add(1)"), "{out}");
+    assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
+    assert!(!out.contains("native"), "{out}");
+    // Hidden: not in --help either.
+    let (_, help, _) = env.run(&["--help"]);
+    assert!(help.contains("completions"), "{help}");
+    assert!(!help.contains("\n  man "), "{help}");
+}
+
+/// `puppy man --dir` writes one page per visible command, nested ones included.
+#[test]
+fn man_dir_writes_a_page_per_command() {
+    let env = Env::new();
+    let dir = env.home.path().join("man/man1");
+    let (status, out, err) = env.run(&["man", "--dir", dir.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.is_empty(), "{out}");
+    for page in [
+        "puppy.1",
+        "puppy-add.1",
+        "puppy-completions.1",
+        "puppy-browser-install.1",
+    ] {
+        let text =
+            std::fs::read_to_string(dir.join(page)).unwrap_or_else(|e| panic!("{page}: {e}"));
+        assert!(
+            text.starts_with(".ie") || text.contains(".TH"),
+            "{page}: {text}"
+        );
+    }
+    let add = std::fs::read_to_string(dir.join("puppy-add.1")).unwrap();
+    assert!(add.contains(r"\-\-output\-dir"), "{add}");
+    for hidden in ["puppy-man.1", "puppy-native-host.1", "puppy-help.1"] {
+        assert!(!dir.join(hidden).exists(), "{hidden} was written");
+    }
+}
+
 /// `puppy ls | head -1`: the reader is gone before `puppy` writes; the command still
 /// finishes and exits 0 without noise.
 #[cfg(unix)]

@@ -100,14 +100,22 @@ Download the archive for your platform from the
 |-----------------------|--------------------------------------------|
 | Linux x86_64          | `puppy-<version>-x86_64-unknown-linux-gnu.tar.gz`  |
 | Linux ARM64           | `puppy-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64, static  | `puppy-<version>-x86_64-unknown-linux-musl.tar.gz`  |
+| Linux ARM64, static   | `puppy-<version>-aarch64-unknown-linux-musl.tar.gz` |
 | macOS Apple silicon   | `puppy-<version>-aarch64-apple-darwin.tar.gz`      |
 | macOS Intel           | `puppy-<version>-x86_64-apple-darwin.tar.gz`       |
 | Windows x86_64        | `puppy-<version>-x86_64-pc-windows-msvc.zip`       |
 | Windows ARM64         | `puppy-<version>-aarch64-pc-windows-msvc.zip`      |
 
 Each archive holds the `puppy` binary, the browser extension (`extension/`),
-the service files (`packaging/`), this README and the licenses. The Linux
-builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
+the service files (`packaging/`), shell completions (`completions/`), man
+pages (`man/man1/`), this README and the licenses. The Linux
+`-gnu` builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and
+later). The `-musl` builds are statically linked and run on any Linux with that
+CPU, including older distributions, Alpine and minimal containers. They look up
+host names in `/etc/hosts` and the DNS servers in `/etc/resolv.conf` only, so
+names that only `/etc/nsswitch.conf` modules resolve (mDNS `.local` names,
+LDAP) are not found; use the `-gnu` build where you need those.
 HTTPS and FTPS trust the system's CA certificates; on a system without any (a minimal
 container without `ca-certificates`), the daemon falls back to Mozilla's root
 list built into puppy and says so in its log.
@@ -138,6 +146,20 @@ its SHA-256 and install `puppy`:
 Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux and macOS, if
 `puppy` is not found afterwards, add `~/.local/bin` to your `PATH`.
 
+On Linux and macOS, `install.sh` also installs the shell completions, for
+each of bash, zsh and fish found on the machine, and the man pages, all into
+per-user folders under your home directory (see
+[Shell completions and man pages](#shell-completions-and-man-pages)). zsh
+needs one line in `~/.zshrc`; the script prints it.
+
+On Linux, install.sh installs the `-gnu` build when the system has glibc 2.35 or
+newer, and the static `-musl` build otherwise (no glibc, or an older one). Set
+`PUPPY_LIBC=musl` or `PUPPY_LIBC=gnu` to choose:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lavavrik/puppy/main/scripts/install.sh | PUPPY_LIBC=musl sh
+```
+
 **By hand:** download the archive from the release page, check it with
 `shasum -a 256 -c <archive>.sha256`, unpack it and put `puppy` (`puppy.exe`)
 anywhere on your `PATH`. The macOS and Windows binaries are not signed, so
@@ -159,6 +181,9 @@ and downloads are kept, and a notification says "puppy updated to <version>".
   `puppy update`), `auto_install = false` only notifies (see Configuration).
 - Development builds and `cargo install` builds do not update themselves; only
   the release binaries do.
+- An install updates to the same build it is: a `-gnu` binary to the next `-gnu`
+  archive, a static `-musl` binary to the next `-musl` one. To switch, run the
+  install command again with `PUPPY_LIBC` set.
 - A folder puppy cannot write to (such as an older macOS install in
   `/usr/local/bin`) only gets a notification: run the install command again.
 
@@ -175,6 +200,16 @@ The binary is `target/release/puppy`. To install it into `~/.cargo/bin`:
 ```sh
 cargo install --path crates/puppy
 ```
+
+A static Linux binary needs the musl target and a musl C compiler, `musl-gcc`
+(the `musl-tools` package on Debian and Ubuntu), for the TLS library's C code:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+TARGET_CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl -p puppy
+```
+
+The binary is `target/x86_64-unknown-linux-musl/release/puppy`.
 
 ## Run
 
@@ -256,6 +291,7 @@ puppy watch                                 # print events as they happen, until
 puppy update --check                        # is a newer puppy out? (no install)
 puppy update                                # install it; the daemon restarts into it
 puppy stop                                  # stop the daemon
+puppy completions zsh                       # print a shell completion script
 ```
 
 The text formats are for people and may change; scripts should use `--json`
@@ -880,6 +916,33 @@ entities and character references are expanded. A document is at most 4 MiB
 have been read), with at most 1000 files, 1000 URLs per file, nesting 32
 deep and 250000 elements. It must be UTF-8.
 
+### Shell completions and man pages
+
+`puppy completions <shell>` prints a completion script for `bash`, `zsh`,
+`fish`, `powershell` or `elvish` on stdout. It is generated from the same
+definitions as `puppy --help`, so it always matches the binary that prints
+it, and it does not start a daemon. The release archives carry the scripts in
+`completions/` and the man pages in `man/man1/`: `puppy.1`, and one page per
+command (`puppy-add.1`, `puppy-browser-install.1`, ...). `install.sh` puts
+them in the places below; to do it by hand, or after `cargo install`:
+
+| Shell      | Where the script goes                                       |
+|------------|-------------------------------------------------------------|
+| bash       | `puppy completions bash > ~/.local/share/bash-completion/completions/puppy` (needs the `bash-completion` package) |
+| zsh        | `puppy completions zsh > ~/.local/share/zsh/site-functions/_puppy`, with `fpath=(~/.local/share/zsh/site-functions $fpath)` before `compinit` in `~/.zshrc` |
+| fish       | `puppy completions fish > ~/.config/fish/completions/puppy.fish` |
+| PowerShell | `puppy completions powershell \| Out-String \| Invoke-Expression` in your `$PROFILE` |
+| elvish     | `eval (puppy completions elvish \| slurp)` in `~/.config/elvish/rc.elv` |
+
+New shells pick the script up; an open one needs `exec $SHELL` (or, in
+PowerShell, `. $PROFILE`).
+
+For the man pages, copy the archive's `man/man1/*.1` into
+`~/.local/share/man/man1/`. `man` searches that folder when `~/.local/bin` is
+on your `PATH`; otherwise add it to `MANPATH`. Then `man puppy` and
+`man puppy-add` work. `puppy man` prints `puppy.1` itself, and
+`puppy man --dir <DIR>` writes every page into `<DIR>`.
+
 ### Configuration
 
 Settings go in `config.toml` (where it lives: see below). Keys:
@@ -980,15 +1043,29 @@ Things to know about v1:
   from librqbit while the torrent is live or paused. When librqbit has none
   (while it checks the data, or after an error): a complete torrent shows
   its selected pieces as had; otherwise the last exact map seen is shown;
-  before there was one (after a restart, until the torrent goes live) the map
+  before there was one (after a restart, until the check is done) the map
   is synthesized from per-file progress, assuming each file fills in order.
+  After a fast resume the exact map is back within moments.
 - **Per-torrent speed limits** can only be set while the torrent is queued
   or waiting for its files to be chosen, before it starts (librqbit takes a torrent's limit only when it is added);
   later the dashboard says so and the limit is not kept. The global limits
   apply to torrents at any time.
-- **After a daemon restart** every unfinished torrent re-checks the data
-  already on disk before it goes on (there is no fast resume); its progress
-  shows 0 until the check is done, and a large library takes a while.
+- **After a daemon restart** a torrent goes on from the pieces it had when
+  the daemon stopped (fast resume). At a clean stop (`puppy stop`, or any
+  normal shutdown) the daemon flushes each torrent's files to disk and keeps
+  its piece map and the size and modification time of its files
+  (`torrents/<id>.resume`). It keeps none for a torrent whose file is shorter
+  than the pieces it had, or was modified after the torrent last wrote to it
+  (for example a seeding torrent's file edited by another program). On
+  restore, if the files are exactly as recorded, up to 64 of the recorded
+  pieces are read back and their hashes checked; the torrent then shows its
+  progress at once instead of re-checking all its data. Otherwise it checks
+  the data already on disk in full before it goes on, showing 0 until the
+  check is done (a large library takes a while): after the daemon was killed
+  or crashed, when there was no record, when a file was changed, moved,
+  truncated or deleted while the daemon was down, when a checked piece is
+  bad, or when the `.torrent` changed. A record is used once: after a
+  restart, only the next clean stop writes a new one.
 - **Deleting a torrent's files** (also once it has completed) deletes exactly
   the files the torrent lists, then its folders once empty; anything else in
   them stays. A torrent whose `.torrent` file is gone (shown as "torrent file
@@ -1110,13 +1187,15 @@ so no network port is opened. Firefox is not supported yet.
    The release workflow refuses to run without this file. Commit both.
 3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 4. The [Release workflow](.github/workflows/release.yml) runs the tests on
-   every platform, builds the six archives and **publishes** the release with
+   every platform, builds the eight archives and **publishes** the release with
    them, `SHA256SUMS` and the notes. Installs pick it up within a day. If any
    test or build fails, nothing is released: fix it and move the tag. A tag
    like `v0.2.0-rc.1` is published as a pre-release, which installs ignore.
 
 The archives are built by `cargo build --profile dist` and
-[`scripts/package.sh`](scripts/package.sh), which also run locally. The
+[`scripts/package.sh`](scripts/package.sh), which also run locally.
+`package.sh` generates the completions and man pages by running the built
+binary (or, when that binary is for another platform, a host build). The
 workflow can be started from the Actions tab to build the archives without
 making a release.
 

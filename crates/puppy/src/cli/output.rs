@@ -14,7 +14,7 @@ const GAP: usize = 2;
 const MIN_FLEX: usize = 12;
 
 /// Whether a write failed because the reader went away.
-fn is_closed_pipe(e: &std::io::Error) -> bool {
+pub(crate) fn is_closed_pipe(e: &std::io::Error) -> bool {
     // Windows: ERROR_NO_DATA (232) is "the pipe is being closed".
     e.kind() == ErrorKind::BrokenPipe || (cfg!(windows) && e.raw_os_error() == Some(232))
 }
