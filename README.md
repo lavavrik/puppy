@@ -87,6 +87,8 @@ Download the archive for your platform from the
 |-----------------------|--------------------------------------------|
 | Linux x86_64          | `puppy-<version>-x86_64-unknown-linux-gnu.tar.gz`  |
 | Linux ARM64           | `puppy-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64, static  | `puppy-<version>-x86_64-unknown-linux-musl.tar.gz`  |
+| Linux ARM64, static   | `puppy-<version>-aarch64-unknown-linux-musl.tar.gz` |
 | macOS Apple silicon   | `puppy-<version>-aarch64-apple-darwin.tar.gz`      |
 | macOS Intel           | `puppy-<version>-x86_64-apple-darwin.tar.gz`       |
 | Windows x86_64        | `puppy-<version>-x86_64-pc-windows-msvc.zip`       |
@@ -94,7 +96,12 @@ Download the archive for your platform from the
 
 Each archive holds the `puppy` binary, the browser extension (`extension/`),
 the service files (`packaging/`), this README and the licenses. The Linux
-builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
+`-gnu` builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and
+later). The `-musl` builds are statically linked and run on any Linux with that
+CPU, including older distributions, Alpine and minimal containers. They look up
+host names in `/etc/hosts` and the DNS servers in `/etc/resolv.conf` only, so
+names that only `/etc/nsswitch.conf` modules resolve (mDNS `.local` names,
+LDAP) are not found; use the `-gnu` build where you need those.
 HTTPS trusts the system's CA certificates; on a system without any (a minimal
 container without `ca-certificates`), the daemon falls back to Mozilla's root
 list built into puppy and says so in its log.
@@ -125,6 +132,14 @@ its SHA-256 and install `puppy`:
 Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux and macOS, if
 `puppy` is not found afterwards, add `~/.local/bin` to your `PATH`.
 
+On Linux, install.sh installs the `-gnu` build when the system has glibc 2.35 or
+newer, and the static `-musl` build otherwise (no glibc, or an older one). Set
+`PUPPY_LIBC=musl` or `PUPPY_LIBC=gnu` to choose:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lavavrik/puppy/main/scripts/install.sh | PUPPY_LIBC=musl sh
+```
+
 **By hand:** download the archive from the release page, check it with
 `shasum -a 256 -c <archive>.sha256`, unpack it and put `puppy` (`puppy.exe`)
 anywhere on your `PATH`. The macOS and Windows binaries are not signed, so
@@ -146,6 +161,9 @@ and downloads are kept, and a notification says "puppy updated to <version>".
   `puppy update`), `auto_install = false` only notifies (see Configuration).
 - Development builds and `cargo install` builds do not update themselves; only
   the release binaries do.
+- An install updates to the same build it is: a `-gnu` binary to the next `-gnu`
+  archive, a static `-musl` binary to the next `-musl` one. To switch, run the
+  install command again with `PUPPY_LIBC` set.
 - A folder puppy cannot write to (such as an older macOS install in
   `/usr/local/bin`) only gets a notification: run the install command again.
 
@@ -162,6 +180,16 @@ The binary is `target/release/puppy`. To install it into `~/.cargo/bin`:
 ```sh
 cargo install --path crates/puppy
 ```
+
+A static Linux binary needs the musl target and a musl C compiler, `musl-gcc`
+(the `musl-tools` package on Debian and Ubuntu), for the TLS library's C code:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+TARGET_CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl -p puppy
+```
+
+The binary is `target/x86_64-unknown-linux-musl/release/puppy`.
 
 ## Run
 
@@ -540,7 +568,7 @@ so no network port is opened. Firefox is not supported yet.
    The release workflow refuses to run without this file. Commit both.
 3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 4. The [Release workflow](.github/workflows/release.yml) runs the tests on
-   every platform, builds the six archives and **publishes** the release with
+   every platform, builds the eight archives and **publishes** the release with
    them, `SHA256SUMS` and the notes. Installs pick it up within a day. If any
    test or build fails, nothing is released: fix it and move the tag. A tag
    like `v0.2.0-rc.1` is published as a pre-release, which installs ignore.
