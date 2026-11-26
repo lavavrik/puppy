@@ -70,6 +70,13 @@ impl Manager {
         limit: Option<u64>,
     ) -> Result<DownloadId> {
         let inner = &self.inner;
+        if req.checksum.is_some() && !matches!(req.source, Source::Http { .. }) {
+            return Err(ManagerError::BadRequest(
+                "a checksum only applies to HTTP(S) downloads: BitTorrent verifies every \
+                 piece already"
+                    .into(),
+            ));
+        }
         let engine = inner
             .engines
             .iter()
@@ -151,7 +158,8 @@ impl Manager {
                     // An engine-held download is validating in `resume`: interrupt it.
                     (e.held.then_some(e.engine).flatten(), false)
                 }
-                DownloadState::Active => (e.engine, true),
+                // Hashing stops; resuming checks the file again from the start.
+                DownloadState::Active | DownloadState::Verifying => (e.engine, true),
                 DownloadState::Failed { .. } if e.retry.is_some() => {
                     e.retry = None;
                     e.state = DownloadState::Paused;
@@ -210,7 +218,7 @@ impl Manager {
                     }
                     None
                 }
-                DownloadState::Queued | DownloadState::Active => None,
+                DownloadState::Queued | DownloadState::Active | DownloadState::Verifying => None,
                 DownloadState::Paused
                 | DownloadState::Failed { .. }
                 | DownloadState::NeedsAttention { .. } => {

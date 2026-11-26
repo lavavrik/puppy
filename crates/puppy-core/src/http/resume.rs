@@ -149,6 +149,7 @@ mod tests {
                 context: RequestContext::default(),
                 files: Default::default(),
                 seed: None,
+                checksum: None,
             },
             context_hash: context_hash(&RequestContext::default()),
             final_url: url,
@@ -267,6 +268,7 @@ mod tests {
                 basic_auth: Some(("u".into(), Some("p".into()))),
                 ..RequestContext::default()
             },
+            checksum: None,
         };
         let s = without_context(&req);
         assert_eq!(s.context, RequestContext::default());

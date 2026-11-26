@@ -47,6 +47,7 @@ fn req(root: &Path, source: Source) -> AddRequest {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     }
 }
 

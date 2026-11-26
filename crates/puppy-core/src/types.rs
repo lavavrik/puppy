@@ -80,6 +80,10 @@ pub struct AddRequest {
     /// Seeding policy override for a torrent (`None`: the daemon's defaults).
     #[serde(default)]
     pub seed: Option<SeedPolicy>,
+    /// The digest the finished file must have (HTTP only): checked once it is complete
+    /// (state `Verifying`); a mismatch fails the download and keeps the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<crate::checksum::Checksum>,
 }
 
 /// Which files of a multi-file torrent to download.
@@ -149,6 +153,9 @@ pub enum DownloadState {
     Queued,
     Starting,
     Active,
+    /// The file is complete and being hashed against the request's checksum;
+    /// `done_bytes` counts the bytes hashed so far.
+    Verifying,
     Paused,
     Completed,
     Failed {

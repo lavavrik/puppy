@@ -167,6 +167,7 @@ impl Env {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         }
     }
 
@@ -671,6 +672,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;
@@ -697,6 +699,7 @@ async fn torrent_engine_failure_fails_torrents_transiently() {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         })
         .await;
     let deadline = Instant::now() + TIMEOUT;

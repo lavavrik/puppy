@@ -239,9 +239,13 @@ fn normalize_limit(bps: Option<u64>) -> Option<u64> {
     bps.filter(|&b| b > 0)
 }
 
-/// Occupies a slot (`ChoosingFiles` and `Seeding` never do).
+/// Occupies a slot (`ChoosingFiles` and `Seeding` never do; `Verifying` does: it is
+/// still on its way to completing).
 fn is_active(s: &DownloadState) -> bool {
-    matches!(s, DownloadState::Starting | DownloadState::Active)
+    matches!(
+        s,
+        DownloadState::Starting | DownloadState::Active | DownloadState::Verifying
+    )
 }
 
 fn is_seeding(s: &DownloadState) -> bool {
@@ -269,7 +273,11 @@ fn stored_state(s: &DownloadState) -> StoredState {
         DownloadState::Queued => StoredState::Queued,
         // A download being started is persisted as active: after a restart it is
         // restored (if it got a path) and queued at the front.
-        DownloadState::Starting | DownloadState::Active => StoredState::Active,
+        // Verifying too: after a restart the engine finds the finished file still
+        // unverified (its sidecar is kept until the check passes) and checks it again.
+        DownloadState::Starting | DownloadState::Active | DownloadState::Verifying => {
+            StoredState::Active
+        }
         DownloadState::Paused => StoredState::Paused,
         DownloadState::ChoosingFiles => StoredState::ChoosingFiles,
         DownloadState::Seeding { .. } => StoredState::Seeding,
@@ -398,7 +406,10 @@ impl Manager {
         self.inner.lock().entries.values().all(|e| {
             e.retry.is_none()
                 && !match e.state {
-                    DownloadState::Queued | DownloadState::Starting | DownloadState::Active => true,
+                    DownloadState::Queued
+                    | DownloadState::Starting
+                    | DownloadState::Active
+                    | DownloadState::Verifying => true,
                     DownloadState::Seeding { .. } => seeding_is_work,
                     _ => false,
                 }
@@ -613,7 +624,8 @@ impl Inner {
 
     /// Applies the engine's view to an engine-held download with no job in flight.
     /// Only transitions the engine makes on its own are taken over (`Completed`,
-    /// `Seeding` and its counters, `Failed`, `NeedsAttention`, a magnet's
+    /// `Verifying` (a finished file being checked), `Seeding` and its counters,
+    /// `Failed`, `NeedsAttention`, a magnet's
     /// `ChoosingFiles` once its metadata is known); `Paused`/`Active` are only ever
     /// caused by the manager, which records them itself (a `Paused` seen while the
     /// manager says `Active` is the transient moment between `resume` and the transfer
@@ -636,9 +648,11 @@ impl Inner {
         let next = match (&e.state, status.state) {
             (_, s @ (DownloadState::Completed | DownloadState::Seeding { .. })) => s,
             (
-                DownloadState::Active | DownloadState::Seeding { .. },
+                DownloadState::Active | DownloadState::Verifying | DownloadState::Seeding { .. },
                 s @ DownloadState::Failed { .. },
             ) => s,
+            // A finished HTTP download being checked against its checksum.
+            (DownloadState::Active, s @ DownloadState::Verifying) => s,
             (
                 DownloadState::Paused | DownloadState::Queued,
                 DownloadState::NeedsAttention { reason },
@@ -961,6 +975,7 @@ mod tests {
                 context: Default::default(),
                 files: Default::default(),
                 seed: None,
+                checksum: None,
             },
             limit: None,
             state: crate::store::StoredState::Queued,

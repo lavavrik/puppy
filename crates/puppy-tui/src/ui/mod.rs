@@ -484,6 +484,7 @@ pub(crate) fn centered(buf: &mut Buffer, area: Rect, y: u16, parts: &[(&str, Sty
 pub(crate) fn state_icon(state: &WireState) -> (&'static str, Token) {
     match state {
         WireState::Active => ("▶", Token::Ok),
+        WireState::Verifying => ("#", Token::Info),
         WireState::Paused => ("⏸", Token::Dim),
         WireState::Queued => ("…", Token::Dim),
         WireState::Completed => ("✓", Token::Ok),
@@ -503,6 +504,7 @@ pub(crate) fn state_icon(state: &WireState) -> (&'static str, Token) {
 pub(crate) fn state_word(state: &WireState) -> &'static str {
     match state {
         WireState::Active => "active",
+        WireState::Verifying => "verifying",
         WireState::Paused => "paused",
         WireState::Queued => "queued",
         WireState::Completed => "completed",

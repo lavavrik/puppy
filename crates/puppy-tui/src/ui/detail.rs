@@ -2,7 +2,7 @@
 //! segment strip (HTTP) or piece map (torrent).
 
 use puppy_core::types::{EngineDetail, SegmentView};
-use puppy_proto::{DownloadSnapshot, EngineKindTag, WireState};
+use puppy_proto::{DownloadSnapshot, EngineKindTag, Verification, WireState};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -380,6 +380,12 @@ fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two
         }
         _ => size_text(d),
     };
+    // While verifying, the bytes count those hashed.
+    let downloaded_key = if d.state == WireState::Verifying {
+        "Hashed"
+    } else {
+        "Downloaded"
+    };
     let speed = if d.kind == EngineKindTag::Torrent {
         format!(
             "↓ {}  ↑ {}",
@@ -395,7 +401,7 @@ fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two
     let eta = format::eta(d.eta_secs);
     let source = format::display_safe(&d.source);
     let pairs: [(&str, &str, Token); 6] = [
-        ("Downloaded", &downloaded, Token::Text),
+        (downloaded_key, &downloaded, Token::Text),
         ("Speed", &speed, Token::Text),
         ("ETA", &eta, Token::Text),
         ("State", &state, icon_tok),
@@ -436,10 +442,13 @@ fn fields(t: &Theme, buf: &mut Buffer, c: &mut Cursor, d: &DownloadSnapshot, two
 
 /// Rows [`extra_fields`] adds to the grid.
 fn extra_rows(d: &DownloadSnapshot) -> u16 {
-    u16::from(matches!(d.state, WireState::Seeding { .. })) + u16::from(d.note.is_some())
+    u16::from(matches!(d.state, WireState::Seeding { .. }))
+        + u16::from(d.note.is_some())
+        + u16::from(d.checksum.is_some())
 }
 
-/// `Seeding  ratio 0.42 / 1.0 · 48:00 / 2:00:00 · ↑ 430.0 MiB` and the state's note.
+/// `Seeding  ratio 0.42 / 1.0 · 48:00 / 2:00:00 · ↑ 430.0 MiB`, the state's note and
+/// `Checksum  verified · sha-256 ba78…15ad`.
 fn extra_fields(d: &DownloadSnapshot) -> Vec<(&'static str, String, Token)> {
     let mut v = Vec::new();
     if let WireState::Seeding {
@@ -467,6 +476,22 @@ fn extra_fields(d: &DownloadSnapshot) -> Vec<(&'static str, String, Token)> {
     }
     if let Some(note) = &d.note {
         v.push(("Note", format::display_safe(note).into_owned(), Token::Warn));
+    }
+    if let (Some(sum), Some(status)) = (&d.checksum, d.verification()) {
+        let (word, tok) = match status {
+            Verification::Verified => ("✓ verified", Token::Ok),
+            Verification::Verifying => ("verifying…", Token::Info),
+            Verification::Mismatch => ("✗ mismatch", Token::Err),
+            Verification::Pending => ("not checked yet", Token::Dim),
+        };
+        // Abbreviated (`puppy info` prints it whole), so the algorithm stays in view.
+        let hex = &sum.hex;
+        let short = if hex.len() > 20 {
+            format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
+        } else {
+            hex.clone()
+        };
+        v.push(("Checksum", format!("{word} · {} {short}", sum.algo), tok));
     }
     v
 }

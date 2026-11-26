@@ -19,6 +19,7 @@
 pub mod codec;
 
 pub use codec::{CodecError, MsgReader, read_msg, write_msg};
+use puppy_core::checksum::Checksum;
 use puppy_core::types::{
     AddRequest, AttentionReason, DownloadId, DownloadState, EngineDetail, SeedPolicy, Selection,
     TorrentFile,
@@ -302,6 +303,36 @@ pub struct DownloadSnapshot {
     /// a `None` field (or no policy) inherits the daemon's default.
     #[serde(default)]
     pub seed: Option<SeedPolicy>,
+    /// The checksum the file is verified against once complete (`add --checksum`).
+    #[serde(default)]
+    pub checksum: Option<Checksum>,
+}
+
+/// Where a download with a checksum stands with it, derived from its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verification {
+    /// Not checked yet (still downloading, queued, paused, ...).
+    Pending,
+    Verifying,
+    /// Completed, so the checksum matched.
+    Verified,
+    /// Failed with a checksum mismatch (the reason names both digests).
+    Mismatch,
+}
+
+impl DownloadSnapshot {
+    /// `None` without a checksum.
+    pub fn verification(&self) -> Option<Verification> {
+        self.checksum.as_ref()?;
+        Some(match &self.state {
+            WireState::Verifying => Verification::Verifying,
+            WireState::Completed => Verification::Verified,
+            WireState::Failed { reason, .. } if puppy_core::checksum::is_mismatch(reason) => {
+                Verification::Mismatch
+            }
+            _ => Verification::Pending,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +353,9 @@ pub enum WireState {
     Queued,
     Starting,
     Active,
+    /// The file is complete and being checked against its checksum (`done_bytes`:
+    /// bytes hashed so far). Older clients see `Unknown`.
+    Verifying,
     Paused,
     Completed,
     Failed {
@@ -396,6 +430,7 @@ impl From<&DownloadState> for WireState {
             DownloadState::Queued => WireState::Queued,
             DownloadState::Starting => WireState::Starting,
             DownloadState::Active => WireState::Active,
+            DownloadState::Verifying => WireState::Verifying,
             DownloadState::Paused => WireState::Paused,
             DownloadState::Completed => WireState::Completed,
             DownloadState::Failed { reason, transient } => WireState::Failed {
@@ -447,6 +482,7 @@ pub struct Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use puppy_core::checksum::HashAlgo;
     use puppy_core::types::{RequestContext, Source};
     use tokio::io::{AsyncWriteExt, BufReader, duplex};
 
@@ -473,6 +509,7 @@ mod tests {
             next_retry_unix: Some(99),
             note: None,
             seed: None,
+            checksum: None,
         }
     }
 
@@ -562,6 +599,7 @@ mod tests {
                     context: RequestContext::default(),
                     files: Default::default(),
                     seed: None,
+                    checksum: None,
                 },
                 start_paused: true,
                 limit: Some(9),
@@ -823,7 +861,7 @@ mod tests {
     fn unknown_nested_values_deserialize() {
         let snap = serde_json::json!({
             "id": 1, "kind": "ipfs", "source": "s", "name": "n", "path": null,
-            "state": {"kind": "verifying", "progress": 3},
+            "state": {"kind": "deduplicating", "progress": 3},
             "total_bytes": null, "done_bytes": 0, "down_bps": 0, "up_bps": 0,
             "eta_secs": null, "limit": null, "queue_position": null,
             "connections": null, "peers": null
@@ -973,6 +1011,64 @@ mod tests {
                 .note,
             None
         );
+    }
+
+    #[test]
+    fn checksum_and_verifying_on_the_wire() {
+        let sum: Checksum = format!("sha-256={}", "AB".repeat(32)).parse().unwrap();
+        let mut s = snap(1);
+        s.checksum = Some(sum.clone());
+        s.state = (&DownloadState::Verifying).into();
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["state"], serde_json::json!({"kind": "verifying"}));
+        assert_eq!(
+            json["checksum"],
+            serde_json::json!({"algo": "sha-256", "hex": "ab".repeat(32)})
+        );
+        assert_eq!(
+            serde_json::from_value::<DownloadSnapshot>(json.clone()).unwrap(),
+            s
+        );
+        assert_eq!(s.verification(), Some(Verification::Verifying));
+        // From an older daemon: no `checksum`.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("checksum");
+        let old: DownloadSnapshot = serde_json::from_value(old).unwrap();
+        assert_eq!((old.checksum.clone(), old.verification()), (None, None));
+        for (state, v) in [
+            (WireState::Completed, Verification::Verified),
+            (WireState::Active, Verification::Pending),
+            (
+                WireState::Failed {
+                    reason: sum.mismatch("00"),
+                    transient: false,
+                },
+                Verification::Mismatch,
+            ),
+            (
+                WireState::Failed {
+                    reason: "HTTP 404".into(),
+                    transient: false,
+                },
+                Verification::Pending,
+            ),
+        ] {
+            s.state = state;
+            assert_eq!(s.verification(), Some(v));
+        }
+        // An add with a checksum; a malformed one is a bad request.
+        let req = serde_json::json!({"req_id": 1, "method": "add", "request": {
+            "source": {"kind": "http", "url": "http://x/f"}, "output_dir": null,
+            "filename": null, "context": {"headers": [], "cookies": null, "referer": null,
+            "user_agent": null, "basic_auth": null},
+            "checksum": {"algo": "md5", "hex": "0".repeat(32)}}});
+        let Request::Add { request, .. } = parse_request(req.clone()).unwrap().body else {
+            panic!()
+        };
+        assert_eq!(request.checksum.unwrap().algo, HashAlgo::Md5);
+        let mut bad = req;
+        bad["request"]["checksum"]["hex"] = "xyz".into();
+        assert_eq!(parse_request(bad).unwrap_err().0, Some(1));
     }
 
     #[test]

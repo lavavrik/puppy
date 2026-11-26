@@ -37,6 +37,7 @@ use transfer::spawn_run;
 mod files;
 mod restore;
 mod transfer;
+mod verify;
 
 const SPEED_SAMPLE: Duration = Duration::from_millis(250);
 
@@ -61,6 +62,8 @@ struct Inner {
     st: Mutex<Shared>,
     /// Whole-download speed, sampled by the running transfer.
     bps: AtomicU64,
+    /// Bytes hashed so far while `Verifying`.
+    hashed: AtomicU64,
     control: tokio::sync::Mutex<Control>,
     /// Bumped by `pause`/`cancel` before they wait for the control lock, so they can
     /// interrupt a validation in progress.
@@ -75,6 +78,9 @@ struct Shared {
     /// Where the finished file is (or will be): `final_path` unless finalizing found that
     /// name taken.
     path: PathBuf,
+    /// The file is complete and at `path` (`.part` renamed), but not yet `Completed`
+    /// unless verified: a run only verifies it.
+    finalized: bool,
 }
 
 struct Plan {
@@ -235,8 +241,10 @@ impl Env {
                 plan,
                 final_url,
                 path,
+                finalized: false,
             }),
             bps: AtomicU64::new(0),
+            hashed: AtomicU64::new(0),
             control: tokio::sync::Mutex::new(Control::default()),
             interrupt: watch::channel(0).0,
         });
@@ -349,7 +357,8 @@ impl HttpDownload {
     }
 
     /// Stops the download for good. With `delete_files`, removes `.part`, the sidecar and,
-    /// if the download had completed, the final file.
+    /// if the download had completed (or finished but failed its checksum), the final
+    /// file.
     pub async fn cancel(&self, delete_files: bool) {
         self.inner.interrupt.send_modify(|n| *n += 1);
         let mut c = self.inner.control.lock().await;
@@ -362,7 +371,7 @@ impl HttpDownload {
         let (completed, path) = {
             let st = self.inner.lock();
             (
-                matches!(st.state, DownloadState::Completed),
+                st.finalized || matches!(st.state, DownloadState::Completed),
                 st.path.clone(),
             )
         };
@@ -382,12 +391,18 @@ impl HttpDownload {
 
     pub fn status(&self) -> DownloadStatus {
         let st = self.inner.lock();
-        let done = st.plan.done_bytes();
+        let mut done = st.plan.done_bytes();
         let bps = match st.state {
             DownloadState::Active => self.inner.bps.load(Ordering::Relaxed),
             _ => 0,
         };
-        let total = self.inner.remote.total;
+        let mut total = self.inner.remote.total;
+        if st.state == DownloadState::Verifying {
+            // The progress of the check (the size of a stream of unknown length is
+            // known by now).
+            total = total.or(Some(done));
+            done = self.inner.hashed.load(Ordering::Relaxed);
+        }
         let eta_secs = match total {
             Some(t) if bps > 0 => Some(t.saturating_sub(done).div_ceil(bps)),
             _ => None,
@@ -482,7 +497,8 @@ impl Inner {
     /// Single streams restart from zero, so there is nothing to validate. A change of
     /// `interrupt` (pause/cancel) abandons validation: `Ok(false)`, now `Paused`.
     async fn validate(&self, mut interrupt: watch::Receiver<u64>) -> Result<bool, EngineError> {
-        if self.lock().plan.single {
+        // A finished file (awaiting its checksum check) needs nothing from the remote.
+        if self.lock().plan.single || self.lock().finalized {
             return Ok(true);
         }
         let state = self.resume_state();
@@ -616,6 +632,7 @@ impl Inner {
             context: Default::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         };
         env.build(req, remote, PathBuf::from("f"), Plan::single(None, false))
             .0

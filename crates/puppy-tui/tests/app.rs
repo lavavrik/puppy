@@ -30,6 +30,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         next_retry_unix: None,
         note: None,
         seed: None,
+        checksum: None,
     }
 }
 
@@ -470,6 +471,8 @@ fn add_popup_submits_add_cmd() {
     for c in "/data".chars() {
         a.update(ch(c), now);
     }
+    // Past the (empty) checksum to the checkbox.
+    a.update(key(KeyCode::Tab), now);
     a.update(key(KeyCode::Tab), now);
     a.update(ch(' '), now);
     let cmds = a.update(key(KeyCode::Enter), now);

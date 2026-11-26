@@ -168,6 +168,7 @@ impl Env {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         }
     }
 }
@@ -372,6 +373,7 @@ async fn daemon_restart_restores_magnet_offline_with_its_name() {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     let seen = watch(&c, id, "transferring", |s| {
@@ -415,6 +417,7 @@ async fn http_only_daemon_never_starts_the_torrent_session() {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
@@ -613,6 +616,7 @@ async fn file_requests_on_http_downloads_are_unsupported() {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "completion", |s| s.state == WireState::Completed).await;
@@ -797,6 +801,7 @@ async fn slots_ignore_choosing_and_seeding() {
         context: RequestContext::default(),
         files: FileChoice::Ask,
         seed: None,
+        checksum: None,
     };
     let idb = c.add(req, false, None).await.unwrap();
     watch(&c, idb, "choosing files", |s| {
@@ -1090,6 +1095,7 @@ async fn restart_keeps_magnet_choosing() {
         context: RequestContext::default(),
         files: FileChoice::Ask,
         seed: None,
+        checksum: None,
     };
     let id = c.add(req, false, None).await.unwrap();
     watch(&c, id, "choosing files", |s| {

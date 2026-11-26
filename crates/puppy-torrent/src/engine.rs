@@ -3220,6 +3220,7 @@ mod tests {
             context: Default::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         };
         engine
             .add(1, req, StartMode::Fresh, AddOptions::default())

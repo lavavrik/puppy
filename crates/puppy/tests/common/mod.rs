@@ -204,6 +204,7 @@ impl Env {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         }
     }
 
@@ -217,6 +218,7 @@ impl Env {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         }
     }
 

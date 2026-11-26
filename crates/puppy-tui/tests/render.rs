@@ -44,6 +44,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         next_retry_unix: None,
         note: None,
         seed: None,
+        checksum: None,
     }
 }
 
@@ -1334,4 +1335,44 @@ fn render_seeding_and_choosing_rows() {
         r[d]
     );
     assert!(r[d].contains("↑ 430.0 MiB"), "{:?}", r[d]);
+}
+
+#[test]
+fn render_verifying_row_and_checksum_detail() {
+    let sum: puppy_core::checksum::Checksum =
+        format!("sha-256={}", "ab".repeat(32)).parse().unwrap();
+    let mut verifying = snap(1, "big.iso", WireState::Verifying);
+    verifying.checksum = Some(sum.clone());
+    verifying.done_bytes = 300;
+    let mut bad = snap(
+        2,
+        "bad.iso",
+        WireState::Failed {
+            reason: sum.mismatch(&"cd".repeat(32)),
+            transient: false,
+        },
+    );
+    bad.checksum = Some(sum.clone());
+    let mut ok = snap(3, "ok.iso", WireState::Completed);
+    ok.checksum = Some(sum);
+    let mut a = app(vec![verifying, bad, ok]);
+    a.selected = Some(1);
+    let r = render(&mut a, 160, 40);
+    let v = find(&r, "big.iso").unwrap_or_else(|| panic!("{r:#?}"));
+    assert!(r[v + 1].contains("verifying sha-256…"), "{:?}", r[v + 1]);
+    let line = find(&r, "Checksum").unwrap_or_else(|| panic!("{r:#?}"));
+    assert!(r[line].contains("verifying…"), "{:?}", r[line]);
+    assert!(find(&r, "Hashed").is_some(), "{r:#?}");
+    a.selected = Some(2);
+    let r = render(&mut a, 160, 40);
+    let line = find(&r, "Checksum").unwrap();
+    assert!(r[line].contains("✗ mismatch"), "{:?}", r[line]);
+    a.selected = Some(3);
+    let r = render(&mut a, 160, 40);
+    let line = find(&r, "Checksum").unwrap();
+    assert!(
+        r[line].contains("✓ verified · sha-256 abababab…abababab"),
+        "{:?}",
+        r[line]
+    );
 }

@@ -117,8 +117,9 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The progress line: `⠋ 2/3 · 45% · 11.4 MiB/s · eta 0:41`, plus `· retrying in m:ss`
-/// while a download waits for its automatic retry. `waited` are the latest snapshots of
+/// The progress line: `⠋ 2/3 · 45% · 11.4 MiB/s · eta 0:41`, plus `· verifying 30%`
+/// while downloads are checked against their checksums and `· retrying in m:ss` while
+/// a download waits for its automatic retry. `waited` are the latest snapshots of
 /// every waited download (finished ones included).
 fn progress_line(
     frame: usize,
@@ -139,7 +140,8 @@ fn progress_line(
     let done: u64 = waited
         .iter()
         .map(|d| match (&d.state, d.total_bytes) {
-            (WireState::Completed, Some(t)) => t,
+            // Downloaded; its `done_bytes` count the bytes hashed.
+            (WireState::Completed | WireState::Verifying, Some(t)) => t,
             (_, Some(t)) => d.done_bytes.min(t),
             (_, None) => d.done_bytes,
         })
@@ -154,6 +156,18 @@ fn progress_line(
         .filter(|_| bps > 0)
         .map(|s| s.saturating_sub(done).div_ceil(bps));
     parts.push(format!("eta {}", format::eta(eta)));
+    let verifying: Vec<_> = waited
+        .iter()
+        .filter(|d| d.state == WireState::Verifying)
+        .collect();
+    if !verifying.is_empty() {
+        let hashed = verifying.iter().map(|d| d.done_bytes).sum();
+        let size = verifying.iter().map(|d| d.total_bytes).sum::<Option<u64>>();
+        parts.push(match format::percent(hashed, size) {
+            Some(p) => format!("verifying {:.0}%", p * 100.0),
+            None => "verifying".into(),
+        });
+    }
     let retry = waited
         .iter()
         .filter(|d| {
@@ -513,6 +527,7 @@ mod tests {
             next_retry_unix: None,
             note: None,
             seed: None,
+            checksum: None,
         }
     }
 
@@ -539,6 +554,27 @@ mod tests {
             progress_line(1, 0, 1, &[&c], 100),
             "⠙ 0/1 · — · eta — · retrying in 1:05"
         );
+    }
+
+    #[test]
+    fn verifying_counts_as_downloaded_and_shows_its_progress() {
+        let mib = 1 << 20;
+        let v = snap(WireState::Verifying, Some(10 * mib), 3 * mib, 0);
+        assert_eq!(
+            progress_line(0, 0, 1, &[&v], 0),
+            "⠋ 0/1 · 100% · — · eta — · verifying 30%"
+        );
+        assert_eq!(ended(&v), None, "verifying has not ended");
+        let mismatch = snap(
+            WireState::Failed {
+                reason: "checksum mismatch (sha-256): expected aa, got bb".into(),
+                transient: false,
+            },
+            Some(1),
+            1,
+            0,
+        );
+        assert_eq!(ended(&mismatch).map(|(code, _)| code), Some(4));
     }
 
     #[test]

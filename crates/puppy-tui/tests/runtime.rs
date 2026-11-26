@@ -51,6 +51,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         next_retry_unix: None,
         note: None,
         seed: None,
+        checksum: None,
     }
 }
 

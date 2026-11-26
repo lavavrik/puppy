@@ -1541,3 +1541,106 @@ async fn test_daemons_stay_off_github() {
         s => panic!("the check reached a release server: {s:?}"),
     }
 }
+
+#[test]
+fn add_bad_checksum_specs_are_usage() {
+    let env = Env::new();
+    let a = url_of(&env, "a");
+    for spec in [
+        "abc",
+        "sha-256=abcd",
+        "crc32=abcd",
+        "sha-256=zz00000000000000000000000000000000000000000000000000000000000000",
+    ] {
+        let (status, out, err) = env.run(&["add", "--paused", "--checksum", spec, &a]);
+        assert_eq!(status.code(), Some(2), "{spec}: {err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("--checksum"), "{spec}: {err}");
+    }
+    let (_, _, err) = env.run(&["add", "--checksum", "sha-256=abcd", &a]);
+    assert!(err.contains("64 hex digits"), "{err}");
+    // Several sources (also through stdin) cannot share one digest.
+    let b = url_of(&env, "b");
+    let sum = format!("md5={}", "0".repeat(32));
+    let (status, _, err) = env.run(&["add", "--paused", "--checksum", &sum, &a, &b]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("exactly one source"), "{err}");
+    let input = format!("{a}\n{b}\n");
+    let (status, _, err) = run_stdin(
+        &env,
+        &["add", "--paused", "--checksum", &sum, "-"],
+        input.as_bytes(),
+    );
+    assert_eq!(status.code(), Some(2), "{err}");
+    // A torrent verifies its pieces already.
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    let (status, _, err) = env.run(&["add", "--paused", "--checksum", &sum, magnet]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("BitTorrent"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_checksum_wait_verifies_or_fails() {
+    let env = Env::new();
+    let cfg = small_server_cfg();
+    let len = cfg.len;
+    let s = puppy_testserver::TestServer::start(cfg).await;
+    let url = s.url("/file.bin").to_string();
+    let dir = env.dl_dir();
+    let dir = dir.to_str().unwrap();
+    let good = format!(
+        "SHA256={}",
+        puppy_testserver::body_sha256(len, 0).to_uppercase()
+    );
+    let (status, out, err) = env.run(&[
+        "--json",
+        "add",
+        "--wait",
+        "-o",
+        dir,
+        "--name",
+        "good.bin",
+        "--checksum",
+        &good,
+        &url,
+    ]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(v["final"][0]["state"]["kind"], "completed", "{out}");
+    assert_eq!(v["final"][0]["checksum"]["algo"], "sha-256", "{out}");
+    let (status, out, err) = env.run(&["info", "1"]);
+    assert!(status.success(), "{err}");
+    assert!(out.contains("checksum    sha-256="), "{out}");
+    assert!(out.contains("verified    yes"), "{out}");
+
+    let bad = format!("sha-1={}", "0".repeat(40));
+    let (status, _, err) = env.run(&[
+        "add",
+        "--wait",
+        "-o",
+        dir,
+        "--name",
+        "bad.bin",
+        "--checksum",
+        &bad,
+        &url,
+    ]);
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "a mismatch is a failed download: {err}"
+    );
+    assert!(
+        err.contains(
+            "checksum mismatch (sha-1): expected 0000000000000000000000000000000000000000, got "
+        ),
+        "{err}"
+    );
+    assert!(env.dl_dir().join("bad.bin").exists(), "the file is kept");
+    let (_, out, _) = env.run(&["info", "2"]);
+    assert!(out.contains("verified    no"), "{out}");
+    let (_, out, _) = env.run(&["ls", "--state", "failed"]);
+    assert!(out.contains("bad.bin"), "{out}");
+    let (status, _, _) = env.run(&["wait", "2"]);
+    assert_eq!(status.code(), Some(4));
+}

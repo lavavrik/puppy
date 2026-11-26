@@ -199,6 +199,7 @@ pub fn to_add_request(m: &AddMsg) -> Result<AddRequest, String> {
         },
         files: FileChoice::All,
         seed: None,
+        checksum: None,
     })
 }
 
@@ -279,6 +280,7 @@ mod tests {
                 },
                 files: FileChoice::All,
                 seed: None,
+                checksum: None,
             }
         );
     }

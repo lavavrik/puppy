@@ -212,6 +212,7 @@ puppy add --name b.iso --paused URL         # under another name, without starti
 puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
 puppy add - < urls.txt                      # one source per line from stdin (# comments)
 puppy add --wait URL                        # add, then wait like `puppy wait`
+puppy add --checksum sha-256=9f86d0… URL    # check the finished file against this digest
 puppy add --files 1,3-5 --files '*.mkv' T   # torrent: only these files (1-based numbers, ranges, globs)
 puppy add --choose T                        # torrent: wait for `puppy select` to pick the files
 puppy add --seed-ratio 2 --seed-time 6h T   # torrent: seeding limits for this one (`default` inherits)
@@ -265,7 +266,7 @@ the same origin (scheme, host and port). A redirect to another origin gets no
 cookies and no `Cookie`, `Authorization` or `Proxy-Authorization` header; the
 referer, user agent and other headers still go along.
 
-`ls --state` takes `queued`, `starting`, `active`, `paused`, `completed`
+`ls --state` takes `queued`, `starting`, `active`, `verifying`, `paused`, `completed`
 (completed only, not seeding), `done` (finished downloading: completed or
 seeding), `choosing`, `seeding`, `failed` (for good), `retrying` and
 `attention`. Piped `ls` output
@@ -302,6 +303,32 @@ combined, and neither (nor `--seed-*`) applies to a non-torrent source. `puppy
 files` on a download that is not a torrent, or one that already completed
 (and so left the torrent engine), fails with exit 1 and the daemon's message.
 
+`add --checksum ALGO=HEX` checks the finished file against a digest:
+`md5`, `sha-1`, `sha-224`, `sha-256`, `sha-384` or `sha-512` (written as
+aria2 and Metalink do, `sha-256=…`; `sha256=…` works too; algorithm and hex
+digits in any case). It needs exactly one HTTP(S) source (also on stdin):
+torrents are refused, since BitTorrent already checks every piece. A
+malformed digest, an unknown algorithm or a wrong number of hex digits is a
+usage error (exit 2). The dashboard's add form (`a`) has an optional
+checksum field that takes the same spec.
+
+Once every byte is downloaded, puppy hashes the whole file (also when it was
+resumed, or finished before a restart) and shows the download as
+`verifying` meanwhile, its progress counting the bytes hashed; it holds its
+`max_active` slot until then. A match completes it. A mismatch fails it for
+good (no automatic retry; `wait` exits 4) with the reason `checksum mismatch
+(sha-256): expected <hex>, got <hex>`, and keeps the file where it is:
+`resume` checks it again (for example after you replaced it), `restart`
+deletes it and downloads it again, and `rm --delete-files` deletes it. If
+the daemon stops before the check has passed, it checks the file again
+after the next start, without the network. `pause` during the check stops it;
+`resume` starts it over. `info` shows the digest (`checksum`) and the result
+(`verified`: `yes`, `verifying (N%)`, `no` or `not yet`), the detail pane a
+`Checksum` line; `--json` snapshots carry it as
+`"checksum":{"algo":"sha-256","hex":"…"}` and the state `verifying`. A daemon
+from before checksums cannot verify, so `add --checksum` against one
+removes the download again and fails, asking you to `puppy stop` it.
+
 `puppy seed <id>` **replaces the torrent's whole seeding policy**: `--ratio R`
 and `--time DUR` (`90m`, `2h`, ...) set a limit, `0` turns that limit off, and
 `default` (or leaving the option out) goes back to the daemon's `seed_ratio` /
@@ -315,7 +342,7 @@ Exit codes (with several ids, the highest wins):
 | `1`  | error (daemon or operation) |
 | `2`  | usage |
 | `3`  | unknown id |
-| `4`  | waited download failed |
+| `4`  | waited download failed (including a checksum mismatch) |
 | `5`  | waited download needs attention |
 | `6`  | update not possible here (not a release build, or a folder puppy cannot write) |
 

@@ -101,6 +101,7 @@ impl Env {
             context: RequestContext::default(),
             files,
             seed: None,
+            checksum: None,
         }
     }
 

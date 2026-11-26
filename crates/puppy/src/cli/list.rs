@@ -6,8 +6,8 @@ use super::{CliError, Ctx};
 use crate::cli::ClientError;
 use clap::ValueEnum;
 use puppy_core::types::EngineDetail;
-use puppy_proto::WireState;
 use puppy_proto::{DownloadSnapshot, ErrorCode, ReplyData, Request, UpdateStatus, WireAttention};
+use puppy_proto::{Verification, WireState};
 use puppy_tui::format::{bytes, eta, speed};
 use puppy_tui::format::{display_safe, percent};
 use serde::Serialize;
@@ -54,6 +54,8 @@ pub enum StateFilter {
     Queued,
     Starting,
     Active,
+    /// Finished downloading, being checked against its checksum.
+    Verifying,
     Paused,
     /// Completed only (not seeding).
     Completed,
@@ -77,6 +79,7 @@ impl StateFilter {
             (StateFilter::Queued, WireState::Queued)
                 | (StateFilter::Starting, WireState::Starting)
                 | (StateFilter::Active, WireState::Active)
+                | (StateFilter::Verifying, WireState::Verifying)
                 | (StateFilter::Paused, WireState::Paused)
                 | (StateFilter::Completed, WireState::Completed)
                 | (
@@ -158,6 +161,7 @@ pub fn state_word(s: &WireState) -> &'static str {
         WireState::Queued => "queued",
         WireState::Starting => "starting",
         WireState::Active => "active",
+        WireState::Verifying => "verifying",
         WireState::Paused => "paused",
         WireState::Completed => "done",
         WireState::ChoosingFiles => "choosing",
@@ -188,6 +192,19 @@ pub(super) fn attention_text(r: &WireAttention) -> String {
         WireAttention::NotResumable => "the server cannot resume this download".to_string(),
         WireAttention::ValidationFailed { detail } => format!("validation failed: {detail}"),
         WireAttention::Unknown => "unknown reason".to_string(),
+    }
+}
+
+/// Where a download with a checksum stands with it (`info`).
+fn verification_text(d: &DownloadSnapshot) -> String {
+    match d.verification() {
+        Some(Verification::Verified) => "yes".into(),
+        Some(Verification::Verifying) => match percent(d.done_bytes, d.total_bytes) {
+            Some(p) => format!("verifying ({:.0}%)", p * 100.0),
+            None => "verifying".into(),
+        },
+        Some(Verification::Mismatch) => "no: the file does not match (see state)".into(),
+        Some(Verification::Pending) | None => "not yet".into(),
     }
 }
 
@@ -261,8 +278,16 @@ pub async fn info(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     if let Some(note) = &d.note {
         kv("note", display_safe(note).into_owned());
     }
+    if let Some(sum) = &d.checksum {
+        kv("checksum", sum.to_string());
+        kv("verified", verification_text(&d));
+    }
     kv("size", d.total_bytes.map_or("—".to_string(), bytes));
-    kv("downloaded", bytes(d.done_bytes));
+    if d.state == WireState::Verifying {
+        kv("hashed", bytes(d.done_bytes));
+    } else {
+        kv("downloaded", bytes(d.done_bytes));
+    }
     kv("speed", speed(d.down_bps));
     kv("eta", eta(d.eta_secs));
     kv(

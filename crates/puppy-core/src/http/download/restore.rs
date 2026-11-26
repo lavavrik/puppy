@@ -114,17 +114,28 @@ impl HttpDownload {
                 });
                 return Ok((HttpDownload { inner }, added));
             }
-            match tokio::fs::remove_file(&sidecar).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %sidecar.display(), "cannot delete: {e}"),
-            }
             let mut remote = match &loaded {
                 Ok(state) => from_sidecar(state, &final_path),
                 Err(_) => unknown_remote(&url, &final_path),
             };
             remote.total = Some(len);
             let (inner, added) = env.build(req, remote, final_path, Plan::finished(len));
+            inner.lock().finalized = true;
+            if inner.request.checksum.is_some() {
+                // Not verified yet (or it failed): the sidecar stays until it passes.
+                // Verifying is local, so it runs right away unless started paused.
+                if start_paused {
+                    inner.set_state(DownloadState::Paused);
+                } else {
+                    inner.control.lock().await.run = Some(spawn_run(&inner));
+                }
+                return Ok((HttpDownload { inner }, added));
+            }
+            match tokio::fs::remove_file(&sidecar).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %sidecar.display(), "cannot delete: {e}"),
+            }
             inner.set_state(DownloadState::Completed);
             let _ = inner.events.send(EngineEvent::Completed { id });
             return Ok((HttpDownload { inner }, added));

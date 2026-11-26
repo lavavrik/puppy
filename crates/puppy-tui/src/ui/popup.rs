@@ -279,6 +279,19 @@ fn add_rows<'a>(t: &Theme, f: &'a AddForm, default_dir: Option<String>, w: u16) 
         },
     ]);
     error_rows(&mut rows, err_on(AddField::Dir), w);
+    rows.extend([
+        Row::Blank,
+        Row::Label {
+            text: "Checksum (optional, HTTP only)",
+            focused: f.focus == AddField::Checksum,
+        },
+        Row::Input {
+            input: &f.checksum,
+            placeholder: Some("sha-256=…  sha-1=…  md5=…".into()),
+            focused: f.focus == AddField::Checksum,
+        },
+    ]);
+    error_rows(&mut rows, err_on(AddField::Checksum), w);
     let ok = if f.focus == AddField::Ok {
         t.style(Token::Badge)
     } else {

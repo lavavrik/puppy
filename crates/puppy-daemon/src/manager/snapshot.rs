@@ -118,6 +118,7 @@ impl Inner {
             next_retry_unix: e.retry.map(|r| r.unix),
             note: status.as_ref().and_then(|s| s.note.clone()),
             seed: e.rec.request.seed.clone(),
+            checksum: e.rec.request.checksum.clone(),
         };
         (snap, detail)
     }

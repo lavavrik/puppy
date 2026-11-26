@@ -114,6 +114,10 @@ enum Command {
         /// Wait until the downloads end (exit code as for `puppy wait`).
         #[arg(long)]
         wait: bool,
+        /// Check the finished file against this digest, `ALGO=HEX` (`sha-256`,
+        /// `sha-512`, `sha-1`, `md5`, ...); one HTTP(S) source only.
+        #[arg(long, value_name = "ALGO=HEX")]
+        checksum: Option<String>,
         /// Torrent: download only these files, by number as `puppy files` shows
         /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable. Every comma splits
         /// specs: use numbers for brace globs or names containing a comma.
@@ -321,6 +325,7 @@ fn main() -> ExitCode {
                 cookie,
                 referer,
                 wait,
+                checksum,
                 files,
                 choose,
                 seed_ratio,
@@ -337,6 +342,7 @@ fn main() -> ExitCode {
                         headers,
                         cookie,
                         referer,
+                        checksum,
                         files,
                         choose,
                         seed_ratio,

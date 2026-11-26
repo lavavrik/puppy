@@ -80,6 +80,7 @@ async fn a_failed_fresh_torrent_resumes_in_session() {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     };
     let added = engine
         .add(1, req, StartMode::Fresh, AddOptions::default())

@@ -317,6 +317,7 @@ impl RowCtx<'_> {
         };
         theme.p.bar_done = match d.state {
             WireState::Active | WireState::Starting => p.bar_done,
+            WireState::Verifying => p.info,
             WireState::Failed { .. } => p.err,
             WireState::NeedsAttention { .. } => p.warn,
             // Complete, and still sharing.
@@ -368,6 +369,11 @@ impl RowCtx<'_> {
             }
             WireState::Starting => {
                 push("starting…".into(), Token::Dim);
+                push(size, Token::Dim);
+            }
+            WireState::Verifying => {
+                let algo = d.checksum.as_ref().map_or("checksum", |c| c.algo.name());
+                push(format!("verifying {algo}…"), Token::Info);
                 push(size, Token::Dim);
             }
             WireState::Queued => {
@@ -444,7 +450,10 @@ impl RowCtx<'_> {
 }
 
 fn is_moving(state: &WireState) -> bool {
-    matches!(state, WireState::Active | WireState::Starting)
+    matches!(
+        state,
+        WireState::Active | WireState::Starting | WireState::Verifying
+    )
 }
 
 /// Fraction done (complete ⇒ 1) and the percent slot text (floored: never `100%`

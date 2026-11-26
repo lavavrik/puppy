@@ -29,6 +29,7 @@ fn request(s: &TestServer, dir: &Path) -> AddRequest {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     }
 }
 

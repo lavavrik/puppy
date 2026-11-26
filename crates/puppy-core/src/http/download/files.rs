@@ -100,7 +100,8 @@ pub(super) async fn blocking<T: Send + 'static>(
         .map_err(io::Error::other)?
 }
 
-/// fsyncs the data, renames `.part` to the final name, then removes the sidecar.
+/// fsyncs the data, renames `.part` to the final name, then removes the sidecar (kept
+/// when the request has a checksum: see `verify`), and marks the download finalized.
 /// Never replaces a file that appeared at the final name meanwhile: the download is then
 /// finalized under a free name, recorded as its `path` (with a `StateChanged` event).
 /// Must only run after `transfer` returned (no open handles).
@@ -131,6 +132,7 @@ pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
         }
     };
     let final_path = inner.final_path.clone();
+    let keep_sidecar = inner.request.checksum.is_some();
     let target = blocking(move || {
         let part = part_path(&final_path);
         let file = OpenOptions::new().read(true).write(true).open(&part)?;
@@ -149,10 +151,13 @@ pub(super) async fn finalize(inner: &Inner) -> io::Result<()> {
         // Renaming first means a crash here leaves the finished file plus a stale sidecar,
         // never an unrenamed file without its sidecar. The download is already complete
         // here, so a sidecar that cannot be removed is only logged.
-        remove_sidecar_best_effort(&sidecar_path(&final_path));
+        if !keep_sidecar {
+            remove_sidecar_best_effort(&sidecar_path(&final_path));
+        }
         Ok(target)
     })
     .await?;
+    inner.lock().finalized = true;
     if target != inner.final_path {
         let state = {
             let mut st = inner.lock();
@@ -194,7 +199,7 @@ fn rename_part(part: &Path, final_path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Removes a sidecar after a successful rename; failure is logged, never fatal.
-fn remove_sidecar_best_effort(path: &Path) {
+pub(super) fn remove_sidecar_best_effort(path: &Path) {
     if let Err(e) = remove_if_exists(path) {
         tracing::warn!(path = %path.display(), "cannot remove sidecar after finishing: {e}");
     }

@@ -384,6 +384,7 @@ mod tests {
                     },
                     files: Default::default(),
                     seed: None,
+                    checksum: None,
                 },
                 limit: Some(5),
                 state: StoredState::Failed {
@@ -476,6 +477,44 @@ mod tests {
         .unwrap();
         assert_eq!(s.load().await.unwrap(), PersistedState::default());
         assert_eq!(corrupt_files(d.path()).len(), 1);
+    }
+
+    /// A state file from before checksums (no `checksum` in its requests) loads; one
+    /// written now without checksums has none either (an older daemon reads it as is),
+    /// and a checksum survives a round trip.
+    #[tokio::test]
+    async fn checksum_field_is_optional_and_round_trips() {
+        let (d, s) = store();
+        let old = r#"{"version":1,"next_id":2,"order":[1],"settings":null,"downloads":[
+            {"id":1,"request":{"source":{"kind":"http","url":"http://x/f.bin"},
+             "output_dir":null,"filename":null,"context":{"headers":[],"cookies":null,
+             "referer":null,"user_agent":null,"basic_auth":null}},
+             "limit":null,"state":{"kind":"completed"},"name":"f.bin","path":"/tmp/f.bin",
+             "total_bytes":10,"created_unix":1,"finished_unix":2}]}"#;
+        std::fs::write(d.path().join("state.json"), old).unwrap();
+        let st = s.load().await.unwrap();
+        assert_eq!(st.downloads.len(), 1);
+        assert_eq!(st.downloads[0].request.checksum, None);
+        assert!(corrupt_files(d.path()).is_empty());
+
+        let plain = serde_json::to_string(&sample(3)).unwrap();
+        assert!(!plain.contains("checksum"), "{plain}");
+
+        let mut st = sample(3);
+        st.downloads[0].request.checksum = Some(
+            "sha-1=A9993E364706816ABA3E25717850C26C9CD0D89D"
+                .parse()
+                .unwrap(),
+        );
+        s.save_now(&st).await.unwrap();
+        let loaded = s.load().await.unwrap();
+        assert_eq!(loaded, st);
+        let raw = std::fs::read_to_string(d.path().join("state.json")).unwrap();
+        assert!(raw.contains(r#""algo": "sha-1""#), "{raw}");
+        assert!(
+            raw.contains("a9993e364706816aba3e25717850c26c9cd0d89d"),
+            "{raw}"
+        );
     }
 
     #[test]

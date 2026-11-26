@@ -1,3 +1,4 @@
+pub mod checksum;
 pub mod config;
 pub mod engine;
 pub mod fsutil;

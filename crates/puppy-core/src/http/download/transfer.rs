@@ -2,8 +2,9 @@
 //! sidecar flushed, and turns worker exits into an outcome.
 
 use super::files::{blocking, finalize, open_part};
+use super::verify::complete;
 use super::{Inner, Plan, RunEnd, RunHandle, SPEED_SAMPLE, SegEntry};
-use crate::engine::{EngineError, EngineEvent};
+use crate::engine::EngineError;
 use crate::http::segments::Segment;
 use crate::http::single::run_single;
 use crate::http::worker::{SegmentShared, WorkerCtx, WorkerExit, run_segment};
@@ -41,15 +42,14 @@ async fn run(inner: Arc<Inner>, cancel: CancellationToken) -> RunEnd {
     // Progress when the URL was last re-resolved: a fresh URL that is refused again
     // before any progress is not re-resolved again.
     let mut reresolved_at: Option<u64> = None;
+    if inner.lock().finalized {
+        return complete(&inner, &cancel).await;
+    }
     loop {
         let next = match transfer(&inner, &cancel).await {
             Outcome::Stopped => return RunEnd::Stopped,
             Outcome::Complete => match finalize(&inner).await {
-                Ok(()) => {
-                    inner.set_state(DownloadState::Completed);
-                    let _ = inner.events.send(EngineEvent::Completed { id: inner.id });
-                    return RunEnd::Finished;
-                }
+                Ok(()) => return complete(&inner, &cancel).await,
                 Err(e) => DownloadState::Failed {
                     reason: format!("finalizing failed: {e}"),
                     transient: false,

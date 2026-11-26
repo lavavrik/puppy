@@ -50,6 +50,7 @@ fn torrent_req(root: &Path, seeder: &Seeder, seed: Option<SeedPolicy>) -> AddReq
         context: RequestContext::default(),
         files: Default::default(),
         seed,
+        checksum: None,
     }
 }
 
@@ -415,6 +416,7 @@ fn choosing_req(root: &Path) -> AddRequest {
         context: RequestContext::default(),
         files: FileChoice::Ask,
         seed: None,
+        checksum: None,
     }
 }
 

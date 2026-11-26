@@ -79,6 +79,7 @@ impl Env {
             context: RequestContext::default(),
             files: Default::default(),
             seed: None,
+            checksum: None,
         }
     }
 }
@@ -477,6 +478,7 @@ async fn unsupported_source_is_bad_request() {
         context: RequestContext::default(),
         files: Default::default(),
         seed: None,
+        checksum: None,
     };
     let err = m.add(req, false, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::BadRequest(_)), "{err:?}");
@@ -1710,5 +1712,173 @@ async fn removed_download_leaves_no_context() {
         !text.contains("COOKIESECRET") && !text.contains("PWSECRET"),
         "{text}"
     );
+    m.shutdown().await;
+}
+
+fn sha256_of(len: u64) -> puppy_core::checksum::Checksum {
+    format!("sha-256={}", puppy_testserver::body_sha256(len, 0))
+        .parse()
+        .unwrap()
+}
+
+fn wrong_sha256() -> puppy_core::checksum::Checksum {
+    format!("sha-256={}", "0".repeat(64)).parse().unwrap()
+}
+
+#[tokio::test]
+async fn checksum_match_completes_verified() {
+    let env = Env::new();
+    let len = 256 * KIB;
+    let s = server(|c| c.len = len).await;
+    let m = env.manager(3).await;
+    let mut rx = m.events();
+    let mut req = env.req(&s, "a.bin");
+    req.checksum = Some(sha256_of(len));
+    let id = m.add(req, false, None).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, Event::Completed { .. })).await;
+    wait_completed(&m, id).await;
+    let d = snap(&m, id);
+    assert_eq!(d.checksum, Some(sha256_of(len)));
+    assert_eq!(d.verification(), Some(puppy_proto::Verification::Verified));
+    assert_eq!(d.done_bytes, len);
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn checksum_mismatch_fails_for_good_and_keeps_the_file() {
+    let env = Env::new();
+    let len = 256 * KIB;
+    let s = server(|c| c.len = len).await;
+    let m = env.manager(3).await;
+    let mut rx = m.events();
+    let mut req = env.req(&s, "a.bin");
+    req.checksum = Some(wrong_sha256());
+    let id = m.add(req, false, None).await.unwrap();
+    let ev = next_event(&mut rx, |e| matches!(e, Event::Failed { .. })).await;
+    let expected = format!(
+        "checksum mismatch (sha-256): expected {}, got {}",
+        "0".repeat(64),
+        puppy_testserver::body_sha256(len, 0)
+    );
+    assert_eq!(
+        ev,
+        Event::Failed {
+            id,
+            reason: expected.clone(),
+            transient: false
+        }
+    );
+    let d = snap(&m, id);
+    assert_eq!(
+        d.state,
+        WireState::Failed {
+            reason: expected,
+            transient: false
+        }
+    );
+    assert_eq!(d.next_retry_unix, None, "not retried automatically");
+    assert_eq!(d.verification(), Some(puppy_proto::Verification::Mismatch));
+    assert_file(&env.dl_dir().join("a.bin"), len, 0);
+    // Restarting downloads it again from scratch (the bad file is deleted first).
+    m.restart(id).await.unwrap();
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
+    assert_eq!(snap(&m, id).path, Some(env.dl_dir().join("a.bin")));
+    assert!(!env.dl_dir().join("a (1).bin").exists());
+    m.shutdown().await;
+}
+
+#[tokio::test]
+async fn checksum_with_a_torrent_source_is_refused() {
+    let env = Env::new();
+    let m = env.manager(3).await;
+    let mut req = env.req(&server(|_| {}).await, "a.bin");
+    req.source = Source::Magnet {
+        uri: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+    };
+    req.checksum = Some(wrong_sha256());
+    match m.add(req, false, None).await {
+        Err(e @ ManagerError::BadRequest(_)) => {
+            assert!(e.to_string().contains("BitTorrent"), "{e}");
+            assert_eq!(e.code(), ErrorCode::BadRequest);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(m.snapshot().0.is_empty());
+    m.shutdown().await;
+}
+
+/// The daemon stopped after the file was finished but before it was verified (stored
+/// as active; the file and its sidecar on disk): after a restart it is verified.
+#[tokio::test]
+async fn restart_between_completion_and_verification_verifies() {
+    let env = Env::new();
+    let len = 256 * KIB;
+    let s = server(|c| c.len = len).await;
+    let m = env.manager(3).await;
+    let mut req = env.req(&s, "a.bin");
+    // A mismatch leaves the same files as a stop before verifying: file + sidecar.
+    req.checksum = Some(wrong_sha256());
+    let id = m.add(req, false, None).await.unwrap();
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
+    m.shutdown().await;
+    drop(m);
+    let path = env.dl_dir().join("a.bin");
+    assert!(puppy_core::http::resume::sidecar_path(&path).exists());
+
+    // Rewrite the state as it would have been while verifying (with the right digest).
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.state_path()).unwrap()).unwrap();
+    let rec = &mut v["downloads"][0];
+    rec["state"] = serde_json::json!({"kind": "active"});
+    rec["request"]["checksum"] = serde_json::to_value(sha256_of(len)).unwrap();
+    std::fs::write(env.state_path(), serde_json::to_vec(&v).unwrap()).unwrap();
+    let before = s.requests_seen().len();
+
+    let m = env.manager(3).await;
+    let mut rx = m.events();
+    wait_completed(&m, id).await;
+    assert_eq!(
+        snap(&m, id).verification(),
+        Some(puppy_proto::Verification::Verified)
+    );
+    assert!(!puppy_core::http::resume::sidecar_path(&path).exists());
+    assert_eq!(
+        s.requests_seen().len(),
+        before,
+        "verified without the network"
+    );
+    assert_file(&path, len, 0);
+    let ev = next_event(&mut rx, |e| matches!(e, Event::Completed { .. })).await;
+    assert!(matches!(ev, Event::Completed { id: i, .. } if i == id));
+    m.shutdown().await;
+}
+
+/// A stored mismatch survives a restart and `resume` checks the file again.
+#[tokio::test]
+async fn stored_mismatch_resumes_into_a_new_check() {
+    let env = Env::new();
+    let len = 256 * KIB;
+    let s = server(|c| c.len = len).await;
+    let m = env.manager(3).await;
+    let mut req = env.req(&s, "a.bin");
+    req.checksum = Some(wrong_sha256());
+    let id = m.add(req, false, None).await.unwrap();
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
+    m.shutdown().await;
+    drop(m);
+    let m = env.manager(3).await;
+    // Restored still failed, with its reason.
+    wait_until(&m, "restored", |l| {
+        l.iter()
+            .any(|d| d.id == id && d.verification() == Some(puppy_proto::Verification::Mismatch))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        snap(&m, id).verification(),
+        Some(puppy_proto::Verification::Mismatch)
+    );
+    m.resume(id).await.unwrap();
+    wait_state(&m, id, |s| matches!(s, WireState::Failed { .. })).await;
     m.shutdown().await;
 }

@@ -5,7 +5,9 @@ use super::output::{err, json, out};
 use super::seed;
 use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
+use puppy_core::checksum::Checksum;
 use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, Source};
+use puppy_proto::{ReplyData, Request};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
 use puppy_tui::format::parse_rate;
 use serde::Serialize;
@@ -25,6 +27,8 @@ pub struct AddArgs {
     pub headers: Vec<String>,
     pub cookie: Option<String>,
     pub referer: Option<String>,
+    /// `--checksum ALGO=HEX` (one HTTP(S) source only).
+    pub checksum: Option<String>,
     /// `--files` specs (torrents only): numbers, ranges and globs.
     pub files: Vec<String>,
     /// `--choose`: wait for `puppy select` (torrents only).
@@ -201,10 +205,27 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         }
     };
     let seed = seed::policy(args.seed_ratio.as_deref(), args.seed_time.as_deref())?;
+    let checksum = match args.checksum.as_deref() {
+        Some(c) => Some(
+            c.parse::<Checksum>()
+                .map_err(|e| CliError::Usage(format!("bad --checksum {c:?}: {e}")))?,
+        ),
+        None => None,
+    };
+    if checksum.is_some() && args.sources.len() != 1 {
+        return Err(CliError::Usage(
+            "--checksum needs exactly one source: one digest cannot match several files".into(),
+        ));
+    }
     let sources = expand_sources(args.sources)?;
     if args.name.is_some() && sources.len() != 1 {
         return Err(CliError::Usage(
             "--name needs exactly one source".to_string(),
+        ));
+    }
+    if checksum.is_some() && sources.len() != 1 {
+        return Err(CliError::Usage(
+            "--checksum needs exactly one source: one digest cannot match several files".into(),
         ));
     }
     let context = RequestContext {
@@ -249,6 +270,17 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         }
     }
 
+    if checksum.is_some()
+        && let Some((shown, _)) = parsed
+            .iter()
+            .find(|(_, s)| !matches!(s, Source::Http { .. }))
+    {
+        return Err(CliError::Usage(format!(
+            "--checksum only applies to HTTP(S) downloads, but {shown} is a torrent \
+             (BitTorrent verifies every piece already)"
+        )));
+    }
+
     let mut added = Vec::new();
     if !parsed.is_empty() {
         let client = ctx.client().await?;
@@ -260,8 +292,13 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                 context: context.clone(),
                 files: choice.clone(),
                 seed: seed.clone(),
+                checksum: checksum.clone(),
             };
-            match client.add(req, args.paused, limit).await {
+            let result = match client.add(req, args.paused, limit).await {
+                Ok(id) if checksum.is_some() => check_checksum_kept(&client, id).await,
+                r => r.map_err(Into::into),
+            };
+            match result {
                 Ok(id) => {
                     if !ctx.json {
                         out(format_args!(
@@ -276,10 +313,10 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                     // The daemon refused the request itself (e.g. `--files 9` past the
                     // last file of a torrent): a usage problem, not a failed attempt.
                     let code = match e {
-                        super::ClientError::Daemon {
+                        AddError::Client(super::ClientError::Daemon {
                             code: puppy_proto::ErrorCode::BadRequest,
                             ..
-                        } => 2,
+                        }) => 2,
                         _ => 1,
                     };
                     failed.push(Failed {
@@ -305,6 +342,43 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         failed,
         code,
     })
+}
+
+/// Why one source was not added.
+#[derive(Debug, thiserror::Error)]
+enum AddError {
+    #[error(transparent)]
+    Client(#[from] super::ClientError),
+    #[error(
+        "the running puppy daemon is too old to verify checksums (download removed); \
+         run `puppy stop` and try again"
+    )]
+    NoChecksumSupport,
+}
+
+/// A daemon older than checksums ignores the field: the download it added would never
+/// be verified. Its snapshot then has no checksum; such a download is removed again.
+async fn check_checksum_kept(
+    client: &puppy_client::Client,
+    id: DownloadId,
+) -> Result<DownloadId, AddError> {
+    let kept = match client.call(Request::Get { id }).await? {
+        ReplyData::Download { download, .. } => download.checksum.is_some(),
+        _ => false,
+    };
+    if kept {
+        return Ok(id);
+    }
+    if let Err(e) = client
+        .call(Request::Remove {
+            id,
+            delete_files: true,
+        })
+        .await
+    {
+        err(format_args!("puppy: removing download {id}: {e}"));
+    }
+    Err(AddError::NoChecksumSupport)
 }
 
 #[cfg(test)]

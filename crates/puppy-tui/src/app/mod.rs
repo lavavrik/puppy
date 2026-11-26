@@ -354,6 +354,7 @@ fn describe(state: &WireState) -> &'static str {
         WireState::Queued => "a queued download",
         WireState::Starting => "a starting download",
         WireState::Active => "an active download",
+        WireState::Verifying => "a download being verified",
         WireState::Paused => "a paused download",
         WireState::Completed => "a completed download",
         WireState::ChoosingFiles => "a download waiting for a file choice",
@@ -1551,6 +1552,7 @@ mod tests {
             next_retry_unix: None,
             note: None,
             seed: None,
+            checksum: None,
         }
     }
 

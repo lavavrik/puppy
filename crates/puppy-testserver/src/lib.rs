@@ -15,6 +15,22 @@ pub fn body_byte(i: u64, version: u32) -> u8 {
     ((i * 31 + 7 + version as u64 * 13) % 251) as u8
 }
 
+/// The SHA-256 (lowercase hex) of the first `len` bytes of the body at `version`.
+pub fn body_sha256(len: u64, version: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut chunk = Vec::with_capacity(1 << 16);
+    for i in 0..len {
+        chunk.push(body_byte(i, version));
+        if chunk.len() == chunk.capacity() {
+            h.update(&chunk);
+            chunk.clear();
+        }
+    }
+    h.update(&chunk);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerCfg {
     pub len: u64,

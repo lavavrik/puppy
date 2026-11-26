@@ -16,19 +16,23 @@ use crate::format::{parse_rate, rate_input};
 pub const ADD_EMPTY_SOURCE: &str = "enter a URL, magnet link or .torrent path";
 pub const ADD_BAD_SOURCE: &str = "not a URL, magnet link or .torrent file";
 pub const ADD_BAD_DIR: &str = "use an absolute folder path";
+pub const ADD_CHECKSUM_NOT_HTTP: &str =
+    "a checksum only applies to HTTP(S) downloads (BitTorrent verifies its pieces)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddField {
     Source,
     Dir,
+    Checksum,
     Paused,
     Ok,
 }
 
 impl AddField {
-    const ORDER: [AddField; 4] = [
+    const ORDER: [AddField; 5] = [
         AddField::Source,
         AddField::Dir,
+        AddField::Checksum,
         AddField::Paused,
         AddField::Ok,
     ];
@@ -49,6 +53,8 @@ pub struct AddForm {
     pub source: TextInput,
     /// Output directory; empty ⇒ the daemon's default.
     pub dir: TextInput,
+    /// Optional `ALGO=HEX` (HTTP only); empty ⇒ no check.
+    pub checksum: TextInput,
     pub focus: AddField,
     pub start_paused: bool,
     pub error: Option<String>,
@@ -61,6 +67,7 @@ impl Default for AddForm {
         Self {
             source: TextInput::new(),
             dir: TextInput::new(),
+            checksum: TextInput::new(),
             focus: AddField::Source,
             start_paused: false,
             error: None,
@@ -163,6 +170,7 @@ impl AddForm {
         match self.focus {
             AddField::Source => Some(&mut self.source),
             AddField::Dir => Some(&mut self.dir),
+            AddField::Checksum => Some(&mut self.checksum),
             AddField::Paused | AddField::Ok => None,
         }
     }
@@ -212,6 +220,16 @@ impl AddForm {
             Ok(d) => d,
             Err(e) => return self.fail(AddField::Dir, e),
         };
+        let checksum = match unquote(&self.checksum.value) {
+            "" => None,
+            _ if !matches!(source, Source::Http { .. }) => {
+                return self.fail(AddField::Checksum, ADD_CHECKSUM_NOT_HTTP.into());
+            }
+            spec => match spec.parse::<puppy_core::checksum::Checksum>() {
+                Ok(c) => Some(c),
+                Err(e) => return self.fail(AddField::Checksum, format!("bad checksum: {e}")),
+            },
+        };
         // The dashboard asks which files of a multi-file torrent to download.
         let files = match source {
             Source::Magnet { .. } | Source::TorrentFile { .. } => FileChoice::Ask,
@@ -225,6 +243,7 @@ impl AddForm {
                 context: RequestContext::default(),
                 files,
                 seed: None,
+                checksum,
             },
             start_paused: self.start_paused,
         })

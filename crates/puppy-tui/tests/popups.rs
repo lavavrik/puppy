@@ -48,6 +48,7 @@ fn snap(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         next_retry_unix: None,
         note: None,
         seed: None,
+        checksum: None,
     }
 }
 
@@ -318,7 +319,7 @@ fn tab_cycles_focus() {
     let (mut a, now) = connected(vec![]);
     a.update(ch('a'), now);
     let mut seen = vec![add_form(&a).focus];
-    for _ in 0..4 {
+    for _ in 0..5 {
         a.update(key(KeyCode::Tab), now);
         seen.push(add_form(&a).focus);
     }
@@ -327,6 +328,7 @@ fn tab_cycles_focus() {
         [
             AddField::Source,
             AddField::Dir,
+            AddField::Checksum,
             AddField::Paused,
             AddField::Ok,
             AddField::Source
@@ -341,6 +343,7 @@ fn tab_cycles_focus() {
     let r = render(&mut a, 100, 30);
     assert!(find(&r, "[x] start paused").is_some(), "{r:#?}");
     // Enter on any field submits.
+    a.update(key(KeyCode::BackTab), now);
     a.update(key(KeyCode::BackTab), now);
     a.update(key(KeyCode::BackTab), now);
     typed(&mut a, "https://x.org/a", now);
@@ -735,4 +738,56 @@ fn popup_cursor_follows_focused_input() {
     a.update(ch('d'), now);
     let term = render_term(&mut a, 100, 30);
     assert!(!term.backend().cursor_visible());
+}
+
+#[test]
+fn add_form_takes_an_optional_checksum() {
+    use puppy_core::checksum::HashAlgo;
+    use puppy_tui::app::forms::ADD_CHECKSUM_NOT_HTTP;
+    // Empty: no check.
+    let mut f = AddForm::with_source("https://example.com/a.iso");
+    match f.submit() {
+        Some(Cmd::Add { request, .. }) => assert_eq!(request.checksum, None),
+        c => panic!("{c:?}"),
+    }
+    let hex = "AB".repeat(32);
+    f.checksum = TextInput::with_value(&format!(" sha256={hex} "));
+    match f.submit() {
+        Some(Cmd::Add { request, .. }) => {
+            let c = request.checksum.unwrap();
+            assert_eq!((c.algo, c.hex), (HashAlgo::Sha256, hex.to_lowercase()));
+        }
+        c => panic!("{c:?}"),
+    }
+    f.checksum = TextInput::with_value("sha-256=abc");
+    assert!(f.submit().is_none());
+    assert_eq!(
+        (f.error_on, f.focus),
+        (AddField::Checksum, AddField::Checksum)
+    );
+    assert!(
+        f.error.as_deref().unwrap().starts_with("bad checksum: "),
+        "{f:?}"
+    );
+    let mut t = AddForm::with_source("magnet:?xt=urn:btih:abc");
+    t.checksum = TextInput::with_value(&format!("sha-256={hex}"));
+    assert!(t.submit().is_none());
+    assert_eq!(t.error.as_deref(), Some(ADD_CHECKSUM_NOT_HTTP));
+
+    // Rendered under "Save to", the error under its field.
+    let (mut a, now) = connected(vec![]);
+    a.update(ch('a'), now);
+    typed(&mut a, "https://example.com/a.iso", now);
+    a.update(key(KeyCode::Tab), now);
+    a.update(key(KeyCode::Tab), now);
+    typed(&mut a, "md5=1", now);
+    assert!(a.update(key(KeyCode::Enter), now).is_empty());
+    let r = render(&mut a, 100, 30);
+    let label = find(&r, "Checksum (optional").unwrap_or_else(|| panic!("{r:#?}"));
+    assert!(label > find(&r, "Save to").unwrap());
+    let err = find(&r, "bad checksum").unwrap_or_else(|| panic!("{r:#?}"));
+    assert!(
+        err > label && err < find(&r, "start paused").unwrap(),
+        "{r:#?}"
+    );
 }

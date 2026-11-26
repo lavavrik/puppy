@@ -109,6 +109,7 @@ mod tests {
             next_retry_unix: None,
             note: None,
             seed: None,
+            checksum: None,
         }
     }
 

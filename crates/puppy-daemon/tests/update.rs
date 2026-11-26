@@ -336,6 +336,7 @@ mod daemon {
                 context: RequestContext::default(),
                 files: Default::default(),
                 seed: None,
+                checksum: None,
             }
         }
 
