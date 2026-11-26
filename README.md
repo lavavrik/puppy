@@ -15,7 +15,9 @@ Early development (v0.1.1). What works today:
   default) with robust resume. A resumed file is revalidated against the
   server (ETag / Last-Modified, or a byte comparison when the server offers
   neither) and is never silently continued if the remote file changed.
-  Retries with backoff, per-download and global speed limits, proxies.
+  Retries with backoff, per-download and global speed limits, proxies. One
+  file can come from several mirrors at once, with failover between them
+  (see [Mirrors](#mirrors)).
 - **Daemon**: a single instance per user owns the queue (3 active at a time by
   default), with atomically persisted state, a versioned JSON protocol,
   graceful shutdown, and an idle exit when started on demand.
@@ -214,6 +216,7 @@ puppy add - < urls.txt                      # one source per line from stdin (# 
 puppy add -i list.txt                       # an aria2-style input file, with per-download options
 puppy add --wait URL                        # add, then wait like `puppy wait`
 puppy add --checksum sha-256=9f86d0… URL    # check the finished file against this digest
+puppy add --mirror URL2 --mirror URL3 URL   # one file from several places at once
 puppy add --files 1,3-5 --files '*.mkv' T   # torrent: only these files (1-based numbers, ranges, globs)
 puppy add --choose T                        # torrent: wait for `puppy select` to pick the files
 puppy add --seed-ratio 2 --seed-time 6h T   # torrent: seeding limits for this one (`default` inherits)
@@ -370,6 +373,13 @@ https://example.com/b.iso
 | `seed-ratio` | torrent: as `--seed-ratio` |
 | `seed-time` | torrent: a number is minutes, as in aria2; `90m`, `2h` and `default` work too |
 
+A URI line may hold several URIs of the same file separated by TABs, as in
+aria2: the first is the download's source and the others are its mirrors, as
+with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an `http://` or
+`https://` URL and the first URI an HTTP(S) one; anything else is a usage
+error for that line. `--mirror` on the command line adds its URLs after the
+line's own.
+
 The flags on the command line are defaults for every download of the file,
 and an entry's options override them: `-o`, `--limit`, `--paused`, `--files`,
 `--seed-ratio`/`--seed-time` and `--referer` are replaced, and an entry's
@@ -386,12 +396,87 @@ up with half a list queued: an option line before the first URI, one without
 `=`, an empty or bad value for one of the options above, an unknown source, `checksum` on a torrent, a
 torrent option on an HTTP(S) download, or `pause=true` with `--wait`. Every
 problem is reported with its line (`puppy: list.txt: line 7: bad
-max-download-limit "fast": ...`). A line with several TAB-separated URIs
-(aria2's mirrors of one file) is also refused for now: puppy does not download
-from mirrors yet. `seed-time=0`, which in aria2 means "do not seed", is
+max-download-limit "fast": ...`). `seed-time=0`, which in aria2 means "do not seed", is
 refused as well, since puppy's `0` would mean the opposite (never stop). What
 the daemon refuses once the file is valid (for example a `select-file` number
 past a torrent's last file) fails that download only, as with several sources.
+
+### Mirrors
+
+`add --mirror URL` (repeatable) gives an HTTP(S) download other places to get
+the same file from; the source stays its primary URL. It needs exactly one
+HTTP(S) source, like `--name`. Mirrors are `http://` or `https://` URLs; a
+torrent with mirrors is refused.
+
+When the download starts, puppy probes the primary and every mirror at once.
+The file is what the primary says it is (its size and name); if the primary
+does not answer, the first mirror that does decides. A location is dropped,
+with its reason, if its probe fails, if it reports another size, or if it does
+not honour range requests while others do. If no location honours ranges, or
+the size is unknown (so nothing can be compared), one stream goes to the first
+location that answered and the rest are dropped. The download fails only if
+no location answers at all; it fails transiently (and is retried) if one of
+them failed with an error that may go away.
+
+The connection count (`connections`, 8 by default) is the total over all
+mirrors. Each new connection goes to the usable mirror with the fewest
+connections, so 8 connections over two mirrors are 4 and 4; between equally
+loaded mirrors, the one that is faster per connection wins. Work stealing
+then favours fast mirrors by itself: a connection that finishes its range
+early takes half of the largest range still running, and the freed connection
+goes back to the least loaded mirror, usually the fast one. There is no
+separate per-host limit: without mirrors puppy already opens all 8
+connections to one host, and a download whose other mirrors failed keeps that.
+
+A connection that fails on an error that may go away (network error, timeout,
+5xx, 429, 408) hands its range back at once, and the range continues on
+another usable mirror. The failing mirror is benched: it gets no new
+connections for the usual retry backoff, which grows with each failure in a
+row; its other connections carry on, and their failures during the bench
+count as the same outage. A mirror that fails `max_retries` (8) times in a row
+without progress, refuses the request (401, 403, 404, 410: an expired
+redirect target is re-resolved first, as without mirrors), sends another file
+(its `If-Range` no longer matches, or another size) or stops honouring ranges
+is dropped. The download fails only when no mirror is left: transiently if
+one of them kept failing on such errors, with a reason naming each mirror and
+why it went (`no mirror works: a.example: HTTP 404; b.example: retries
+exhausted: HTTP 503`), as needing attention if one serves a changed file, and
+otherwise for good. `resume` (and the automatic retry of a transient failure)
+tries every mirror again.
+
+Each location is validated on its own, since mirrors have their own ETag and
+Last-Modified. Every request to a location carries that location's own
+validator as `If-Range`, and the resume sidecar records each location's
+final URL and validators. On resume (also after a restart) every location is
+checked against the partial file as a download without mirrors is: with a
+strong ETag by `If-Range`, otherwise by its size and a byte comparison of
+already downloaded parts, whichever mirror they came from. A location without
+any validator recorded is probed first and then compared byte for byte. A
+location whose file changed is dropped and never asked for another byte; the
+download continues from the ones proven unchanged, and needs attention
+(`remote changed`) only when every location changed. A location that cannot
+be checked (it does not answer) is left out until the next resume; if none
+can be checked, the resume fails transiently.
+
+Mirrors that agree on the size may still serve different bytes. Give a
+`--checksum` with mirrors: puppy warns on stderr when there is none, but adds
+the download anyway. A daemon from before mirrors ignores them and downloads
+from the primary only; `add` warns about that.
+
+`-H`, `--cookie` and `--referer` (and a browser's cookies) belong to the
+primary's site. A mirror on the primary's own origin (scheme, host and port)
+gets them; a mirror on another origin gets none of them, no basic-auth
+credentials and no headers at all, only the user agent.
+
+`info` lists every location after `mirrors`: the primary first, then the
+mirrors by priority, each with how it is used (`in use, 4 connections,
+2.1 MiB/s, 30.0 MiB from it`, `failed, retried in 2 s: HTTP 503`, or
+`dropped: its size (4194305 bytes) differs from the file's (4194304 bytes)`).
+The dashboard's detail pane shows the same under `Mirrors`. In `--json`
+snapshots, `"mirrors"` lists the mirror URLs as added; `info --json` has the
+live state in the detail's `"mirrors"`: `{"url","primary","state":{"kind":
+"in_use"|"benched"|"dropped",…},"connections","bps","done_bytes"}`. Both are
+absent for a download without mirrors.
 
 `puppy seed <id>` **replaces the torrent's whole seeding policy**: `--ratio R`
 and `--time DUR` (`90m`, `2h`, ...) set a limit, `0` turns that limit off, and
@@ -581,7 +666,9 @@ so no network port is opened. Firefox is not supported yet.
 - Cookies are read for the original URL only. If that URL redirects to another
   origin (a different scheme, host or port), the target gets none of them, and
   no basic-auth credentials or `Cookie`/`Authorization` headers either. A
-  download whose redirect target needs a login fails in puppy.
+  download whose redirect target needs a login fails in puppy. The extension
+  never adds mirrors; a mirror added otherwise gets none of a download's
+  cookies unless it is on the same origin.
 - CHIPS partitioned cookies are not read below Chrome 119.
 - "Ask where to save each file" is not mirrored: files go to puppy's folder.
 - Re-downloading a completed download after a post-completion recheck failure
