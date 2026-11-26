@@ -263,7 +263,8 @@ async fn add_metalink(
             b => b.clone(),
         };
         let request = Request::Add {
-            request: f.request(dir, &context, loaded.document.as_ref()),
+            // SFTP logins try this terminal's agent first.
+            request: puppy_client::with_ssh_agent(loaded.request(f, dir, &context)),
             start_paused,
             limit: None,
         };

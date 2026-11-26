@@ -763,10 +763,13 @@ extra request for every URL to look at its `Content-Type`. An `ftp://` or
 
 The metalink is read, or fetched, by `puppy add` itself, before anything is
 queued, and each file goes to the daemon as an ordinary download (so a
-daemon older than this works too). The fetch sends `-H`, `--cookie`,
-`--referer` and an entry's `header`, `referer` and `user-agent` options, goes
-through the configured `proxy`, follows up to 10 redirects and must finish
-within 60 s. If it fails, or the document is not a usable metalink, the source
+daemon older than this works too). The fetch goes through the configured
+`proxy`, follows up to 10 redirects and must finish within 60 s. `-H`,
+`--cookie`, `--referer` and an entry's `header` and `referer` options are sent
+only to the origin (scheme, host and port) of the URL you gave; a redirect to
+any other origin gets the user agent alone. A redirect from HTTPS to plain HTTP
+is refused, since the document supplies the hashes the files are checked
+against. If it fails, or the document is not a usable metalink, the source
 is reported like one that cannot be added (exit 1; `"failed"` in `--json`) and
 none of its files is queued; the other sources are added. The dashboard's add
 form takes a metalink path or URL as well (detected as above, without the
@@ -814,10 +817,14 @@ Options:
   apply to a metalink of one file only: `--name` replaces its name and
   subdirectories, `--checksum` its hash, `--mirror` adds locations. With
   several files they are usage errors (exit 2) and nothing is added.
-- `-H`, `--cookie` and `--referer` belong to the metalink's site: a file whose
-  primary URL is on another origin gets them without cookies and credentials
-  (as after a redirect), and mirrors are treated as in [Mirrors](#mirrors). A
-  local metalink's files get them as given.
+- `-H`, `--cookie` and `--referer` (and an entry's `header` and `referer`)
+  belong to the site of the metalink's URL. A file gets them only if its
+  primary URL is on that origin and the metalink was served from there too,
+  not after a redirect to another origin (that site wrote the list then).
+  Any other file gets the user agent alone, and its mirrors are treated as in
+  [Mirrors](#mirrors). With a local metalink puppy cannot tell which of the
+  hosts it lists they are meant for, so giving any of them (a `User-Agent`
+  header excepted) is a usage error: add the metalink by its URL instead.
 - TAB-separated mirrors on a metalink's input-file line, and torrent-only
   options, are usage errors.
 

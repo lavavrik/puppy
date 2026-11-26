@@ -53,7 +53,7 @@ fn metalink4_mirrorbrain() {
     assert_eq!(f.urls[3].priority, Some(5));
     assert_eq!(f.urls[2].location.as_deref(), Some("cz"));
 
-    let req = f.request(Some(PathBuf::from("/dl")), &RequestContext::default(), None);
+    let req = f.request(Some(PathBuf::from("/dl")), RequestContext::default());
     assert_eq!(
         req.source,
         Source::Http {
@@ -126,8 +126,7 @@ fn multi_file_and_priorities() {
     assert_eq!(b.checksum, None);
     let req = b.request(
         Some(b.path.dir_in(Path::new("/dl"))),
-        &RequestContext::default(),
-        None,
+        RequestContext::default(),
     );
     assert_eq!(req.filename.as_deref(), Some("b.bin"));
     assert_eq!(
@@ -417,25 +416,73 @@ fn detection() {
     assert_eq!(url(&torrent), None);
 }
 
-/// A context for the document's site keeps its cookies only for a primary there.
+/// The user's context is for the URL they gave: it goes only to a primary on that
+/// origin, and only if the document came from there too. Anything else gets the user
+/// agent alone: no cookies, credentials, referer or headers. A local document's context
+/// is as given (credentials are refused with one: `carries_credentials`).
 #[test]
-fn request_context_follows_the_document_origin() {
+fn request_context_follows_the_requested_origin() {
     let doc = v4(r#"<file name="f"><url>https://mirror.example/f</url></file>
-                   <file name="g"><url>https://dl.example/g</url></file>"#);
-    let m = parse(doc.as_bytes()).unwrap();
+                   <file name="g"><url>https://dl.example/g</url></file>
+                   <file name="h"><url>http://dl.example/h</url></file>"#);
+    let metalink = parse(doc.as_bytes()).unwrap();
     let ctx = RequestContext {
         cookies: Some("s=1".into()),
+        headers: vec![("X-Token".into(), "t".into())],
+        referer: Some("https://dl.example/".into()),
+        basic_auth: Some(("u".into(), Some("p".into()))),
         user_agent: Some("ua".into()),
         ..RequestContext::default()
     };
-    let origin = url::Url::parse("https://dl.example/list.meta4").unwrap();
-    let other = m.files[0].request(None, &ctx, Some(&origin));
-    assert_eq!(other.context.cookies, None);
-    assert_eq!(other.context.user_agent.as_deref(), Some("ua"));
-    let same = m.files[1].request(None, &ctx, Some(&origin));
-    assert_eq!(same.context, ctx);
-    let local = m.files[0].request(None, &ctx, None);
-    assert_eq!(local.context, ctx);
+    let ua_only = RequestContext {
+        user_agent: Some("ua".into()),
+        ..RequestContext::default()
+    };
+    let u = |s: &str| url::Url::parse(s).unwrap();
+    let fetched = |requested: &str, final_url: &str| Loaded {
+        metalink: metalink.clone(),
+        document: Some(Document {
+            requested: u(requested),
+            final_url: u(final_url),
+        }),
+    };
+    let files = &metalink.files;
+
+    let direct = fetched("https://dl.example/l.meta4", "https://dl.example/l.meta4");
+    assert_eq!(direct.request(&files[0], None, &ctx).context, ua_only);
+    assert_eq!(direct.request(&files[1], None, &ctx).context, ctx);
+    // http://dl.example is another origin than https://dl.example.
+    assert_eq!(direct.request(&files[2], None, &ctx).context, ua_only);
+
+    // Redirected to another site, which wrote the list: nothing for anyone, not even a
+    // primary on that site or on the requested one.
+    let moved = fetched(
+        "https://dl.example/l.meta4",
+        "https://mirror.example/l.meta4",
+    );
+    for f in files {
+        assert_eq!(moved.request(f, None, &ctx).context, ua_only, "{}", f.path);
+    }
+    // A redirect within the origin changes nothing.
+    let within = fetched(
+        "https://dl.example/l.meta4",
+        "https://dl.example/v2/l.meta4",
+    );
+    assert_eq!(within.request(&files[1], None, &ctx).context, ctx);
+
+    let local = Loaded {
+        metalink: metalink.clone(),
+        document: None,
+    };
+    assert_eq!(local.request(&files[0], None, &ctx).context, ctx);
+
+    assert!(carries_credentials(&ctx));
+    assert!(!carries_credentials(&ua_only));
+    let ua_header = RequestContext {
+        headers: vec![(" user-agent".into(), "x".into())],
+        ..RequestContext::default()
+    };
+    assert!(!carries_credentials(&ua_header));
 }
 
 #[test]

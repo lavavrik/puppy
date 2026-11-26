@@ -1,14 +1,23 @@
 //! Fetching a metalink document over HTTP(S), bounded in size and time.
+//!
+//! Redirects are followed here, not by the HTTP client, so that each hop gets only what
+//! it may: the user's headers, cookies, referer and credentials go to the origin of the
+//! URL the user gave, and a hop on any other origin gets the user agent alone (as a
+//! download's mirror on another origin does). A redirect from HTTPS to plain HTTP is
+//! refused: the document supplies the hashes the downloads are checked against.
 
 use super::{ACCEPT, MAX_DOCUMENT_BYTES, MetalinkError};
 use crate::config::HttpConfig;
-use crate::http::probe::{apply_context, build_client};
+use crate::http::probe::{apply_context, build_client_with};
 use crate::types::{RequestContext, masked_url};
 use reqwest::header;
 use std::time::Duration;
 
 /// The whole fetch (connecting, redirects, the body) must finish within this.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// At most this many redirects are followed.
+const MAX_REDIRECTS: usize = 10;
 
 /// A fetched document.
 #[derive(Debug, Clone)]
@@ -20,10 +29,10 @@ pub struct Fetched {
     pub final_url: url::Url,
 }
 
-/// GETs `url` with `context` (headers, cookies, user agent) through `cfg`'s proxy and
-/// an `Accept` header asking for Metalink. A body larger than [`MAX_DOCUMENT_BYTES`] is
-/// refused as soon as that shows (from `Content-Length` or while reading). The error is
-/// a sentence for the user.
+/// GETs `url` with `context` (headers, cookies, user agent; on `url`'s origin only, see
+/// the module) through `cfg`'s proxy and an `Accept` header asking for Metalink. A body
+/// larger than [`MAX_DOCUMENT_BYTES`] is refused as soon as that shows (from
+/// `Content-Length` or while reading). The error is a sentence for the user.
 pub async fn fetch(
     cfg: &HttpConfig,
     url: &url::Url,
@@ -39,24 +48,72 @@ pub async fn fetch(
     }
 }
 
+/// Whether a metalink fetch of `requested` may follow a redirect from `current` to
+/// `next`: only to HTTP(S), and never from HTTPS down to plain HTTP.
+fn check_redirect(requested: &url::Url, current: &url::Url, next: &url::Url) -> Result<(), String> {
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(format!(
+            "cannot fetch the metalink: it redirects to a {}: URL",
+            next.scheme()
+        ));
+    }
+    if current.scheme() == "https" && next.scheme() == "http" {
+        return Err(format!(
+            "refused: the metalink at {} redirects from HTTPS to plain HTTP ({}), where its \
+             hashes could be changed on the way",
+            masked_url(requested),
+            masked_url(next)
+        ));
+    }
+    Ok(())
+}
+
 async fn fetch_inner(
     cfg: &HttpConfig,
     url: &url::Url,
     context: &RequestContext,
 ) -> Result<Fetched, String> {
-    let client = build_client(cfg).map_err(|e| e.to_string())?;
-    let mut rb = client.get(url.clone());
-    if !context
-        .headers
-        .iter()
-        .any(|(n, _)| n.trim().eq_ignore_ascii_case("accept"))
-    {
-        rb = rb.header(header::ACCEPT, ACCEPT);
-    }
-    let mut resp = apply_context(rb, context)
-        .send()
-        .await
-        .map_err(|e| format!("cannot fetch the metalink: {e}"))?;
+    let client =
+        build_client_with(cfg, reqwest::redirect::Policy::none()).map_err(|e| e.to_string())?;
+    let mut current = url.clone();
+    let mut redirects = 0;
+    let mut resp = loop {
+        // Everything on the given URL's origin; the user agent alone elsewhere.
+        let ctx = context.for_mirror(url, &current);
+        let mut rb = client.get(current.clone());
+        if !ctx
+            .headers
+            .iter()
+            .any(|(n, _)| n.trim().eq_ignore_ascii_case("accept"))
+        {
+            rb = rb.header(header::ACCEPT, ACCEPT);
+        }
+        let resp = apply_context(rb, &ctx)
+            .send()
+            .await
+            .map_err(|e| format!("cannot fetch the metalink: {e}"))?;
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        let Some(location) = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            break resp;
+        };
+        let next = current
+            .join(location.trim())
+            .map_err(|e| format!("cannot fetch the metalink: bad redirect ({e})"))?;
+        check_redirect(url, &current, &next)?;
+        redirects += 1;
+        if redirects > MAX_REDIRECTS {
+            return Err(format!(
+                "cannot fetch the metalink: more than {MAX_REDIRECTS} redirects"
+            ));
+        }
+        current = next;
+    };
     let status = resp.status();
     if !status.is_success() {
         return Err(format!(
@@ -93,4 +150,26 @@ async fn fetch_inner(
         content_type,
         final_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirects_never_downgrade() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let req = u("https://a.example/f.meta4");
+        assert!(check_redirect(&req, &req, &u("https://b.example/f.meta4")).is_ok());
+        let e = check_redirect(&req, &req, &u("http://a.example/f.meta4")).unwrap_err();
+        assert!(e.contains("from HTTPS to plain HTTP"), "{e}");
+        // Down again after a hop elsewhere: refused too.
+        let mid = u("https://c.example/x");
+        assert!(check_redirect(&req, &mid, &u("http://c.example/y")).is_err());
+        // Plain HTTP from the start: the user chose it.
+        let plain = u("http://a.example/f.meta4");
+        assert!(check_redirect(&plain, &plain, &u("http://b.example/f")).is_ok());
+        assert!(check_redirect(&plain, &plain, &u("https://b.example/f")).is_ok());
+        assert!(check_redirect(&req, &req, &u("file:///etc/passwd")).is_err());
+    }
 }

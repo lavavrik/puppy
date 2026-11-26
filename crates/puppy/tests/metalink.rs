@@ -517,3 +517,57 @@ async fn sftp_and_http_mirrors() {
     assert!(sftp.opens() > 0, "the SFTP location was not used");
     assert!(h.range_requests() > 0, "the HTTP location was not used");
 }
+
+/// Cookies, headers and a referer cannot be scoped to a site for a local metalink:
+/// refused (exit 2, nothing added); a user agent is fine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credentials_with_a_local_metalink_are_refused() {
+    let env = Env::new();
+    let s = server(64 * KIB).await;
+    let ml = write(
+        &env,
+        "local.meta4",
+        &meta4(&[(
+            "l.bin",
+            64 * KIB,
+            None,
+            vec![s.url("/file.bin").to_string()],
+        )]),
+    );
+    let ml = ml.to_str().unwrap();
+    for extra in [
+        vec!["--cookie", "sid=X"],
+        vec!["-H", "Authorization: Bearer T"],
+        vec!["-H", "X-Custom: c"],
+        vec!["--referer", "https://a.example/"],
+    ] {
+        let mut args = vec!["add", "--paused"];
+        args.extend(&extra);
+        args.push(ml);
+        let (status, _, err) = env.run(&args);
+        assert_eq!(status.code(), Some(2), "{extra:?}: {err}");
+        assert!(err.contains("do not go with a local metalink"), "{err}");
+    }
+    let list = write(&env, "l.txt", &format!("{ml}\n  header=X-Custom: c\n"));
+    let (status, _, err) = env.run(&["add", "--paused", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("line 1: --cookie"), "{err}");
+    assert_eq!(ids(&env), 0);
+
+    let dl = env.dl_dir();
+    let (status, _, err) = env.run(&[
+        "add",
+        "--wait",
+        "-o",
+        dl.to_str().unwrap(),
+        "-H",
+        "User-Agent: custom-agent",
+        ml,
+    ]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let seen = s.requests_seen();
+    assert!(
+        seen.iter().all(|h| h["user-agent"] == "custom-agent"),
+        "{seen:?}"
+    );
+}

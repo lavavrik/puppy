@@ -346,23 +346,10 @@ fn interpret(el: &Element, ns: Option<&str>, version: Version) -> Result<MetaFil
 impl MetaFile {
     /// This file's download: from its best URL with the others as mirrors, into
     /// `output_dir` (the caller adds the file's subdirectories: [`SafePath::dir_in`]),
-    /// under its name, with its checksum and size.
-    ///
-    /// `context` (the user's headers and cookies) is for the metalink's own site: if the
-    /// document came from `document` (its final URL), a primary on another origin gets
-    /// it without cookies and credentials, as a redirect would. A local document's
-    /// context is used as given.
-    pub fn request(
-        &self,
-        output_dir: Option<PathBuf>,
-        context: &RequestContext,
-        document: Option<&url::Url>,
-    ) -> AddRequest {
+    /// under its name, with its checksum and size, and `context` as given (see
+    /// [`Loaded::request`], which scopes it).
+    pub fn request(&self, output_dir: Option<PathBuf>, context: RequestContext) -> AddRequest {
         let primary = self.urls[0].url.clone();
-        let context = match document {
-            Some(doc) => context.for_target(doc, &primary),
-            None => context.clone(),
-        };
         AddRequest {
             source: Source::Http { url: primary },
             output_dir,
@@ -434,11 +421,62 @@ pub fn detect(s: &str, force: bool) -> Result<Option<Location>, String> {
     Ok(None)
 }
 
-/// A metalink read or fetched: the document and, when fetched, its final URL.
+/// A metalink read or fetched: the document and, when fetched, where from.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub metalink: Metalink,
-    pub document: Option<url::Url>,
+    pub document: Option<Document>,
+}
+
+/// Where a fetched metalink came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    /// The URL the user gave.
+    pub requested: url::Url,
+    /// The URL after redirects.
+    pub final_url: url::Url,
+}
+
+impl Loaded {
+    /// The context `file`'s download gets, from the user's `context` (headers, cookies,
+    /// referer, credentials). Those were given for the URL the user typed, so they go
+    /// only to a primary on that URL's origin, and only if the document was served from
+    /// that origin too (a redirect elsewhere means another site wrote the URL list). A
+    /// primary anywhere else gets the user agent alone, as a mirror on another origin
+    /// does. A local document's context is used as given: callers refuse credentials
+    /// with one ([`carries_credentials`]).
+    pub fn context_for(&self, file: &MetaFile, context: &RequestContext) -> RequestContext {
+        match &self.document {
+            None => context.clone(),
+            Some(d) if d.requested.origin() == d.final_url.origin() => {
+                context.for_mirror(&d.requested, &file.urls[0].url)
+            }
+            Some(d) => context.for_mirror(&d.requested, &d.final_url),
+        }
+    }
+
+    /// `file`'s download, with its context scoped ([`Loaded::context_for`]).
+    pub fn request(
+        &self,
+        file: &MetaFile,
+        output_dir: Option<PathBuf>,
+        context: &RequestContext,
+    ) -> AddRequest {
+        file.request(output_dir, self.context_for(file, context))
+    }
+}
+
+/// Whether `context` holds anything meant for one site: cookies, a referer, basic-auth
+/// credentials or a header other than `User-Agent`. A local metalink cannot say which of
+/// its hosts that site is.
+pub fn carries_credentials(context: &RequestContext) -> bool {
+    context.cookies.is_some()
+        || context.referer.is_some()
+        || context.basic_auth.is_some()
+        || context
+            .headers
+            .iter()
+            .any(|(n, _)| !n.trim().eq_ignore_ascii_case("user-agent"))
 }
 
 /// Reads (a path) or fetches (a URL, with `context` and `cfg`'s proxy) the metalink at
@@ -481,7 +519,10 @@ pub async fn load(
             };
             Ok(Loaded {
                 metalink,
-                document: Some(got.final_url),
+                document: Some(Document {
+                    requested: url.clone(),
+                    final_url: got.final_url,
+                }),
             })
         }
     }

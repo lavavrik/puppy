@@ -21,6 +21,15 @@ pub struct RemoteInfo {
 }
 
 pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
+    build_client_with(cfg, reqwest::redirect::Policy::limited(10))
+}
+
+/// [`build_client`] with another redirect policy (a metalink fetch follows redirects
+/// itself, to decide what each hop gets).
+pub(crate) fn build_client_with(
+    cfg: &HttpConfig,
+    redirect: reqwest::redirect::Policy,
+) -> Result<Client, EngineError> {
     let mut defaults = HeaderMap::new();
     defaults.insert(
         header::ACCEPT_ENCODING,
@@ -31,7 +40,7 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client, EngineError> {
         // HTTP/2 would multiplex every segment request over one TCP connection, defeating
         // multi-connection downloads (per-connection throttling is what they work around).
         .http1_only()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(redirect)
         // On a redirect reqwest would replace the caller's Referer with the full previous
         // URL, query included (a signed token, say), and send it to the next host. Keep
         // the caller's own Referer header instead (browsers send at most the origin).

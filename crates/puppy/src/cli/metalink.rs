@@ -119,6 +119,18 @@ pub(super) async fn expand(
 ) -> Result<Result<Vec<Planned>, String>, CliError> {
     let o = &p.options;
     let context = defaults.context_for(o);
+    if matches!(p.location, Location::Path(_)) && metalink::carries_credentials(&context) {
+        let at = p
+            .origin
+            .as_deref()
+            .map_or(String::new(), |o| format!("{o}: "));
+        return Err(CliError::Usage(format!(
+            "{at}--cookie, --header and --referer (and an entry's header and referer) do not \
+             go with a local metalink ({}): puppy cannot tell which of the hosts it lists \
+             they are meant for. Give the metalink's URL instead, so they go to its site only",
+            p.shown
+        )));
+    }
     let loaded = match metalink::load(&p.location, env.http(), &context).await {
         Ok(l) => l,
         Err(e) => return Ok(Err(e)),
@@ -172,7 +184,7 @@ pub(super) async fn expand(
             };
             Some(f.path.dir_in(&base))
         };
-        let mut req = f.request(output_dir, &context, loaded.document.as_ref());
+        let mut req = loaded.request(f, output_dir, &context);
         if let Some(n) = &name {
             req.filename = Some(n.clone());
         }
