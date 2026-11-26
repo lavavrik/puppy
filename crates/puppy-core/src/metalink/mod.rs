@@ -56,9 +56,11 @@ pub const NS_V3: &str = "http://www.metalinker.org/";
 /// The media types a server labels Metalink documents with (4, then 3).
 pub const MEDIA_TYPES: [&str; 2] = ["application/metalink4+xml", "application/metalink+xml"];
 
-/// The `Accept` header of a metalink fetch: Metalink preferred, anything else accepted
-/// (MirrorBrain servers answer a file's URL with its Metalink when asked so).
-pub const ACCEPT: &str = "application/metalink4+xml, application/metalink+xml;q=0.9, */*;q=0.1";
+/// The `Accept` header of a metalink fetch. MirrorBrain and MirrorCache servers answer a
+/// file's own URL with its metalink when asked so; MirrorCache serves the file instead
+/// (even at its `.meta4` URL) as soon as `*/*` is accepted too, so it is not. Servers
+/// that do not negotiate send what they have anyway.
+pub const ACCEPT: &str = "application/metalink4+xml, application/metalink+xml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {

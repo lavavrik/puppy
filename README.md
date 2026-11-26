@@ -750,9 +750,11 @@ with its own id.
 `--metalink` reads every source as a metalink: any HTTP(S) URL (for one that
 serves a metalink under another name, such as
 `https://mirrors.fedoraproject.org/metalink?repo=…`) and any file. A URL is
-always fetched with `Accept: application/metalink4+xml,
-application/metalink+xml;q=0.9, */*;q=0.1`, so MirrorBrain servers (openSUSE's
-`download.opensuse.org`) answer even a file's own URL with its metalink.
+always fetched with `Accept: application/metalink4+xml, application/metalink+xml`,
+so MirrorBrain and MirrorCache servers (openSUSE's `download.opensuse.org`)
+answer even a file's own URL with its metalink. (`*/*` is deliberately not
+accepted as well: MirrorCache then sends the file itself, even at its `.meta4`
+URL.)
 `--no-metalink` turns detection off: a `.meta4` source is then downloaded as a
 file. Without either flag, an HTTP(S) URL that does not end in `.meta4` or
 `.metalink` is downloaded as a file whatever it serves: puppy does not make an
