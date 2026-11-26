@@ -26,6 +26,9 @@ Early development (v0.1.1). What works today:
   connections at once, logging in with ssh-agent, key files or a password in
   the URL, and host keys checked against `known_hosts` (`puppy ssh trust` to
   add one). See [SFTP](#sftp).
+- **Metalink**: `.meta4` (RFC 5854) and Metalink 3 `.metalink` documents, local
+  or fetched, become one download per file, from its mirrors at once, checked
+  against its size and strongest hash. See [Metalink](#metalink).
 - **Daemon**: a single instance per user owns the queue (3 active at a time by
   default), with atomically persisted state, a versioned JSON protocol,
   graceful shutdown, and an idle exit when started on demand.
@@ -228,6 +231,8 @@ puppy add -i list.txt                       # an aria2-style input file, with pe
 puppy add --wait URL                        # add, then wait like `puppy wait`
 puppy add --checksum sha-256=9f86d0… URL    # check the finished file against this digest
 puppy add --mirror URL2 --mirror URL3 URL   # one file from several places at once
+puppy add -o ~/isos a.iso.meta4             # every file of a metalink (file or URL)
+puppy add --metalink 'https://mirrors.example/metalink?repo=x'  # a URL that serves one
 puppy add --files 1,3-5 --files '*.mkv' T   # torrent: only these files (1-based numbers, ranges, globs)
 puppy add --choose T                        # torrent: wait for `puppy select` to pick the files
 puppy add --seed-ratio 2 --seed-time 6h T   # torrent: seeding limits for this one (`default` inherits)
@@ -262,7 +267,9 @@ JSON value (`watch` excepted):
   `update`: `{"status":…}` (the final update status).
 - `add`: `{"added":[{"id","source"}…],"failed":[{"source","error","code"}…]}`;
   with `--wait` also `"final"` (the snapshots once done) and `"missing"`
-  (ids that no longer exist).
+  (ids that no longer exist). A metalink's file has `"source"` (its primary
+  URL), `"name"` (its path below the output folder) and `"metalink"` (the
+  metalink as given).
 - `wait`: `{"final":[…snapshots…],"missing":[ids…]}`.
 - `pause`, `resume`, `restart`, `rm`, `move`, `limit <ID>`: one result per id,
   e.g. `[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`.
@@ -725,6 +732,123 @@ the `proxy` setting, and there is no `ProxyJump` or `~/.ssh/config` support:
 puppy connects to the URL's host and port directly. Retries, speed limits,
 `--checksum`, pause, resume, restart and mirrors work as for HTTP.
 
+### Metalink
+
+A metalink lists one or more files, where to get each and how to check it.
+puppy reads Metalink 4 (RFC 5854, `.meta4`, `application/metalink4+xml`) and
+the older Metalink 3 (`.metalink`, `application/metalink+xml`), which
+Fedora's MirrorManager still serves. Each `<file>` becomes its own download,
+with its own id.
+
+`puppy add` takes a metalink as:
+
+- a local file ending in `.meta4` or `.metalink`, or any file whose content
+  starts with a `<metalink>` element (a `.torrent` file never is one);
+- an `http://` or `https://` URL whose path ends in `.meta4` or `.metalink`;
+- a line of an input file (`-i`) that is either of these.
+
+`--metalink` reads every source as a metalink: any HTTP(S) URL (for one that
+serves a metalink under another name, such as
+`https://mirrors.fedoraproject.org/metalink?repo=…`) and any file. A URL is
+always fetched with `Accept: application/metalink4+xml,
+application/metalink+xml;q=0.9, */*;q=0.1`, so MirrorBrain servers (openSUSE's
+`download.opensuse.org`) answer even a file's own URL with its metalink.
+`--no-metalink` turns detection off: a `.meta4` source is then downloaded as a
+file. Without either flag, an HTTP(S) URL that does not end in `.meta4` or
+`.metalink` is downloaded as a file whatever it serves: puppy does not make an
+extra request for every URL to look at its `Content-Type`. An `ftp://` or
+`sftp://` URL is always downloaded as a file.
+
+The metalink is read, or fetched, by `puppy add` itself, before anything is
+queued, and each file goes to the daemon as an ordinary download (so a
+daemon older than this works too). The fetch sends `-H`, `--cookie`,
+`--referer` and an entry's `header`, `referer` and `user-agent` options, goes
+through the configured `proxy`, follows up to 10 redirects and must finish
+within 60 s. If it fails, or the document is not a usable metalink, the source
+is reported like one that cannot be added (exit 1; `"failed"` in `--json`) and
+none of its files is queued; the other sources are added. The dashboard's add
+form takes a metalink path or URL as well (detected as above, without the
+flags), and adds every file into the form's folder.
+
+How a `<file>` is used:
+
+- **URLs.** Its `<url>`s are the download's locations, best first: by
+  `priority` (1 is best; Metalink 3: by `preference`, 100 is best), then in
+  document order, URLs without one last. The first is the primary, the rest
+  are mirrors (see [Mirrors](#mirrors)), with their `location`. Only
+  `http`, `https`, `ftp`, `ftps`, `ftpes` and `sftp` URLs are kept (the schemes
+  puppy downloads from; others, such as `rsync`, are skipped), at most 16 per
+  file: the engine probes every location when the download starts.
+- **Hashes.** The strongest `<hash>` puppy supports becomes the download's
+  checksum, in the order `sha-512`, `sha-384`, `sha-256`, `sha-224`, `sha-1`,
+  `md5`; types it does not know (`sha3-256`, `ed2k`, …) are skipped. A hash of a
+  known type that is not a valid digest refuses the metalink. A file without a
+  usable hash is downloaded unchecked, with the usual warning when it has
+  mirrors.
+- **Size.** `<size>` is checked against every location when the download
+  starts: one that reports another size is dropped, even the primary, and if
+  every location that answers does, the download fails
+  (`the file is N bytes, not the expected M`). A location that does not report
+  a size is used.
+- **Name.** `<name>` may contain subdirectories (`iso/x86_64/a.iso`), which
+  are created below the output folder (`-o`, an entry's `dir`, or the daemon's
+  download folder). The name comes from a document puppy does not control, so
+  a metalink is refused, whole, if any of its names could leave that folder:
+  an absolute path, a drive letter or UNC prefix, a `..` component (or one of
+  dots and spaces only, which Windows reads as `.` or `..`), a control
+  character (NUL included), more than 32 components or more than 4096 bytes.
+  Each component is then cleaned like any downloaded file name: `<>:"|?*`
+  become `_`, trailing dots and spaces are dropped, Windows device names
+  (`CON`, `nul.txt`, `COM1`, …) get a leading `_`, and components longer than
+  200 bytes are shortened. Two files with the same path (ignoring case) refuse
+  the metalink. As for any download, an existing file is never overwritten:
+  the new one gets a free name next to it.
+
+Options:
+
+- `-o`, `--paused`, `--limit` and `--wait` (and an input-file entry's `dir`,
+  `pause` and `max-download-limit`) apply to every file.
+- `--name`, `--checksum` and `--mirror` (an entry's `out` and `checksum`)
+  apply to a metalink of one file only: `--name` replaces its name and
+  subdirectories, `--checksum` its hash, `--mirror` adds locations. With
+  several files they are usage errors (exit 2) and nothing is added.
+- `-H`, `--cookie` and `--referer` belong to the metalink's site: a file whose
+  primary URL is on another origin gets them without cookies and credentials
+  (as after a redirect), and mirrors are treated as in [Mirrors](#mirrors). A
+  local metalink's files get them as given.
+- TAB-separated mirrors on a metalink's input-file line, and torrent-only
+  options, are usage errors.
+
+`puppy add` prints `added ID PATH` for each file; `--json` lists each in
+`"added"` with its `"name"` and `"metalink"`.
+
+Ignored, by design or for now:
+
+- `<metaurl>` (torrents) and Metalink 3 `type="bittorrent"` URLs: puppy
+  downloads a metalink's files from their plain URLs. A file with only a
+  torrent is refused (`no usable URL (puppy does not use a metalink's
+  torrents)`).
+- `<pieces>` (chunk hashes): the whole-file hash is checked once the file is
+  complete, so a mirror serving bad bytes fails the download (keeping the
+  file) rather than having its ranges fetched again elsewhere.
+- `<signature>`: OpenPGP and other signatures are not verified. Check them
+  yourself if you need to.
+- `<origin dynamic="true">` (the metalink is not fetched again), `<os>`,
+  `<language>`, `<version>`, `<publisher>`, `<description>` and the other
+  descriptive elements, and elements of other namespaces (MirrorManager's
+  `mm0:alternates`, the hashes of older versions of a file, are not the
+  file's).
+- Metalink/HTTP (RFC 6249: `Link: rel=duplicate` and `Digest` response
+  headers) is not used.
+
+The parser is a safe one for documents from the network: a metalink with a
+`<!DOCTYPE>` is refused (Metalink has no use for one), so no DTD, entity
+definition or external entity is ever read; only XML's five predefined
+entities and character references are expanded. A document is at most 4 MiB
+(a larger one is refused from its `Content-Length`, or once that many bytes
+have been read), with at most 1000 files, 1000 URLs per file, nesting 32
+deep and 250000 elements. It must be UTF-8.
+
 ### Configuration
 
 Settings go in `config.toml` (where it lives: see below). Keys:
@@ -901,6 +1025,8 @@ so no network port is opened. Firefox is not supported yet.
   download whose redirect target needs a login fails in puppy. The extension
   never adds mirrors; a mirror added otherwise gets none of a download's
   cookies unless it is on the same origin.
+- A metalink the browser hands over is downloaded as a file, not read: add
+  it with `puppy add` (or the dashboard) to get its files.
 - CHIPS partitioned cookies are not read below Chrome 119.
 - "Ask where to save each file" is not mirrored: files go to puppy's folder.
 - Re-downloading a completed download after a post-completion recheck failure
