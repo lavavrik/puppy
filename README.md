@@ -424,7 +424,9 @@ connections, so 8 connections over two mirrors are 4 and 4; between equally
 loaded mirrors, the one that is faster per connection wins. Work stealing
 then favours fast mirrors by itself: a connection that finishes its range
 early takes half of the largest range still running, and the freed connection
-goes back to the least loaded mirror, usually the fast one. There is no
+goes back to the least loaded mirror, usually the fast one. A mirror that
+becomes usable again (after its backoff, say) while every connection is taken
+gets one moved to it from the busiest mirror. There is no
 separate per-host limit: without mirrors puppy already opens all 8
 connections to one host, and a download whose other mirrors failed keeps that.
 
@@ -435,7 +437,8 @@ connections for the usual retry backoff, which grows with each failure in a
 row; its other connections carry on, and their failures during the bench
 count as the same outage. A mirror that fails `max_retries` (8) times in a row
 without progress, refuses the request (401, 403, 404, 410: an expired
-redirect target is re-resolved first, as without mirrors), sends another file
+redirect target is re-resolved first, for that mirror alone while the others
+keep downloading, and again only after that mirror made progress), sends another file
 (its `If-Range` no longer matches, or another size) or stops honouring ranges
 is dropped. The download fails only when no mirror is left: transiently if
 one of them kept failing on such errors, with a reason naming each mirror and
@@ -452,11 +455,23 @@ checked against the partial file as a download without mirrors is: with a
 strong ETag by `If-Range`, otherwise by its size and a byte comparison of
 already downloaded parts, whichever mirror they came from. A location without
 any validator recorded is probed first and then compared byte for byte. A
-location whose file changed is dropped and never asked for another byte; the
-download continues from the ones proven unchanged, and needs attention
-(`remote changed`) only when every location changed. A location that cannot
-be checked (it does not answer) is left out until the next resume; if none
-can be checked, the resume fails transiently.
+mirror whose file changed is dropped and never asked for another byte; the
+download continues from the locations proven unchanged. If the primary's file
+changed (and the primary has an ETag or Last-Modified, so this is certain),
+the download needs attention (`remote changed`), as without mirrors, even if
+a mirror still serves the old file; it does so too when every location
+changed, at resume or during the download. A location that cannot be checked
+because it does not answer for now is benched, and checked again before it
+gets a range; if none can be checked, the resume fails transiently.
+
+A location without validators (neither ETag nor Last-Modified) cannot be
+checked with `If-Range`. Before each range it is given, puppy compares the
+last bytes (64 KiB) of the largest part already downloaded against what that
+location serves there, and drops it if they differ. Until there are such
+bytes it waits, unless no location has validators at all. What this cannot
+catch is such a mirror changing its file in the middle of one response, or
+serving different bytes only outside the compared window: give a
+`--checksum` to be sure.
 
 Mirrors that agree on the size may still serve different bytes. Give a
 `--checksum` with mirrors: puppy warns on stderr when there is none, but adds
