@@ -93,7 +93,8 @@ Download the archive for your platform from the
 | Windows ARM64         | `puppy-<version>-aarch64-pc-windows-msvc.zip`      |
 
 Each archive holds the `puppy` binary, the browser extension (`extension/`),
-the service files (`packaging/`), this README and the licenses. The Linux
+the service files (`packaging/`), shell completions (`completions/`), man
+pages (`man/man1/`), this README and the licenses. The Linux
 builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
 HTTPS trusts the system's CA certificates; on a system without any (a minimal
 container without `ca-certificates`), the daemon falls back to Mozilla's root
@@ -124,6 +125,12 @@ its SHA-256 and install `puppy`:
 
 Set `PUPPY_VERSION=0.1.0` to install a particular version. On Linux and macOS, if
 `puppy` is not found afterwards, add `~/.local/bin` to your `PATH`.
+
+On Linux and macOS, `install.sh` also installs the shell completions, for
+each of bash, zsh and fish found on the machine, and the man pages, all into
+per-user folders under your home directory (see
+[Shell completions and man pages](#shell-completions-and-man-pages)). zsh
+needs one line in `~/.zshrc`; the script prints it.
 
 **By hand:** download the archive from the release page, check it with
 `shasum -a 256 -c <archive>.sha256`, unpack it and put `puppy` (`puppy.exe`)
@@ -235,6 +242,7 @@ puppy watch                                 # print events as they happen, until
 puppy update --check                        # is a newer puppy out? (no install)
 puppy update                                # install it; the daemon restarts into it
 puppy stop                                  # stop the daemon
+puppy completions zsh                       # print a shell completion script
 ```
 
 The text formats are for people and may change; scripts should use `--json`
@@ -318,6 +326,33 @@ Exit codes (with several ids, the highest wins):
 | `4`  | waited download failed |
 | `5`  | waited download needs attention |
 | `6`  | update not possible here (not a release build, or a folder puppy cannot write) |
+
+### Shell completions and man pages
+
+`puppy completions <shell>` prints a completion script for `bash`, `zsh`,
+`fish`, `powershell` or `elvish` on stdout. It is generated from the same
+definitions as `puppy --help`, so it always matches the binary that prints
+it, and it does not start a daemon. The release archives carry the scripts in
+`completions/` and the man pages in `man/man1/`: `puppy.1`, and one page per
+command (`puppy-add.1`, `puppy-browser-install.1`, ...). `install.sh` puts
+them in the places below; to do it by hand, or after `cargo install`:
+
+| Shell      | Where the script goes                                       |
+|------------|-------------------------------------------------------------|
+| bash       | `puppy completions bash > ~/.local/share/bash-completion/completions/puppy` (needs the `bash-completion` package) |
+| zsh        | `puppy completions zsh > ~/.local/share/zsh/site-functions/_puppy`, with `fpath=(~/.local/share/zsh/site-functions $fpath)` before `compinit` in `~/.zshrc` |
+| fish       | `puppy completions fish > ~/.config/fish/completions/puppy.fish` |
+| PowerShell | `puppy completions powershell \| Out-String \| Invoke-Expression` in your `$PROFILE` |
+| elvish     | `eval (puppy completions elvish \| slurp)` in `~/.config/elvish/rc.elv` |
+
+New shells pick the script up; an open one needs `exec $SHELL` (or, in
+PowerShell, `. $PROFILE`).
+
+For the man pages, copy the archive's `man/man1/*.1` into
+`~/.local/share/man/man1/`. `man` searches that folder when `~/.local/bin` is
+on your `PATH`; otherwise add it to `MANPATH`. Then `man puppy` and
+`man puppy-add` work. `puppy man` prints `puppy.1` itself, and
+`puppy man --dir <DIR>` writes every page into `<DIR>`.
 
 ### Configuration
 
@@ -546,7 +581,9 @@ so no network port is opened. Firefox is not supported yet.
    like `v0.2.0-rc.1` is published as a pre-release, which installs ignore.
 
 The archives are built by `cargo build --profile dist` and
-[`scripts/package.sh`](scripts/package.sh), which also run locally. The
+[`scripts/package.sh`](scripts/package.sh), which also run locally.
+`package.sh` generates the completions and man pages by running the built
+binary (or, when that binary is for another platform, a host build). The
 workflow can be started from the Actions tab to build the archives without
 making a release.
 
