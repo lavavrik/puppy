@@ -455,8 +455,9 @@ otherwise for good. `resume` (and the automatic retry of a transient failure)
 tries every mirror again.
 
 Each location is validated on its own, since mirrors have their own ETag and
-Last-Modified (an FTP location: its size and `MDTM`, see [FTP](#ftp)). Every request to a location carries that location's own
-validator as `If-Range`, and the resume sidecar records each location's
+Last-Modified (an FTP location: its size and `MDTM`, checked before each of
+its transfers, see [FTP](#ftp)). Every request to a location carries that
+location's own validator as `If-Range`, and the resume sidecar records each location's
 final URL and validators. On resume (also after a restart) every location is
 checked against the partial file as a download without mirrors is: with a
 strong ETag by `If-Range`, otherwise by its size and a byte comparison of
@@ -471,8 +472,8 @@ changed, at resume or during the download. A location that cannot be checked
 because it does not answer for now is benched, and checked again before it
 gets a range; if none can be checked, the resume fails transiently.
 
-A location without validators (neither ETag nor Last-Modified) cannot be
-checked with `If-Range`. Before each range it is given, puppy compares the
+A location without validators (neither ETag nor Last-Modified; an FTP server
+without `MDTM`) cannot be checked with `If-Range`. Before each range it is given, puppy compares the
 last bytes (64 KiB) of the largest part already downloaded against what that
 location serves there, and drops it if they differ. Until there are such
 bytes it waits, unless no location has validators at all. What this cannot
