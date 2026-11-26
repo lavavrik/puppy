@@ -1227,9 +1227,9 @@ fn assert_only_b_downloaded(env: &Env) {
             == support::content("sub/b.bin", MULTI[1].1),
         "the selected file differs"
     );
-    // a.bin is not a whole number of pieces: its last piece is shared with b.bin, and
-    // librqbit may write that piece's bytes into a.bin too (up to a.bin's full length).
-    // So compare contents, not the size.
+    // The files are not whole numbers of pieces: the piece where they meet is shared,
+    // and librqbit may write its bytes into a.bin too (whichever order the torrent
+    // lists them in). So compare contents, not the size.
     let a = std::fs::read(folder.join("a.bin")).unwrap_or_default();
     assert!(
         a != support::content("a.bin", MULTI[0].1),
@@ -2149,7 +2149,10 @@ async fn add_input_file_torrent_options() {
     );
     std::fs::write(
         &list,
-        format!("{torrent}\n  select-file=2\n  seed-ratio=2.5\n  seed-time=45\n"),
+        format!(
+            "{torrent}\n  select-file={}\n  seed-ratio=2.5\n  seed-time=45\n",
+            seeder.file_number("sub/b.bin")
+        ),
     )
     .unwrap();
     let dl = env.dl_dir();

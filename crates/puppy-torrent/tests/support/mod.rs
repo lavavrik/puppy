@@ -80,6 +80,8 @@ pub struct Seeder {
     pub dir: TempDir,
     pub session: Arc<Session>,
     files: Vec<(String, usize)>,
+    /// The files' relative paths (`/`-separated) in the torrent's own order.
+    torrent_order: Vec<String>,
 }
 
 impl Seeder {
@@ -137,6 +139,22 @@ impl Seeder {
             .expect("seeder verified its files");
         assert!(handle.stats().finished, "seeder has the whole torrent");
 
+        let torrent_order = match &created.as_info().info.data.files {
+            // A multi-file torrent's `files`, in the order the info dict lists them.
+            Some(files) if !single => files
+                .iter()
+                .map(|f| {
+                    let parts: Vec<_> = f
+                        .path
+                        .iter()
+                        .map(|c| String::from_utf8_lossy(c.as_ref()))
+                        .collect();
+                    parts.join("/")
+                })
+                .collect(),
+            _ => vec![name.clone()],
+        };
+
         Seeder {
             torrent_bytes: created.as_bytes().unwrap(),
             magnet: created.as_magnet().to_string(),
@@ -146,7 +164,28 @@ impl Seeder {
             dir,
             session,
             files: files.iter().map(|(n, l)| (n.to_string(), *l)).collect(),
+            torrent_order,
         }
+    }
+
+    /// The files' relative paths (as given to [`Seeder::start`]) in the torrent's order.
+    /// `create_torrent` lists a folder in readdir order, which differs between file
+    /// systems (APFS, NTFS, ext4), so tests must not assume it is the order given.
+    pub fn torrent_order(&self) -> &[String] {
+        &self.torrent_order
+    }
+
+    /// 0-based index of file `rel` in the torrent.
+    pub fn file_index(&self, rel: &str) -> usize {
+        self.torrent_order
+            .iter()
+            .position(|p| p == rel)
+            .unwrap_or_else(|| panic!("{rel} is not in the torrent: {:?}", self.torrent_order))
+    }
+
+    /// 1-based number of file `rel` in the torrent (as `puppy files` lists it).
+    pub fn file_number(&self, rel: &str) -> usize {
+        self.file_index(rel) + 1
     }
 
     /// `(relative path, expected bytes)` of each file, relative to the folder a leecher
