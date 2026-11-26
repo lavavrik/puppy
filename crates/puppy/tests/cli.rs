@@ -1644,3 +1644,302 @@ async fn add_checksum_wait_verifies_or_fails() {
     let (status, _, _) = env.run(&["wait", "2"]);
     assert_eq!(status.code(), Some(4));
 }
+
+// ---- add -i (aria2-style input file) ----
+
+/// Runs `puppy <args>` in `cwd` with `input` on stdin: (status, stdout, stderr).
+fn run_in(
+    env: &Env,
+    cwd: &std::path::Path,
+    args: &[&str],
+    input: &[u8],
+) -> (std::process::ExitStatus, String, String) {
+    use std::io::Write;
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_f = env.home.path().join(format!("io-{n}"));
+    let err_f = env.home.path().join(format!("ie-{n}"));
+    let mut child = env
+        .command(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&out_f).unwrap())
+        .stderr(std::fs::File::create(&err_f).unwrap())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let status = wait_exit(child, TIMEOUT);
+    (
+        status,
+        std::fs::read_to_string(out_f).unwrap(),
+        std::fs::read_to_string(err_f).unwrap(),
+    )
+}
+
+/// Comments, blank lines, CRLF, per-entry `dir` (relative to the current directory),
+/// `out`, `header`, `user-agent`, `checksum`, and an unsupported option (a warning).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_input_file_with_options_and_comments() {
+    let env = Env::new();
+    let s = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let (a, b) = (s.url("/file.bin?a"), s.url("/file.bin?b"));
+    let sum = format!("sha-256={}", puppy_testserver::body_sha256(256 * KIB, 0));
+    let cwd = env.home.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let list = cwd.join("list.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "# two files\r\n{a}\r\n  dir=sub\r\n\tout=first.bin\r\n  split=5\r\n  \
+             header=X-Entry: yes=1\r\n  checksum={sum}\r\n\r\n# the second\r\n{b}\r\n  \
+             user-agent=Agent/7\r\n"
+        ),
+    )
+    .unwrap();
+    let dl = env.dl_dir();
+    let (status, out, err) = run_in(
+        &env,
+        &cwd,
+        &[
+            "add",
+            "--wait",
+            "-o",
+            dl.to_str().unwrap(),
+            "-i",
+            "list.txt",
+        ],
+        b"",
+    );
+    assert_eq!(status.code(), Some(0), "{out}\n{err}");
+    assert!(out.contains("added 1 first.bin"), "{out}");
+    assert!(out.contains(&format!("added 2 {b}")), "{out}");
+    assert!(
+        err.contains("list.txt: line 5: ignoring unsupported option `split`"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::metadata(cwd.join("sub/first.bin")).unwrap().len(),
+        256 * KIB
+    );
+    env.assert_file("file.bin", 256 * KIB);
+    let seen = s.requests_seen();
+    assert!(
+        seen.iter()
+            .any(|h| h.get("x-entry").is_some_and(|v| v == "yes=1")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|h| h.get("user-agent").is_some_and(|v| v == "Agent/7")),
+        "{seen:?}"
+    );
+    let all = snapshots(&env, &["--json", "ls"]);
+    let by_id = |id: u64| all.iter().find(|d| d["id"] == id).unwrap();
+    assert_eq!(by_id(1)["checksum"]["algo"], "sha-256", "{all:?}");
+    assert!(by_id(2)["checksum"].is_null(), "{all:?}");
+}
+
+/// Flags are defaults; an entry's options override them. Positional sources come
+/// first in `added`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_input_file_options_override_flags() {
+    let env = Env::new();
+    let s = puppy_testserver::TestServer::start(small_server_cfg()).await;
+    let (pos, p1, p2) = (url_of(&env, "pos"), url_of(&env, "p1"), url_of(&env, "p2"));
+    let live = s.url("/file.bin?live");
+    let list = env.home.path().join("l.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "{p1}\n{p2}\n max-download-limit=500K\n out=two.bin\n{live}\n pause=false\n \
+             max-download-limit=0\n"
+        ),
+    )
+    .unwrap();
+    let dl = env.dl_dir();
+    let (status, out, err) = env.run(&[
+        "--json",
+        "add",
+        "--paused",
+        "--limit",
+        "1M",
+        "-o",
+        dl.to_str().unwrap(),
+        &pos,
+        "-i",
+        list.to_str().unwrap(),
+    ]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    let sources: Vec<&str> = v["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, [&pos, &p1, &p2, live.as_str()]);
+    let (status, _, err) = env.run(&["wait", "4"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    env.assert_file("file.bin", 256 * KIB);
+    let all = snapshots(&env, &["--json", "ls"]);
+    let by_id = |id: u64| all.iter().find(|d| d["id"] == id).unwrap();
+    for id in [1, 2] {
+        assert_eq!(by_id(id)["state"]["kind"], "paused", "{all:?}");
+        assert_eq!(by_id(id)["limit"], 1 << 20, "{all:?}");
+    }
+    assert_eq!(by_id(3)["state"]["kind"], "paused", "{all:?}");
+    assert_eq!(by_id(3)["limit"], 500 * KIB, "{all:?}");
+    assert_eq!(by_id(3)["name"], "two.bin", "{all:?}");
+    assert!(by_id(4)["limit"].is_null(), "{all:?}");
+}
+
+/// One invalid entry rejects the whole file: every problem is reported with its line,
+/// nothing is added, and no daemon is started.
+#[test]
+fn add_input_file_invalid_entry_rejects_the_batch() {
+    let env = Env::new();
+    let (a, b) = (url_of(&env, "a"), url_of(&env, "b"));
+    let list = env.home.path().join("bad.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "  out=early\n{a}\n  max-download-limit=fast\n  bogus=1\n{b}\n  out=b.bin\n\
+             not a url\n{a}\t{b}\n{b}\n  seed-ratio=2\n"
+        ),
+    )
+    .unwrap();
+    let (status, out, err) = env.run(&["add", "--paused", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(out.is_empty(), "{out}");
+    for needle in [
+        "bad.txt: line 1: option \"out=early\" comes before any URI",
+        "bad.txt: line 3: bad max-download-limit \"fast\"",
+        "bad.txt: line 4: ignoring unsupported option `bogus`",
+        "bad.txt: line 7: not a url",
+        "bad.txt: line 8: 2 TAB-separated URIs: mirrors",
+        "not supported yet",
+        "bad.txt: line 9: seed-ratio only applies to torrents",
+        "bad.txt: 5 problems, nothing was added",
+    ] {
+        assert!(err.contains(needle), "{needle:?} missing in:\n{err}");
+    }
+    assert!(!env.lock_held(), "a usage error must not start a daemon");
+    // One problem: one line, which says nothing was added.
+    std::fs::write(&list, format!("{a}\n  pause=maybe\n")).unwrap();
+    let (status, _, err) = env.run(&["add", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("line 2: bad pause \"maybe\""), "{err}");
+    assert!(err.contains("nothing was added"), "{err}");
+    // --wait with pause=true: refused, like --wait --paused.
+    std::fs::write(&list, format!("{a}\n  pause=true\n")).unwrap();
+    let (status, _, err) = env.run(&["add", "--wait", "-i", list.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("pause=true does not go with --wait"), "{err}");
+    let (status, _, err) = env.run(&["add", "-i", "/nonexistent/list.txt"]);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("cannot read input file"), "{err}");
+    assert!(!env.lock_held());
+}
+
+/// `-i -` reads the file from stdin (BOM and all); with `-` as a source too it is a
+/// usage error; an empty file is one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_input_file_from_stdin() {
+    let env = Env::new();
+    let (a, b) = (url_of(&env, "a"), url_of(&env, "b"));
+    let input = format!("\u{feff}# from stdin\n{a}\n  out=x.bin\n{b}\n");
+    let cwd = env.home.path().to_path_buf();
+    let (status, out, err) = run_in(
+        &env,
+        &cwd,
+        &["add", "--paused", "-i", "-"],
+        input.as_bytes(),
+    );
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out, format!("added 1 x.bin\nadded 2 {b}\n"));
+    let (status, _, err) = run_in(&env, &cwd, &["add", "-i", "-", "-"], input.as_bytes());
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("stdin can only be read once"), "{err}");
+    let (status, _, err) = run_in(&env, &cwd, &["add", "-i", "-"], b"# nothing\n\n");
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("no downloads in stdin"), "{err}");
+    assert_eq!(snapshots(&env, &["--json", "ls"]).len(), 2);
+}
+
+/// `--name` and `--checksum` need exactly one source in total, file entries included.
+#[test]
+fn add_input_file_single_source_flags() {
+    let env = Env::new();
+    let (a, b) = (url_of(&env, "a"), url_of(&env, "b"));
+    let two = env.home.path().join("two.txt");
+    std::fs::write(&two, format!("{a}\n{b}\n")).unwrap();
+    let sum = format!("sha-256={}", "ab".repeat(32));
+    for flags in [["--name", "x"], ["--checksum", sum.as_str()]] {
+        let (status, out, err) = env.run(&[
+            "add",
+            "--paused",
+            flags[0],
+            flags[1],
+            "-i",
+            two.to_str().unwrap(),
+        ]);
+        assert_eq!(status.code(), Some(2), "{flags:?}: {err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("exactly one source"), "{err}");
+    }
+    assert!(!env.lock_held());
+    let one = env.home.path().join("one.txt");
+    std::fs::write(&one, format!("{a}\n")).unwrap();
+    let (status, out, err) = env.run(&[
+        "add",
+        "--paused",
+        "--name",
+        "x.bin",
+        "-i",
+        one.to_str().unwrap(),
+    ]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.trim(), "added 1 x.bin");
+}
+
+/// A torrent entry: `select-file` by number, `seed-ratio` overriding `--seed-ratio`,
+/// `seed-time` in aria2's minutes; `checksum` on a torrent rejects the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_input_file_torrent_options() {
+    let seeder = Seeder::start(MULTI).await;
+    let (env, _c) = torrent_env(&[&seeder]).await;
+    let torrent = torrent_path(&env, &seeder);
+    let list = env.home.path().join("t.txt");
+    std::fs::write(
+        &list,
+        format!("{torrent}\n  checksum=sha-256={}\n", "ab".repeat(32)),
+    )
+    .unwrap();
+    let (_, err) = run_code(&env, &["add", "-i", list.to_str().unwrap()], 2);
+    assert!(
+        err.contains("line 1: checksum only applies to HTTP(S)"),
+        "{err}"
+    );
+    std::fs::write(
+        &list,
+        format!("{torrent}\n  select-file=2\n  seed-ratio=2.5\n  seed-time=45\n"),
+    )
+    .unwrap();
+    let dl = env.dl_dir();
+    let id = add_torrent(
+        &env,
+        &[
+            "-o",
+            dl.to_str().unwrap(),
+            "--seed-ratio",
+            "4",
+            "-i",
+            list.to_str().unwrap(),
+        ],
+    );
+    let d = wait_ls_state(&env, &id, "seeding");
+    assert_eq!(d["state"]["ratio_target"], 2.5, "{d}");
+    assert_eq!(d["state"]["time_target_secs"], 45 * 60, "{d}");
+    assert_only_b_downloaded(&env);
+}

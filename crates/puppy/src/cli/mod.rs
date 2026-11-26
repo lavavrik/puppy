@@ -5,6 +5,7 @@ pub mod add;
 pub mod browser;
 pub mod control;
 pub mod files;
+pub mod input_file;
 pub mod list;
 pub mod output;
 pub mod seed;

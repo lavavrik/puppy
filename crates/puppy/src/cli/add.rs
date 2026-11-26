@@ -1,18 +1,19 @@
 //! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files or stdin.
 
 use super::files::parse_spec;
+use super::input_file::{self, EntryOptions, LineError, split_header};
 use super::output::{err, json, out};
 use super::seed;
 use super::wait::{Waited, absorb, finish, interruptible, until_done};
 use super::{CliError, Ctx};
 use puppy_core::checksum::Checksum;
-use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, Source};
+use puppy_core::types::{AddRequest, DownloadId, FileChoice, RequestContext, SeedPolicy, Source};
 use puppy_proto::{ReplyData, Request};
 use puppy_tui::app::forms::{expand_tilde, parse_source, unquote};
 use puppy_tui::format::parse_rate;
 use serde::Serialize;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What `puppy add` was asked to do.
 #[derive(Debug, Default)]
@@ -37,6 +38,8 @@ pub struct AddArgs {
     pub seed_ratio: Option<String>,
     /// `--seed-time` (torrents only).
     pub seed_time: Option<String>,
+    /// `-i FILE`: an aria2-style input file (`-`: stdin), added after `sources`.
+    pub input_file: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -62,11 +65,11 @@ struct AddJson<'a> {
     waited: Option<&'a Waited>,
 }
 
-/// Decodes stdin text: strips a UTF-8 BOM, decodes UTF-16 (LE or BE) after its BOM,
-/// else UTF-8 (invalid bytes replaced).
-fn decode_stdin(bytes: &[u8]) -> Result<String, CliError> {
+/// Decodes text from stdin or an input file (`what` names it in errors): strips a UTF-8
+/// BOM, decodes UTF-16 (LE or BE) after its BOM, else UTF-8 (invalid bytes replaced).
+fn decode_text(bytes: &[u8], what: &str) -> Result<String, CliError> {
     let utf16 = |rest: &[u8], le: bool| -> Result<String, CliError> {
-        let bad = || CliError::Usage("stdin is not valid UTF-16".into());
+        let bad = || CliError::Usage(format!("{what} is not valid UTF-16"));
         if !rest.len().is_multiple_of(2) {
             return Err(bad());
         }
@@ -89,40 +92,203 @@ fn decode_stdin(bytes: &[u8]) -> Result<String, CliError> {
     }
 }
 
+fn read_stdin() -> Result<String, CliError> {
+    let mut text = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut text)
+        .map_err(|e| anyhow::anyhow!("cannot read stdin: {e}"))?;
+    decode_text(&text, "stdin")
+}
+
 /// Splits `Name: value` at the first `:`.
 fn parse_header(h: &str) -> Result<(String, String), CliError> {
-    match h.split_once(':') {
-        Some((k, v)) if !k.trim().is_empty() => Ok((k.trim().to_string(), v.trim().to_string())),
-        _ => Err(CliError::Usage(format!(
-            "bad --header {h:?}: expected \"Name: value\""
-        ))),
-    }
+    split_header(h)
+        .ok_or_else(|| CliError::Usage(format!("bad --header {h:?}: expected \"Name: value\"")))
 }
 
 /// The sources: stdin lines for `-` (blank lines and `#` comments skipped), as given
-/// otherwise.
-fn expand_sources(sources: Vec<String>) -> Result<Vec<String>, CliError> {
+/// otherwise. `-` reading nothing is an error unless `more` downloads come from
+/// elsewhere (an input file).
+fn expand_sources(sources: Vec<String>, more: bool) -> Result<Vec<String>, CliError> {
     let mut all = Vec::new();
+    let mut stdin = false;
     for s in sources {
         if s != "-" {
             all.push(s);
             continue;
         }
-        let mut text = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut text)
-            .map_err(|e| anyhow::anyhow!("cannot read stdin: {e}"))?;
-        for line in decode_stdin(&text)?.lines() {
+        stdin = true;
+        for line in read_stdin()?.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
                 all.push(line.to_string());
             }
         }
     }
-    if all.is_empty() {
+    if stdin && all.is_empty() && !more {
         return Err(CliError::Usage("no sources on stdin".into()));
     }
     Ok(all)
+}
+
+/// The command-line flags every source starts from; an input file's options override
+/// them per entry.
+struct Defaults {
+    output_dir: Option<PathBuf>,
+    name: Option<String>,
+    paused: bool,
+    limit: Option<u64>,
+    context: RequestContext,
+    choice: FileChoice,
+    seed: Option<SeedPolicy>,
+    checksum: Option<Checksum>,
+}
+
+/// One download to add, fully decided.
+struct Planned {
+    /// The source as the user wrote it (`added[].source`).
+    shown: String,
+    req: AddRequest,
+    paused: bool,
+    limit: Option<u64>,
+}
+
+impl Defaults {
+    /// `source` with these defaults, overridden by `o` (an input-file entry's options;
+    /// empty for a command-line source). An entry's `header` replaces a `-H` of the same
+    /// name and adds the rest; a seeding option replaces only its half of the policy.
+    fn plan(&self, shown: String, source: Source, o: &EntryOptions) -> Planned {
+        let mut context = self.context.clone();
+        context.headers.retain(|(n, _)| {
+            !o.headers
+                .iter()
+                .any(|(m, _)| m.trim().eq_ignore_ascii_case(n.trim()))
+        });
+        context.headers.extend(o.headers.iter().cloned());
+        if let Some(r) = &o.referer {
+            context.referer = Some(r.clone());
+        }
+        if let Some(u) = &o.user_agent {
+            context.user_agent = Some(u.clone());
+        }
+        let seed = if o.seed_ratio.is_some() || o.seed_time.is_some() {
+            let base = self.seed.clone().unwrap_or_default();
+            Some(SeedPolicy {
+                ratio: o.seed_ratio.unwrap_or(base.ratio),
+                time_secs: o.seed_time.unwrap_or(base.time_secs),
+            })
+        } else {
+            self.seed.clone()
+        };
+        let files = match &o.select {
+            Some(selection) => FileChoice::Select {
+                selection: selection.clone(),
+            },
+            None => self.choice.clone(),
+        };
+        Planned {
+            shown,
+            req: AddRequest {
+                source,
+                output_dir: o.dir.clone().or_else(|| self.output_dir.clone()),
+                filename: o.out.clone().or_else(|| self.name.clone()),
+                context,
+                files,
+                seed,
+                checksum: o.checksum.clone().or_else(|| self.checksum.clone()),
+            },
+            paused: o.pause.unwrap_or(self.paused),
+            limit: o.limit.unwrap_or(self.limit),
+        }
+    }
+}
+
+/// Reads `-i FILE` (`-`: stdin) into planned adds. Unsupported options are warned about
+/// on stderr. Any invalid entry fails the whole file, every problem reported with its
+/// line, so that nothing is added: a script then fixes the file and runs it again,
+/// instead of having to work out which half of the list is already queued.
+fn plan_input_file(
+    path: &Path,
+    defaults: &Defaults,
+    wait: bool,
+) -> Result<(String, Vec<Planned>), CliError> {
+    let (label, text) = if path == Path::new("-") {
+        ("stdin".to_string(), read_stdin()?)
+    } else {
+        let label = path.display().to_string();
+        let bytes = std::fs::read(path)
+            .map_err(|e| CliError::Usage(format!("cannot read input file {label}: {e}")))?;
+        let text = decode_text(&bytes, &label)?;
+        (label, text)
+    };
+    let (entries, mut errors) = input_file::parse(&text);
+    let mut planned = Vec::new();
+    for entry in &entries {
+        let got = input_file::interpret(entry);
+        for w in got.warnings {
+            err(format_args!("puppy: {label}: {w}"));
+        }
+        let options = got.errors.is_empty().then_some(got.options);
+        errors.extend(got.errors);
+        let mut bad = |message: String| {
+            errors.push(LineError {
+                line: entry.line,
+                message,
+            })
+        };
+        if entry.uris.len() > 1 && !input_file::MIRRORS_SUPPORTED {
+            bad(format!(
+                "{} TAB-separated URIs: mirrors (several URIs for one file) are not \
+                 supported yet; put each on its own line to download them separately",
+                entry.uris.len()
+            ));
+            continue;
+        }
+        let uri = &entry.uris[0];
+        let source = match parse_source(uri) {
+            Ok(s) => s,
+            Err(e) => {
+                bad(format!("{uri}: {e}"));
+                continue;
+            }
+        };
+        let Some(o) = options else { continue };
+        if matches!(source, Source::Http { .. }) {
+            if let Some(key) = o.torrent_only() {
+                bad(format!(
+                    "{key} only applies to torrents, but {uri} is not one"
+                ));
+                continue;
+            }
+        } else if o.checksum.is_some() {
+            bad(format!(
+                "checksum only applies to HTTP(S) downloads, but {uri} is a torrent \
+                 (BitTorrent verifies every piece already)"
+            ));
+            continue;
+        }
+        if wait && o.pause == Some(true) {
+            bad("pause=true does not go with --wait: a paused download never ends".into());
+            continue;
+        }
+        planned.push(defaults.plan(unquote(uri).to_string(), source, &o));
+    }
+    errors.sort_by_key(|e| e.line);
+    match errors.as_slice() {
+        [] => Ok((label, planned)),
+        [one] => Err(CliError::Usage(format!(
+            "{label}: {one} (nothing was added)"
+        ))),
+        many => {
+            for e in many {
+                err(format_args!("puppy: {label}: {e}"));
+            }
+            Err(CliError::Usage(format!(
+                "{label}: {} problems, nothing was added",
+                many.len()
+            )))
+        }
+    }
 }
 
 /// What `add` did, and its exit code (1 if some sources could not be added; they were
@@ -142,7 +308,7 @@ pub async fn run(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<(), CliError> {
             "--wait and --paused do not go together: a paused download never ends".into(),
         ));
     }
-    let outcome = add(ctx, args).await?;
+    let outcome = add(ctx, args, wait).await?;
     let mut codes = vec![outcome.code];
     let mut waited = None;
     if wait {
@@ -166,9 +332,10 @@ pub async fn run(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<(), CliError> {
     finish(&codes)
 }
 
-/// Adds every source; ones that cannot be added are reported on stderr and make the
-/// outcome's code 1, after the others were added.
-pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
+/// Adds every source (command-line ones first, then the input file's); ones that cannot
+/// be added are reported on stderr and make the outcome's code 1, after the others were
+/// added. `wait`: the caller waits afterwards (an entry's `pause=true` is refused).
+pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, CliError> {
     let limit = match args.limit.as_deref() {
         Some(l) => parse_rate(l).map_err(|e| CliError::Usage(format!("bad --limit: {e}")))?,
         None => None,
@@ -185,7 +352,8 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
             std::path::absolute(&p).unwrap_or(p)
         })
         .map(|p| p.to_path_buf());
-    if args.name.is_some() && args.sources.len() != 1 {
+    let file = args.input_file;
+    if args.name.is_some() && file.is_none() && args.sources.len() != 1 {
         return Err(CliError::Usage(
             "--name needs exactly one source".to_string(),
         ));
@@ -212,35 +380,63 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         ),
         None => None,
     };
-    if checksum.is_some() && args.sources.len() != 1 {
+    if checksum.is_some() && file.is_none() && args.sources.len() != 1 {
         return Err(CliError::Usage(
             "--checksum needs exactly one source: one digest cannot match several files".into(),
         ));
     }
-    let sources = expand_sources(args.sources)?;
-    if args.name.is_some() && sources.len() != 1 {
+    if file.as_deref() == Some(Path::new("-")) && args.sources.iter().any(|s| s == "-") {
+        return Err(CliError::Usage(
+            "stdin can only be read once: give `-` as a source or `-i -`, not both".into(),
+        ));
+    }
+    let defaults = Defaults {
+        output_dir,
+        name: args.name,
+        paused: args.paused,
+        limit,
+        context: RequestContext {
+            headers,
+            cookies: args.cookie,
+            referer: args.referer,
+            ..RequestContext::default()
+        },
+        choice,
+        seed,
+        checksum,
+    };
+
+    // Plan everything first: usage-level problems should not leave a half-done add.
+    let from_file = match &file {
+        Some(path) => Some(plan_input_file(path, &defaults, wait)?),
+        None => None,
+    };
+    let file_count = from_file.as_ref().map_or(0, |(_, p)| p.len());
+    let sources = expand_sources(args.sources, file_count > 0)?;
+    if let Some((label, _)) = &from_file
+        && sources.is_empty()
+        && file_count == 0
+    {
+        return Err(CliError::Usage(format!("no downloads in {label}")));
+    }
+    let total = sources.len() + file_count;
+    if defaults.name.is_some() && total != 1 {
         return Err(CliError::Usage(
             "--name needs exactly one source".to_string(),
         ));
     }
-    if checksum.is_some() && sources.len() != 1 {
+    if defaults.checksum.is_some() && total != 1 {
         return Err(CliError::Usage(
             "--checksum needs exactly one source: one digest cannot match several files".into(),
         ));
     }
-    let context = RequestContext {
-        headers,
-        cookies: args.cookie,
-        referer: args.referer,
-        ..RequestContext::default()
-    };
 
-    // Parse everything first: usage-level problems should not leave a half-done add.
     let mut failed = Vec::new();
-    let mut parsed = Vec::new();
+    let mut planned = Vec::new();
+    let none = EntryOptions::default();
     for s in &sources {
         match parse_source(s) {
-            Ok(source) => parsed.push((unquote(s).to_string(), source)),
+            Ok(source) => planned.push(defaults.plan(unquote(s).to_string(), source, &none)),
             Err(e) => {
                 err(format_args!("puppy: {s}: {e}"));
                 failed.push(Failed {
@@ -251,8 +447,9 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
             }
         }
     }
+    planned.extend(from_file.into_iter().flat_map(|(_, p)| p));
 
-    if choice != FileChoice::All || seed.is_some() {
+    if defaults.choice != FileChoice::All || defaults.seed.is_some() {
         let flags = if args.choose {
             "--choose"
         } else if !args.files.is_empty() {
@@ -260,42 +457,43 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
         } else {
             "--seed-ratio/--seed-time"
         };
-        if let Some((shown, _)) = parsed
+        if let Some(p) = planned
             .iter()
-            .find(|(_, s)| matches!(s, Source::Http { .. }))
+            .find(|p| matches!(p.req.source, Source::Http { .. }))
         {
             return Err(CliError::Usage(format!(
-                "{flags} only applies to torrents, but {shown} is not one"
+                "{flags} only applies to torrents, but {} is not one",
+                p.shown
             )));
         }
     }
 
-    if checksum.is_some()
-        && let Some((shown, _)) = parsed
+    if defaults.checksum.is_some()
+        && let Some(p) = planned
             .iter()
-            .find(|(_, s)| !matches!(s, Source::Http { .. }))
+            .find(|p| !matches!(p.req.source, Source::Http { .. }))
     {
         return Err(CliError::Usage(format!(
-            "--checksum only applies to HTTP(S) downloads, but {shown} is a torrent \
-             (BitTorrent verifies every piece already)"
+            "--checksum only applies to HTTP(S) downloads, but {} is a torrent \
+             (BitTorrent verifies every piece already)",
+            p.shown
         )));
     }
 
     let mut added = Vec::new();
-    if !parsed.is_empty() {
+    if !planned.is_empty() {
         let client = ctx.client().await?;
-        for (shown, source) in parsed {
-            let req = AddRequest {
-                source,
-                output_dir: output_dir.clone(),
-                filename: args.name.clone(),
-                context: context.clone(),
-                files: choice.clone(),
-                seed: seed.clone(),
-                checksum: checksum.clone(),
-            };
-            let result = match client.add(req, args.paused, limit).await {
-                Ok(id) if checksum.is_some() => check_checksum_kept(&client, id).await,
+        for Planned {
+            shown,
+            req,
+            paused,
+            limit,
+        } in planned
+        {
+            let verify = req.checksum.is_some();
+            let name = req.filename.clone();
+            let result = match client.add(req, paused, limit).await {
+                Ok(id) if verify => check_checksum_kept(&client, id).await,
                 r => r.map_err(Into::into),
             };
             match result {
@@ -303,7 +501,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddOutcome, CliError> {
                     if !ctx.json {
                         out(format_args!(
                             "added {id} {}",
-                            args.name.as_deref().unwrap_or(&shown)
+                            name.as_deref().unwrap_or(&shown)
                         ));
                     }
                     added.push(Added { id, source: shown });
@@ -387,14 +585,18 @@ mod tests {
 
     #[test]
     fn stdin_encodings() {
-        assert_eq!(decode_stdin(b"a\nb").unwrap(), "a\nb");
-        assert_eq!(decode_stdin(b"\xEF\xBB\xBFa").unwrap(), "a");
+        assert_eq!(decode_text(b"a\nb", "stdin").unwrap(), "a\nb");
+        assert_eq!(decode_text(b"\xEF\xBB\xBFa", "stdin").unwrap(), "a");
         assert_eq!(
-            decode_stdin(&[0xFF, 0xFE, b'a', 0, b'\n', 0]).unwrap(),
+            decode_text(&[0xFF, 0xFE, b'a', 0, b'\n', 0], "stdin").unwrap(),
             "a\n"
         );
-        assert_eq!(decode_stdin(&[0xFE, 0xFF, 0, b'a']).unwrap(), "a");
-        assert!(decode_stdin(&[0xFF, 0xFE, 0x41]).is_err());
-        assert!(decode_stdin(&[0xFF, 0xFE, 0x00, 0xD8]).is_err());
+        assert_eq!(decode_text(&[0xFE, 0xFF, 0, b'a'], "stdin").unwrap(), "a");
+        assert!(decode_text(&[0xFF, 0xFE, 0x41], "stdin").is_err());
+        assert!(decode_text(&[0xFF, 0xFE, 0x00, 0xD8], "stdin").is_err());
+        let Err(CliError::Usage(m)) = decode_text(&[0xFE, 0xFF, 0x41], "list.txt") else {
+            panic!("odd UTF-16 must be refused");
+        };
+        assert_eq!(m, "list.txt is not valid UTF-16");
     }
 }

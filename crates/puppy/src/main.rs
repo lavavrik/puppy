@@ -85,11 +85,18 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Add downloads from URLs, magnet links or .torrent files (`-` reads them from stdin).
+    /// Add downloads from URLs, magnet links or .torrent files (`-` reads them from
+    /// stdin, `-i` from an aria2-style input file).
     Add {
         /// URLs, magnet links, .torrent paths; `-` reads one per line from stdin.
-        #[arg(required = true, value_name = "SOURCE")]
+        #[arg(required_unless_present = "input_file", value_name = "SOURCE")]
         sources: Vec<String>,
+        /// Read downloads from an aria2-style input file (`-`: stdin): one URI per
+        /// line, each followed by indented `key=value` options (`dir`, `out`,
+        /// `checksum`, `header`, ...). The other flags are defaults the options
+        /// override.
+        #[arg(short = 'i', long, value_name = "FILE")]
+        input_file: Option<PathBuf>,
         /// Save into this folder (default: the daemon's download folder).
         #[arg(short = 'o', long, value_name = "DIR")]
         output_dir: Option<PathBuf>,
@@ -330,6 +337,7 @@ fn main() -> ExitCode {
                 choose,
                 seed_ratio,
                 seed_time,
+                input_file,
             }) => {
                 cli::add::run(
                     &Ctx::from_env(cli.json)?,
@@ -347,6 +355,7 @@ fn main() -> ExitCode {
                         choose,
                         seed_ratio,
                         seed_time,
+                        input_file,
                     },
                     wait,
                 )
