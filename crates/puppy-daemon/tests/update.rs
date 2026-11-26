@@ -387,6 +387,7 @@ mod daemon {
                 .request(Request::Hello {
                     client: "test".into(),
                     protocol: PROTOCOL_VERSION,
+                    ssh_auth_sock: None,
                 })
                 .await;
             assert!(matches!(r, Reply::Ok { .. }), "{r:?}");

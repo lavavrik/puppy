@@ -153,6 +153,15 @@ impl Drop for Unregister<'_> {
     }
 }
 
+/// This process's ssh-agent (`SSH_AUTH_SOCK`), offered to the daemon with `hello`: a
+/// daemon started elsewhere (a login service) can then use the agent of the session
+/// its downloads are added from.
+fn ssh_auth_sock() -> Option<String> {
+    std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 impl Client {
     /// Connects to the daemon at `name`, checks that it runs as the current user
     /// ([`ClientError::NotOwnedByUser`] otherwise) and performs the `hello` handshake.
@@ -167,6 +176,7 @@ impl Client {
             body: Request::Hello {
                 client: client_name.into(),
                 protocol: PROTOCOL_VERSION,
+                ssh_auth_sock: ssh_auth_sock(),
             },
         };
         let handshake = async {
@@ -240,6 +250,7 @@ impl Client {
                 body: Request::Hello {
                     client: "puppy-shutdown".into(),
                     protocol: PROTOCOL_VERSION,
+                    ssh_auth_sock: None,
                 },
             };
             write_msg(&mut wr, &hello).await.map_err(codec_error)?;

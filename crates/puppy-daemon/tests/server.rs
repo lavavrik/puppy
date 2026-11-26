@@ -125,6 +125,7 @@ impl Harness {
             .request(Request::Hello {
                 client: "test".into(),
                 protocol: PROTOCOL_VERSION,
+                ssh_auth_sock: None,
             })
             .await;
         assert!(
@@ -259,6 +260,7 @@ async fn hello_handshake() {
         .send(Request::Hello {
             client: "test".into(),
             protocol: PROTOCOL_VERSION,
+            ssh_auth_sock: None,
         })
         .await;
     let r = c.response(id).await;
@@ -281,6 +283,7 @@ async fn hello_handshake() {
         .request(Request::Hello {
             client: "test".into(),
             protocol: PROTOCOL_VERSION,
+            ssh_auth_sock: None,
         })
         .await;
     assert!(
@@ -308,6 +311,7 @@ async fn protocol_mismatch_closes() {
         .request(Request::Hello {
             client: "future".into(),
             protocol: PROTOCOL_VERSION + 1,
+            ssh_auth_sock: None,
         })
         .await;
     assert!(
@@ -367,6 +371,7 @@ async fn mismatch_window_expires() {
         .request(Request::Hello {
             client: "future".into(),
             protocol: PROTOCOL_VERSION + 1,
+            ssh_auth_sock: None,
         })
         .await;
     assert!(matches!(r, Reply::Err { .. }), "{r:?}");

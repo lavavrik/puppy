@@ -37,6 +37,10 @@ pub enum Request {
     Hello {
         client: String,
         protocol: u32,
+        /// The client's ssh-agent socket (`SSH_AUTH_SOCK`): the daemon's SFTP logins use
+        /// the agent the most recent client offered before its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_auth_sock: Option<String>,
     },
     Add {
         request: AddRequest,

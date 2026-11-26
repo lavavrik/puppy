@@ -180,7 +180,10 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<RunOutcome> {
     remove_stale_socket(&paths.socket).await?;
 
     let mut cfg = Config::load(&paths.config_file())?;
-    let http = opts.http.unwrap_or_else(|| cfg.http_config());
+    let mut http = opts.http.unwrap_or_else(|| cfg.http_config());
+    if http.sftp.trusted_hosts.is_none() {
+        http.sftp.trusted_hosts = Some(paths.known_hosts());
+    }
     let download_dir = http.default_dir.clone();
     let engine: Arc<dyn Engine> = match opts.engine {
         Some(engine) => engine,

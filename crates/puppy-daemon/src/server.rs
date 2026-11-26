@@ -368,17 +368,24 @@ fn handshake(first: Result<Option<serde_json::Value>, CodecError>) -> Option<(Se
         Ok(env) => match env.body {
             Request::Hello {
                 protocol: PROTOCOL_VERSION,
+                ssh_auth_sock,
                 ..
-            } => (
-                response(
-                    env.req_id,
-                    ok(ReplyData::Hello {
-                        daemon_version: env!("CARGO_PKG_VERSION").into(),
-                        protocol: PROTOCOL_VERSION,
-                    }),
-                ),
-                After::Serve,
-            ),
+            } => {
+                if let Some(sock) = ssh_auth_sock {
+                    // SFTP logins use the agent of the most recent client first.
+                    puppy_core::sftp::offer_agent(&sock);
+                }
+                (
+                    response(
+                        env.req_id,
+                        ok(ReplyData::Hello {
+                            daemon_version: env!("CARGO_PKG_VERSION").into(),
+                            protocol: PROTOCOL_VERSION,
+                        }),
+                    ),
+                    After::Serve,
+                )
+            }
             Request::Hello { protocol, .. } => (
                 response(
                     env.req_id,

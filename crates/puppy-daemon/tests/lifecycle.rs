@@ -143,6 +143,7 @@ impl Env {
             .request(Request::Hello {
                 client: "test".into(),
                 protocol: PROTOCOL_VERSION,
+                ssh_auth_sock: None,
             })
             .await;
         assert!(
@@ -329,6 +330,7 @@ async fn lock_wait_takes_over_a_departing_daemon() {
         .request(Request::Hello {
             client: "test".into(),
             protocol: PROTOCOL_VERSION,
+            ssh_auth_sock: None,
         })
         .await;
     let _ = c.request(Request::Shutdown).await;
@@ -645,6 +647,7 @@ async fn slow_restore_does_not_block_the_socket() {
         .request(Request::Hello {
             client: "test".into(),
             protocol: PROTOCOL_VERSION,
+            ssh_auth_sock: None,
         })
         .await;
     let waited = t.elapsed();

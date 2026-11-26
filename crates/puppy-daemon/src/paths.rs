@@ -101,6 +101,11 @@ impl Paths {
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
+
+    /// puppy's own `known_hosts` (hosts trusted with `puppy ssh trust`).
+    pub fn known_hosts(&self) -> PathBuf {
+        self.data_dir.join("known_hosts")
+    }
 }
 
 fn no_home() -> io::Error {

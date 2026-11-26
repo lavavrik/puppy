@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use puppy_core::config::{FtpConfig, FtpTls, HttpConfig};
+use puppy_core::config::{FtpConfig, FtpTls, HttpConfig, SftpConfig, SshAgent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +139,26 @@ pub struct FtpSection {
     pub tls: FtpTls,
 }
 
+/// SFTP logins (`[ssh]`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct SshSection {
+    /// A private key tried after the agent's keys, before the default ones
+    /// (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`). Unencrypted only. `~/` is the home.
+    pub identity_file: Option<PathBuf>,
+    /// The ssh-agent socket (Unix) or named pipe (Windows) to use instead of the one
+    /// clients offer and `SSH_AUTH_SOCK`.
+    pub agent: Option<PathBuf>,
+}
+
+/// `~/x` as a path in the home directory.
+fn expand_home(p: &Path) -> PathBuf {
+    match (p.strip_prefix("~"), dirs::home_dir()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 /// Self-update settings (`[update]`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -173,6 +193,7 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     pub update: UpdateConfig,
     pub ftp: FtpSection,
+    pub ssh: SshSection,
     /// First delay before a transiently failed download is retried automatically;
     /// doubles per failure up to [`MAX_RETRY_DELAY`]; never less than 1 s. Not read from
     /// the file.
@@ -203,6 +224,7 @@ impl Default for Config {
             notifications: NotificationsConfig::default(),
             update: UpdateConfig::default(),
             ftp: FtpSection::default(),
+            ssh: SshSection::default(),
             retry_base: Duration::from_secs(30),
             shutdown_pause_timeout: Duration::from_secs(10),
         }
@@ -241,6 +263,19 @@ impl Config {
         })
     }
 
+    /// SFTP logins and host keys as configured (puppy's own `known_hosts` is set by the
+    /// daemon, which knows its data directory).
+    pub fn sftp_config(&self) -> SftpConfig {
+        let mut c = SftpConfig::default();
+        if let Some(key) = &self.ssh.identity_file {
+            c.identity_files.insert(0, expand_home(key));
+        }
+        if let Some(agent) = &self.ssh.agent {
+            c.agent = SshAgent::Path(expand_home(agent));
+        }
+        c
+    }
+
     pub fn http_config(&self) -> HttpConfig {
         HttpConfig {
             connections: self.connections,
@@ -250,6 +285,7 @@ impl Config {
                 tls: self.ftp.tls,
                 ..FtpConfig::default()
             },
+            sftp: self.sftp_config(),
             ..HttpConfig::default()
         }
     }
