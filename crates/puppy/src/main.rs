@@ -5,6 +5,8 @@
 //! - `puppy` opens the full-screen dashboard (starting a daemon if none runs).
 //! - `puppy status`, `add`, `ls`, `info`, `pause`, ..., `wait`, `watch`: scriptable
 //!   commands (see [`cli`] and the README's "Command line" section).
+//! - `puppy completions <SHELL>` prints a shell completion script; `puppy man`
+//!   (hidden) prints or writes the man pages (see [`cli::docs`]).
 //! - `puppy native-host` (hidden) is the native messaging host the browser extension
 //!   starts (see [`native_host`]).
 //! - `--json` (global) makes commands print JSON; errors map to exit codes (see
@@ -16,7 +18,7 @@ mod native_host;
 
 use anyhow::Context;
 use browser::Browser;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use cli::add::AddArgs;
 use cli::list::StateFilter;
 use cli::output::err;
@@ -228,10 +230,23 @@ enum Command {
     Watch,
     /// Stop the background daemon.
     Stop,
+    /// Print a shell completion script (see the README for where to put it).
+    Completions {
+        /// The shell to complete for.
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
     /// Set up browser download pickup (the puppy extension).
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
+    },
+    /// Print the man page (roff), or write one page per command into a folder.
+    #[command(hide = true)]
+    Man {
+        /// Write `puppy.1` and `puppy-<command>.1` pages into this folder instead.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
     },
     /// Native messaging host started by the browser extension.
     #[command(hide = true)]
@@ -282,6 +297,23 @@ fn main() -> ExitCode {
             "puppy's dashboard needs an interactive terminal (try `puppy daemon` to run the background service)",
         );
         return ExitCode::from(2);
+    }
+    // Generated from the clap definitions; no daemon, no runtime.
+    let docs = match &cli.command {
+        Some(Command::Completions { shell }) => {
+            Some(cli::docs::completions(Cli::command(), *shell))
+        }
+        Some(Command::Man { dir }) => Some(cli::docs::man(Cli::command(), dir.as_deref())),
+        _ => None,
+    };
+    if let Some(result) = docs {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                cli::report_error(&e);
+                ExitCode::from(e.exit_code())
+            }
+        };
     }
     if matches!(cli.command, Some(Command::Daemon { .. })) {
         bundled_roots_for_daemon();
@@ -407,6 +439,9 @@ fn main() -> ExitCode {
                 BrowserAction::Status => cli::browser::status(cli.json).await,
             },
             Some(Command::NativeHost { browser_args: _ }) => native_host::run().await,
+            Some(Command::Completions { .. } | Command::Man { .. }) => {
+                unreachable!("handled before the runtime starts")
+            }
             None => dashboard(cli.theme).await.map_err(Into::into),
         }
     });

@@ -4,6 +4,7 @@
 pub mod add;
 pub mod browser;
 pub mod control;
+pub mod docs;
 pub mod files;
 pub mod list;
 pub mod output;
