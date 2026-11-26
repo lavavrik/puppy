@@ -917,17 +917,61 @@ fn source_middle_ellipsis_keeps_filename() {
     );
 }
 
-/// Prints a realistic dashboard at a few sizes, for eyeballing:
-/// `cargo test -p puppy-tui --test render demo_render_print -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn demo_render_print() {
+/// A deterministic pseudo-random stream (xorshift), so the sample history looks like
+/// real traffic without varying between runs.
+fn jitter(seed: &mut u64) -> f64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed % 1000) as f64 / 1000.0
+}
+
+/// A realistic dashboard: every row state, an 8-connection HTTP download selected, and
+/// a noisy minute of speed history. Shared by `demo_render_print` and `hero_ansi`.
+fn demo_app(theme: Theme) -> App {
+    // Selected: an HTTP download over 8 connections, one segment already finished.
+    let total = 6 * GIB;
+    let seg = total / 8;
+    let done_pct = [100u64, 81, 74, 69, 77, 62, 58, 66];
+    let seg_bps = [0u64, 31, 36, 34, 29, 37, 33, 35]; // tenths of MiB/s
+    let segments: Vec<SegmentView> = (0..8)
+        .map(|i| SegmentView {
+            start: i * seg,
+            end: (i + 1) * seg,
+            done: seg * done_pct[i as usize] / 100,
+            bps: seg_bps[i as usize] * MIB / 10,
+            active: done_pct[i as usize] < 100,
+        })
+        .collect();
+    let done: u64 = segments.iter().map(|s| s.done).sum();
+    let bps: u64 = segments.iter().map(|s| s.bps).sum();
+    let mut ubuntu = snap(1, "ubuntu-24.04.3-desktop-amd64.iso", WireState::Active);
+    ubuntu.source = "https://releases.ubuntu.com/24.04.3/ubuntu-24.04.3-desktop-amd64.iso".into();
+    ubuntu.total_bytes = Some(total);
+    ubuntu.done_bytes = done;
+    ubuntu.down_bps = bps;
+    ubuntu.eta_secs = Some((total - done) / bps);
+    ubuntu.connections = Some(7);
+    ubuntu.limit = Some(40 * MIB);
+
+    let mut tor = snap(2, "debian-13.2.0-amd64-DVD-1.iso", WireState::Active);
+    tor.kind = EngineKindTag::Torrent;
+    tor.total_bytes = Some(3900 * MIB);
+    tor.done_bytes = 1520 * MIB;
+    tor.down_bps = 82 * MIB / 10;
+    tor.up_bps = 11 * MIB / 10;
+    tor.eta_secs = Some((2380 * MIB) / tor.down_bps);
+    tor.peers = Some(34);
+
     let mut q = snap(3, "archlinux-2026.11.01-x86_64.iso", WireState::Queued);
     q.queue_position = Some(0);
-    let mut tor = active(2, "debian-13.2.0-amd64-DVD-1.iso");
-    tor.kind = EngineKindTag::Torrent;
-    tor.peers = Some(34);
-    tor.up_bps = 400 * 1024;
+    q.total_bytes = Some(1200 * MIB);
+    q.done_bytes = 0;
+
+    let mut bunny = snap(4, "Big Buck Bunny 4K.mkv", WireState::Completed);
+    bunny.total_bytes = Some(2700 * MIB);
+    bunny.done_bytes = 2700 * MIB;
+
     let mut retry = snap(
         5,
         "big-dataset.tar.zst",
@@ -936,71 +980,184 @@ fn demo_render_print() {
             transient: true,
         },
     );
+    retry.total_bytes = Some(18 * GIB);
+    retry.done_bytes = 13 * GIB;
     retry.next_retry_unix = Some(1083);
-    let mut list = vec![
-        active(1, "ubuntu-24.04.3-desktop-amd64.iso"),
-        tor,
-        q,
-        snap(4, "Big Buck Bunny 4K.mkv", WireState::Completed),
-        retry,
-        snap(
-            6,
-            "photos.zip",
-            WireState::NeedsAttention {
-                reason: WireAttention::RemoteChanged,
-            },
-        ),
-        snap(7, "notes.pdf", WireState::Paused),
-        {
-            let mut s = snap(
-                8,
-                "debian-13.1.0-amd64-netinst.iso",
-                WireState::Seeding {
-                    uploaded: 430 * MIB,
-                    ratio: 0.42,
-                    seeded_secs: 2880,
-                    ratio_target: Some(1.0),
-                    time_target_secs: Some(7200),
-                },
-            );
-            s.kind = EngineKindTag::Torrent;
-            s.up_bps = 12 * MIB / 10;
-            s.peers = Some(7);
-            s
+
+    let mut photos = snap(
+        6,
+        "photos-2026.zip",
+        WireState::NeedsAttention {
+            reason: WireAttention::RemoteChanged,
         },
-        {
-            let mut c = snap(9, "Big.Show.S01.1080p", WireState::ChoosingFiles);
-            c.kind = EngineKindTag::Torrent;
-            c.total_bytes = Some(12 * GIB);
-            c.done_bytes = 0;
-            c
+    );
+    photos.total_bytes = Some(860 * MIB);
+    photos.done_bytes = 104 * MIB;
+
+    let mut notes = snap(7, "lecture-notes.pdf", WireState::Paused);
+    notes.total_bytes = Some(48 * MIB);
+    notes.done_bytes = 40 * MIB;
+
+    let mut seeding = snap(
+        8,
+        "debian-13.1.0-amd64-netinst.iso",
+        WireState::Seeding {
+            uploaded: 430 * MIB,
+            ratio: 0.42,
+            seeded_secs: 2880,
+            ratio_target: Some(1.0),
+            time_target_secs: Some(7200),
         },
+    );
+    seeding.kind = EngineKindTag::Torrent;
+    seeding.total_bytes = Some(1024 * MIB);
+    seeding.done_bytes = 1024 * MIB;
+    seeding.up_bps = 12 * MIB / 10;
+    seeding.peers = Some(7);
+
+    let mut choosing = snap(9, "Big.Show.S01.1080p", WireState::ChoosingFiles);
+    choosing.kind = EngineKindTag::Torrent;
+    choosing.total_bytes = Some(12 * GIB);
+    choosing.done_bytes = 0;
+
+    let list = vec![
+        ubuntu, tor, q, bunny, retry, photos, notes, seeding, choosing,
     ];
-    list[0].limit = Some(20 * MIB);
-    let mut a = app(list);
+    let mut a = app_with(theme, list);
+    a.daemon_version = Some(env!("CARGO_PKG_VERSION").into());
     a.now_unix = 1000;
-    a.detail = Some((1, http_detail()));
+    a.detail = Some((
+        1,
+        EngineDetail::Http {
+            segments,
+            connections: 7,
+            resumable: true,
+        },
+    ));
     a.totals = Totals {
-        down_bps: 14 * MIB,
-        up_bps: 400 * 1024,
+        down_bps: a.downloads[0].down_bps + a.downloads[1].down_bps,
+        up_bps: a.downloads[1].up_bps + a.downloads[7].up_bps,
         active: 2,
         queued: 1,
         paused: 1,
         completed: 1,
         failed: 2,
     };
+
+    // A minute of history: ramp-up, then noisy traffic around the current speeds.
     let mut h = puppy_tui::app::History::default();
     let t0 = Instant::now();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     for i in 0..80u64 {
+        let ramp = (i as f64 / 6.0).min(1.0);
         let mut d = a.downloads.clone();
-        d[0].down_bps = (5 + (i * 7 % 13)) * MIB;
+        for (k, x) in d.iter_mut().enumerate() {
+            let wobble = 0.75 + 0.4 * jitter(&mut seed);
+            let dip = if k == 0 && (34..38).contains(&i) {
+                0.35
+            } else {
+                1.0
+            };
+            x.down_bps = (x.down_bps as f64 * ramp * wobble * dip) as u64;
+        }
         let totals = Totals {
-            down_bps: (8 + i % 9) * MIB,
+            down_bps: d[0].down_bps + d[1].down_bps,
+            up_bps: a.totals.up_bps,
             ..Default::default()
         };
         h.record(&d, &totals, t0 + std::time::Duration::from_secs(i));
     }
     a.history = h;
+    a
+}
+
+/// A buffer as ANSI text (truecolor SGR codes), rows joined by CRLF with no trailing
+/// newline, so `cat` fills an exactly-sized terminal without scrolling.
+fn to_ansi(buf: &Buffer) -> String {
+    fn color(c: Color, fg: bool) -> String {
+        let base = if fg { 38 } else { 48 };
+        match c {
+            Color::Rgb(r, g, b) => format!(";{base};2;{r};{g};{b}"),
+            Color::Indexed(n) => format!(";{base};5;{n}"),
+            Color::Reset => String::new(),
+            other => panic!("hero frames are truecolor; got {other:?}"),
+        }
+    }
+    let a = buf.area;
+    let mut out = String::new();
+    for y in a.y..a.bottom() {
+        if y > a.y {
+            out.push_str("\x1b[0m\r\n");
+        }
+        let mut last = String::new();
+        let mut skip = 0;
+        for x in a.x..a.right() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let cell = &buf[(x, y)];
+            let m = cell.modifier;
+            let mut sgr = String::from("\x1b[0");
+            for (flag, code) in [
+                (Modifier::BOLD, ";1"),
+                (Modifier::DIM, ";2"),
+                (Modifier::ITALIC, ";3"),
+                (Modifier::UNDERLINED, ";4"),
+                (Modifier::REVERSED, ";7"),
+            ] {
+                if m.contains(flag) {
+                    sgr.push_str(code);
+                }
+            }
+            sgr.push_str(&color(cell.fg, true));
+            sgr.push_str(&color(cell.bg, false));
+            sgr.push('m');
+            if sgr != last {
+                out.push_str(&sgr);
+                last = sgr;
+            }
+            let sym = cell.symbol();
+            out.push_str(sym);
+            skip = sym.width().saturating_sub(1);
+        }
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
+/// Writes the README hero frame as ANSI text for `docs/hero.tape` to screenshot:
+/// `HERO_THEME=dark|light HERO_SIZE="$(stty size)" cargo test -p puppy-tui --test render
+/// hero_ansi -- --ignored` writes `target/hero-<theme>.ansi`.
+#[test]
+#[ignore]
+fn hero_ansi() {
+    let theme_name = std::env::var("HERO_THEME").unwrap_or_else(|_| "dark".into());
+    let choice = match theme_name.as_str() {
+        "dark" => ThemeChoice::Dark,
+        "light" => ThemeChoice::Light,
+        other => panic!("HERO_THEME must be dark or light, not {other:?}"),
+    };
+    let size = std::env::var("HERO_SIZE").unwrap_or_else(|_| "32 135".into());
+    let mut it = size.split_whitespace().map(|n| n.parse::<u16>().unwrap());
+    let (h, w) = (it.next().unwrap(), it.next().unwrap());
+    let theme = Theme::detect(choice, &|k| {
+        (k == "COLORTERM").then(|| "truecolor".to_string())
+    });
+    let mut a = demo_app(theme);
+    let buf = render_buf(&mut a, w, h);
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    let path = target.join(format!("hero-{theme_name}.ansi"));
+    std::fs::write(&path, to_ansi(&buf)).unwrap();
+    println!("{} ({w}×{h})", path.display());
+}
+
+/// Prints a realistic dashboard at a few sizes, for eyeballing:
+/// `cargo test -p puppy-tui --test render demo_render_print -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn demo_render_print() {
+    let mut a = demo_app(truecolor());
     for (w, hh) in [(120u16, 32u16), (90, 30), (80, 24)] {
         println!("--- {w}×{hh}");
         for r in render(&mut a, w, hh) {

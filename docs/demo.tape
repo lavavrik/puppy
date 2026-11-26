@@ -3,7 +3,8 @@
 # Everything is isolated: PUPPY_HOME (config, data, socket, daemon) and the download
 # directory (set through a throwaway config.toml) live in temp dirs that are deleted at
 # the end. The files come from docs/demo_server.py, a throttled (about 4 MiB/s per
-# connection), range-capable server on a free local port, so there is time to pause and
+# connection), range-capable server on 127.0.0.1:8642 (a fixed port: the URLs are typed into puppy, where
+# no shell expands variables), so there is time to pause and
 # resume. The recording ends by deleting both downloads in the dashboard and quitting;
 # the daemon (started with PUPPY_IDLE_EXIT=1) then idle-exits on its own, and the
 # cleanup waits for that before removing the temp dirs.
@@ -19,9 +20,9 @@ Set TypingSpeed 60ms
 
 Hide
 Type "export PUPPY_HOME=$(mktemp -d) DEMO=$(mktemp -d) PUPPY_IDLE_EXIT=1" Enter
-Type "mkdir -p $PUPPY_HOME/config && printf 'download_dir = \"%s\"\n' $DEMO/out > $PUPPY_HOME/config/config.toml" Enter
-Type "python3 docs/demo_server.py $DEMO/port ubuntu-24.04-desktop.iso=1G dataset.tar.zst=768M & sleep 1" Enter
-Type "PORT=$(cat $DEMO/port) || { echo 'demo server failed to start'; exit 1; }; clear" Enter
+Type `mkdir -p $PUPPY_HOME/config && printf 'download_dir = "%s"\n' $DEMO/out > $PUPPY_HOME/config/config.toml` Enter
+Type "python3 docs/demo_server.py 8642 ubuntu-24.04-desktop.iso=1G dataset.tar.zst=768M & sleep 1" Enter
+Type "kill -0 $! || { echo 'demo server failed to start (port 8642 busy?)'; exit 1; }; clear" Enter
 Show
 
 Type "puppy" Enter
@@ -30,13 +31,13 @@ Sleep 1.5s
 # Add two downloads.
 Type "a"
 Sleep 500ms
-Type "http://127.0.0.1:$PORT/ubuntu-24.04-desktop.iso"
+Type "http://127.0.0.1:8642/ubuntu-24.04-desktop.iso"
 Sleep 500ms
 Enter
 Sleep 1s
 Type "a"
 Sleep 500ms
-Type "http://127.0.0.1:$PORT/dataset.tar.zst"
+Type "http://127.0.0.1:8642/dataset.tar.zst"
 Sleep 500ms
 Enter
 Sleep 3s
