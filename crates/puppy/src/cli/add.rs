@@ -697,12 +697,13 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         {
             let verify = req.checksum.is_some();
             let mirrored = !req.mirrors.is_empty();
+            let sized = req.size.is_some();
             let name = label.or_else(|| req.filename.clone());
             // SFTP logins try this shell's agent first.
             let req = puppy_client::with_ssh_agent(req);
             let result = match client.add(req, paused, limit).await {
-                Ok(id) if verify || mirrored => {
-                    check_kept(&client, id, &shown, (verify, mirrored)).await
+                Ok(id) if verify || mirrored || sized => {
+                    check_kept(&client, id, &shown, (verify, mirrored, sized)).await
                 }
                 r => r.map_err(Into::into),
             };
@@ -769,28 +770,30 @@ enum AddError {
     NoChecksumSupport,
 }
 
-/// A daemon older than checksums or mirrors ignores those fields. Without its checksum
-/// the download would never be verified, so it is removed again. Without its mirrors it
-/// still downloads the right file, from the primary only: that is only warned about.
+/// A daemon older than checksums, mirrors or expected sizes ignores those fields.
+/// Without its checksum the download would never be verified, so it is removed again.
+/// Without its mirrors it still downloads the right file, from the primary only; without
+/// its expected size (a metalink's) its locations' sizes are not checked against it, and
+/// a checksum still is: both are only warned about.
 async fn check_kept(
     client: &puppy_client::Client,
     id: DownloadId,
     shown: &str,
-    (want_checksum, want_mirrors): (bool, bool),
+    (want_checksum, want_mirrors, want_size): (bool, bool, bool),
 ) -> Result<DownloadId, AddError> {
-    let (checksum, mirrors) = match client.call(Request::Get { id }).await? {
-        ReplyData::Download { download, .. } => {
-            (download.checksum.is_some(), !download.mirrors.is_empty())
-        }
-        _ => (false, false),
+    let kept = match client.call(Request::Get { id }).await? {
+        ReplyData::Download { download, .. } => (
+            download.checksum.is_some(),
+            !download.mirrors.is_empty(),
+            download.expected_size.is_some(),
+        ),
+        _ => (false, false, false),
     };
-    if want_mirrors && !mirrors {
-        err(format_args!(
-            "puppy: {shown}: warning: the running puppy daemon is too old for mirrors, \
-             so it downloads from the first URL only; run `puppy stop` to restart it"
-        ));
+    let (warnings, remove) = dropped_fields((want_checksum, want_mirrors, want_size), kept);
+    for w in warnings {
+        err(format_args!("puppy: {shown}: warning: {w}"));
     }
-    if checksum || !want_checksum {
+    if !remove {
         return Ok(id);
     }
     if let Err(e) = client
@@ -805,9 +808,49 @@ async fn check_kept(
     Err(AddError::NoChecksumSupport)
 }
 
+/// What a daemon that dropped some of the wanted fields (checksum, mirrors, expected
+/// size) means: warnings, and whether the download must be removed (a lost checksum).
+fn dropped_fields(
+    (want_checksum, want_mirrors, want_size): (bool, bool, bool),
+    (checksum, mirrors, size): (bool, bool, bool),
+) -> (Vec<&'static str>, bool) {
+    let mut warnings = Vec::new();
+    if want_size && !size {
+        warnings.push(
+            "the running puppy daemon is too old to check the metalink's file size; run \
+             `puppy stop` to restart it",
+        );
+    }
+    if want_mirrors && !mirrors {
+        warnings.push(
+            "the running puppy daemon is too old for mirrors, so it downloads from the \
+             first URL only; run `puppy stop` to restart it",
+        );
+    }
+    (warnings, want_checksum && !checksum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fields_an_old_daemon_dropped() {
+        let all = (true, true, true);
+        assert_eq!(dropped_fields(all, all), (vec![], false));
+        let (w, remove) = dropped_fields(all, (true, true, false));
+        assert!(!remove);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("file size"), "{w:?}");
+        let (w, remove) = dropped_fields(all, (false, false, false));
+        assert!(remove);
+        assert_eq!(w.len(), 2);
+        // Not wanted, not missed.
+        assert_eq!(
+            dropped_fields((false, false, false), (false, false, false)),
+            (vec![], false)
+        );
+    }
 
     #[test]
     fn stdin_encodings() {

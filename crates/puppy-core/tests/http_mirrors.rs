@@ -228,6 +228,69 @@ async fn expected_size_drops_a_stale_primary() {
     assert_eq!(shown[1].done_bytes, LEN);
 }
 
+/// A primary that reports no size (no Content-Length, no ranges) does not outvote a
+/// mirror that reports the expected one: the mirror is the reference and serves the file.
+#[tokio::test]
+async fn expected_size_prefers_a_location_that_reports_it() {
+    let a = server(|c| {
+        c.len = LEN + 1;
+        c.content_length = false;
+        c.ranges = false;
+    })
+    .await;
+    let b = server(|_| {}).await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = AddRequest {
+        size: Some(LEN),
+        ..request(&a, &[&b], dir.path())
+    };
+    let (dl, added) = start(req, cfg(dir.path())).await;
+    wait_completed(&dl).await;
+    assert_file(&added.path, LEN, 0);
+    let shown = mirrors(&dl);
+    assert!(dropped_reason(&shown[0]).contains("range"), "{shown:?}");
+    assert_eq!(shown[1].done_bytes, LEN);
+}
+
+/// No location reports a size: the one stream's file is checked against the expected
+/// size at the end and fails, instead of completing with another length.
+#[tokio::test]
+async fn expected_size_checks_the_finished_file() {
+    let a = server(|c| {
+        c.len = LEN + 1;
+        c.content_length = false;
+        c.ranges = false;
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let req = AddRequest {
+        size: Some(LEN),
+        ..request(&a, &[], dir.path())
+    };
+    let (dl, _) = start(req, cfg(dir.path())).await;
+    let st = wait_status(
+        &dl,
+        |s| {
+            matches!(
+                s.state,
+                DownloadState::Failed { .. } | DownloadState::Completed
+            )
+        },
+        TIMEOUT,
+    )
+    .await;
+    match st.state {
+        DownloadState::Failed { reason, transient } => {
+            assert!(!transient);
+            assert!(
+                reason.contains(&format!("{} bytes, not the expected {LEN}", LEN + 1)),
+                "{reason}"
+            );
+        }
+        other => panic!("completed with the wrong size: {other:?}"),
+    }
+}
+
 /// No location serving the expected size fails the add, not transiently.
 #[tokio::test]
 async fn expected_size_nowhere_fails_the_add() {

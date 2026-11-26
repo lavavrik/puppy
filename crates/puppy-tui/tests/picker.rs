@@ -47,6 +47,7 @@ fn torrent(id: DownloadId, name: &str, state: WireState) -> DownloadSnapshot {
         seed: None,
         checksum: None,
         mirrors: Vec::new(),
+        expected_size: None,
     }
 }
 

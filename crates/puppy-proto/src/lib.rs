@@ -314,6 +314,9 @@ pub struct DownloadSnapshot {
     /// masked), in the order given; how each is used is in the engine detail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrors: Vec<String>,
+    /// The size the file must have (a Metalink's `<size>`), if one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_size: Option<u64>,
 }
 
 /// Where a download with a checksum stands with it, derived from its state.
@@ -519,6 +522,7 @@ mod tests {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            expected_size: None,
         }
     }
 

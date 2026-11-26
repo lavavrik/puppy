@@ -1,5 +1,6 @@
-//! Completing a finalized download: hashing it against the request's checksum (if any)
-//! off the async runtime, then `Completed` or `Failed`.
+//! Completing a finalized download: checking its length against the request's expected
+//! size and hashing it against its checksum (if any) off the async runtime, then
+//! `Completed` or `Failed`.
 //!
 //! A download with a checksum keeps its sidecar next to the finished file until the
 //! check has passed, so a restart in between (or after a mismatch) finds it finalized
@@ -20,6 +21,27 @@ use tokio_util::sync::CancellationToken;
 /// kept), or `Stopped` if `cancel` fired meanwhile (the hashing thread has stopped and
 /// closed the file by then).
 pub(super) async fn complete(inner: &Arc<Inner>, cancel: &CancellationToken) -> RunEnd {
+    // An expected size (a Metalink's) is checked first: with no location reporting a
+    // size, nothing else did.
+    if let Some(want) = inner.request.size {
+        let path = inner.lock().path.clone();
+        let reason = match tokio::fs::metadata(&path).await {
+            Ok(m) if m.len() == want => None,
+            Ok(m) => Some(format!(
+                "the finished file is {} bytes, not the expected {want}",
+                m.len()
+            )),
+            Err(e) => Some(format!("checking the finished file's size failed: {e}")),
+        };
+        if let Some(reason) = reason {
+            tracing::warn!(id = inner.id, path = %path.display(), "{reason}");
+            inner.set_state(DownloadState::Failed {
+                reason,
+                transient: false,
+            });
+            return RunEnd::Finished;
+        }
+    }
     if let Some(sum) = inner.request.checksum.clone() {
         inner.hashed.store(0, Ordering::Relaxed);
         inner.set_state(DownloadState::Verifying);

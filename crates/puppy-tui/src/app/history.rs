@@ -111,6 +111,7 @@ mod tests {
             seed: None,
             checksum: None,
             mirrors: Vec::new(),
+            expected_size: None,
         }
     }
 

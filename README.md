@@ -793,8 +793,13 @@ How a `<file>` is used:
 - **Size.** `<size>` is checked against every location when the download
   starts: one that reports another size is dropped, even the primary, and if
   every location that answers does, the download fails
-  (`the file is N bytes, not the expected M`). A location that does not report
-  a size is used.
+  (`the file is N bytes, not the expected M`). A location that reports the
+  size decides what the file is; one that does not report a size comes after
+  it and is taken to have it (the totals of its range responses are checked).
+  The finished file's length is checked too, before its hash: a download whose
+  locations never said their size fails if it ends up with another length.
+  Snapshots show the size as `"expected_size"`; a daemon too old to check it
+  ignores it, and `add` warns.
 - **Name.** `<name>` may contain subdirectories (`iso/x86_64/a.iso`), which
   are created below the output folder (`-o`, an entry's `dir`, or the daemon's
   download folder). The name comes from a document puppy does not control, so

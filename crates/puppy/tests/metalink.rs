@@ -109,6 +109,7 @@ async fn local_meta4_with_two_mirrors() {
     let fin = &v["final"][0];
     assert_eq!(fin["state"]["kind"], "completed", "{out}");
     assert_eq!(fin["checksum"]["algo"], "sha-256", "{out}");
+    assert_eq!(fin["expected_size"], LEN, "{out}");
     assert_eq!(
         fin["mirrors"],
         serde_json::json!([b.url("/file.bin").to_string()]),

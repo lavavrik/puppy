@@ -56,7 +56,8 @@ pub(super) async fn prepare(
 ///
 /// With an `expected` size (a Metalink's), a location reporting another size is dropped
 /// first, so a stale primary cannot outvote the mirrors; if every location that answered
-/// had another size, the download fails (not transiently).
+/// had another size, the download fails (not transiently). If one reports the expected
+/// size, it is the reference, and locations that report none are ranked after it.
 pub(super) fn choose(
     mirrors: &mut [MirrorRt],
     probes: Vec<Result<RemoteInfo, EngineError>>,
@@ -76,6 +77,17 @@ pub(super) fn choose(
                 mirrors[i].drop_with(kind_of(&e), format!("probe failed: {e}"));
                 first_err.get_or_insert(e);
             }
+        }
+    }
+    if let Some(want) = expected
+        && answered.iter().any(|(_, info)| info.total == Some(want))
+    {
+        // A location that reports the expected size decides. One that reports no size
+        // is ranked below and taken to have it: the totals of its range responses are
+        // checked against it, and the finished file's length is checked in the end.
+        answered.sort_by_key(|(_, info)| info.total.is_none());
+        for (_, info) in &mut answered {
+            info.total.get_or_insert(want);
         }
     }
     let Some((_, reference)) = answered.first().cloned() else {

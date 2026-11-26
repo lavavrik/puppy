@@ -113,6 +113,7 @@ impl Inner {
             note: status.as_ref().and_then(|s| s.note.clone()),
             seed: e.rec.request.seed.clone(),
             checksum: e.rec.request.checksum.clone(),
+            expected_size: e.rec.request.size,
             mirrors: e
                 .rec
                 .request
