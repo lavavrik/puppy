@@ -86,10 +86,11 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Add downloads from URLs, magnet links or .torrent files (`-` reads them from
-    /// stdin, `-i` from an aria2-style input file).
+    /// Add downloads from URLs, magnet links, .torrent files or metalinks (`-` reads them
+    /// from stdin, `-i` from an aria2-style input file).
     Add {
-        /// URLs, magnet links, .torrent paths; `-` reads one per line from stdin.
+        /// URLs, magnet links, .torrent or .meta4/.metalink paths or URLs; `-` reads one
+        /// per line from stdin.
         #[arg(required_unless_present = "input_file", value_name = "SOURCE")]
         sources: Vec<String>,
         /// Read downloads from an aria2-style input file (`-`: stdin): one URI per
@@ -101,7 +102,7 @@ enum Command {
         /// Save into this folder (default: the daemon's download folder).
         #[arg(short = 'o', long, value_name = "DIR")]
         output_dir: Option<PathBuf>,
-        /// Save under this file name (one source only).
+        /// Save under this file name (one source only; a metalink of one file).
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Add without starting.
@@ -131,6 +132,14 @@ enum Command {
         /// between them. Cookies and headers go to the source's origin only.
         #[arg(long = "mirror", value_name = "URL")]
         mirrors: Vec<String>,
+        /// Read every source as a metalink, a file or an HTTP(S) URL, whatever its name
+        /// (asking the server for one: MirrorBrain answers a file's URL with its metalink).
+        /// Without it, .meta4/.metalink files and URLs and files that look like one are.
+        #[arg(long, conflicts_with = "no_metalink")]
+        metalink: bool,
+        /// Download .meta4/.metalink sources as files instead of reading them.
+        #[arg(long)]
+        no_metalink: bool,
         /// Torrent: download only these files, by number as `puppy files` shows
         /// them (`1,3-5`) and/or glob (`*.mkv`); repeatable. Every comma splits
         /// specs: use numbers for brace globs or names containing a comma.
@@ -368,6 +377,8 @@ fn main() -> ExitCode {
                 seed_time,
                 input_file,
                 mirrors,
+                metalink,
+                no_metalink,
             }) => {
                 cli::add::run(
                     &Ctx::from_env(cli.json)?,
@@ -387,6 +398,8 @@ fn main() -> ExitCode {
                         seed_time,
                         input_file,
                         mirrors,
+                        metalink,
+                        no_metalink,
                     },
                     wait,
                 )

@@ -1,7 +1,9 @@
-//! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files or stdin.
+//! `puppy add`: queue downloads from URLs, magnet links, `.torrent` files, metalinks or
+//! stdin.
 
 use super::files::parse_spec;
 use super::input_file::{self, EntryOptions, LineError, split_header};
+use super::metalink::{self, Detect, Pending};
 use super::output::{err, json, out};
 use super::seed;
 use super::wait::{Waited, absorb, finish, interruptible, until_done};
@@ -44,12 +46,22 @@ pub struct AddArgs {
     pub input_file: Option<PathBuf>,
     /// `--mirror URL` (repeatable): other locations of the one URL source's file.
     pub mirrors: Vec<String>,
+    /// `--metalink`: every source is a metalink (file or HTTP(S) URL).
+    pub metalink: bool,
+    /// `--no-metalink`: none is; a `.meta4` is downloaded as a file.
+    pub no_metalink: bool,
 }
 
 #[derive(Serialize)]
 struct Added {
     id: DownloadId,
     source: String,
+    /// A metalink's file: its path below the output folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// A metalink's file: the metalink, as given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metalink: Option<String>,
 }
 
 /// A source that could not be added (`code` is the exit code it contributes).
@@ -137,40 +149,43 @@ fn expand_sources(sources: Vec<String>, more: bool) -> Result<Vec<String>, CliEr
 
 /// The command-line flags every source starts from; an input file's options override
 /// them per entry.
-struct Defaults {
-    output_dir: Option<PathBuf>,
-    name: Option<String>,
-    paused: bool,
-    limit: Option<u64>,
+pub(super) struct Defaults {
+    pub output_dir: Option<PathBuf>,
+    pub name: Option<String>,
+    pub paused: bool,
+    pub limit: Option<u64>,
     context: RequestContext,
     choice: FileChoice,
     seed: Option<SeedPolicy>,
-    checksum: Option<Checksum>,
+    pub checksum: Option<Checksum>,
     /// `--mirror`s (for the one source there is).
-    mirrors: Vec<Mirror>,
+    pub mirrors: Vec<Mirror>,
 }
 
 /// One download to add, fully decided.
-struct Planned {
-    /// The source as the user wrote it (`added[].source`).
-    shown: String,
-    req: AddRequest,
-    paused: bool,
-    limit: Option<u64>,
+pub(super) struct Planned {
+    /// The source as the user wrote it (`added[].source`); a metalink's file: its
+    /// primary URL.
+    pub shown: String,
+    /// What `added` prints instead of the source or name (a metalink file's path).
+    pub label: Option<String>,
+    /// The metalink a file comes from, as given.
+    pub metalink: Option<String>,
+    pub req: AddRequest,
+    pub paused: bool,
+    pub limit: Option<u64>,
+}
+
+/// A source in the order given: ready, or a metalink still to be read.
+enum Item {
+    Ready(Planned),
+    Metalink(Pending),
 }
 
 impl Defaults {
-    /// `source` with these defaults, overridden by `o` (an input-file entry's options;
-    /// empty for a command-line source). An entry's `header` replaces a `-H` of the same
-    /// name and adds the rest; a seeding option replaces only its half of the policy.
-    /// `mirrors` are the entry's own (TAB-separated URIs); `--mirror`s come after them.
-    fn plan(
-        &self,
-        shown: String,
-        source: Source,
-        mirrors: Vec<Mirror>,
-        o: &EntryOptions,
-    ) -> Planned {
+    /// The request context with `o`'s overrides: an entry's `header` replaces a `-H` of
+    /// the same name and adds the rest.
+    pub fn context_for(&self, o: &EntryOptions) -> RequestContext {
         let mut context = self.context.clone();
         context.headers.retain(|(n, _)| {
             !o.headers
@@ -184,6 +199,21 @@ impl Defaults {
         if let Some(u) = &o.user_agent {
             context.user_agent = Some(u.clone());
         }
+        context
+    }
+
+    /// `source` with these defaults, overridden by `o` (an input-file entry's options;
+    /// empty for a command-line source; see [`Defaults::context_for`]). A seeding option
+    /// replaces only its half of the policy. `mirrors` are the entry's own
+    /// (TAB-separated URIs); `--mirror`s come after them.
+    fn plan(
+        &self,
+        shown: String,
+        source: Source,
+        mirrors: Vec<Mirror>,
+        o: &EntryOptions,
+    ) -> Planned {
+        let context = self.context_for(o);
         let seed = if o.seed_ratio.is_some() || o.seed_time.is_some() {
             let base = self.seed.clone().unwrap_or_default();
             Some(SeedPolicy {
@@ -206,6 +236,8 @@ impl Defaults {
         };
         Planned {
             shown,
+            label: None,
+            metalink: None,
             req: AddRequest {
                 source,
                 output_dir: o.dir.clone().or_else(|| self.output_dir.clone()),
@@ -226,15 +258,17 @@ impl Defaults {
     }
 }
 
-/// Reads `-i FILE` (`-`: stdin) into planned adds. Unsupported options are warned about
-/// on stderr. Any invalid entry fails the whole file, every problem reported with its
-/// line, so that nothing is added: a script then fixes the file and runs it again,
-/// instead of having to work out which half of the list is already queued.
+/// Reads `-i FILE` (`-`: stdin) into planned adds (metalinks still to be read).
+/// Unsupported options are warned about on stderr. Any invalid entry fails the whole
+/// file, every problem reported with its line, so that nothing is added: a script then
+/// fixes the file and runs it again, instead of having to work out which half of the
+/// list is already queued.
 fn plan_input_file(
     path: &Path,
     defaults: &Defaults,
     wait: bool,
-) -> Result<(String, Vec<Planned>), CliError> {
+    detect: Detect,
+) -> Result<(String, Vec<Item>), CliError> {
     let (label, text) = if path == Path::new("-") {
         ("stdin".to_string(), read_stdin()?)
     } else {
@@ -260,6 +294,40 @@ fn plan_input_file(
             })
         };
         let uri = &entry.uris[0];
+        let location = match detect.check(uri) {
+            Ok(l) => l,
+            Err(e) => {
+                bad(format!("{uri}: {e}"));
+                continue;
+            }
+        };
+        if let Some(location) = location {
+            if entry.uris.len() > 1 {
+                bad(format!(
+                    "{uri} is a metalink: its mirrors come from it, not from TAB-separated \
+                     URIs"
+                ));
+                continue;
+            }
+            let Some(o) = options else { continue };
+            if let Some(key) = o.torrent_only() {
+                bad(format!(
+                    "{key} only applies to torrents, but {uri} is a metalink"
+                ));
+                continue;
+            }
+            if wait && o.pause == Some(true) {
+                bad("pause=true does not go with --wait: a paused download never ends".into());
+                continue;
+            }
+            planned.push(Item::Metalink(Pending {
+                shown: unquote(uri).to_string(),
+                location,
+                options: o,
+                origin: Some(format!("{label}: line {}", entry.line)),
+            }));
+            continue;
+        }
         let source = match parse_source(uri) {
             Ok(s) => s,
             Err(e) => {
@@ -303,7 +371,12 @@ fn plan_input_file(
             bad("pause=true does not go with --wait: a paused download never ends".into());
             continue;
         }
-        planned.push(defaults.plan(unquote(uri).to_string(), source, mirrors, &o));
+        planned.push(Item::Ready(defaults.plan(
+            unquote(uri).to_string(),
+            source,
+            mirrors,
+            &o,
+        )));
     }
     errors.sort_by_key(|e| e.line);
     match errors.as_slice() {
@@ -464,9 +537,14 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         mirrors,
     };
 
+    let detect = Detect {
+        force: args.metalink,
+        off: args.no_metalink,
+    };
+
     // Plan everything first: usage-level problems should not leave a half-done add.
     let from_file = match &file {
-        Some(path) => Some(plan_input_file(path, &defaults, wait)?),
+        Some(path) => Some(plan_input_file(path, &defaults, wait, detect)?),
         None => None,
     };
     let file_count = from_file.as_ref().map_or(0, |(_, p)| p.len());
@@ -495,13 +573,29 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
     }
 
     let mut failed = Vec::new();
-    let mut planned = Vec::new();
+    let mut items = Vec::new();
     let none = EntryOptions::default();
     for s in &sources {
-        match parse_source(s) {
-            Ok(source) => {
-                planned.push(defaults.plan(unquote(s).to_string(), source, Vec::new(), &none))
+        match detect.check(s) {
+            Err(e) => return Err(CliError::Usage(format!("{s}: {e}"))),
+            Ok(Some(location)) => {
+                items.push(Item::Metalink(Pending {
+                    shown: unquote(s).to_string(),
+                    location,
+                    options: EntryOptions::default(),
+                    origin: None,
+                }));
+                continue;
             }
+            Ok(None) => {}
+        }
+        match parse_source(s) {
+            Ok(source) => items.push(Item::Ready(defaults.plan(
+                unquote(s).to_string(),
+                source,
+                Vec::new(),
+                &none,
+            ))),
             Err(e) => {
                 err(format_args!("puppy: {s}: {e}"));
                 failed.push(Failed {
@@ -512,7 +606,28 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
             }
         }
     }
-    planned.extend(from_file.into_iter().flat_map(|(_, p)| p));
+    items.extend(from_file.into_iter().flat_map(|(_, p)| p));
+
+    // Metalinks become one download per file. One that cannot be read or fetched is
+    // reported like a source that cannot be added.
+    let mut env = metalink::Env::new(ctx);
+    let mut planned = Vec::new();
+    for item in items {
+        match item {
+            Item::Ready(p) => planned.push(p),
+            Item::Metalink(m) => match metalink::expand(&mut env, &defaults, &m).await? {
+                Ok(files) => planned.extend(files),
+                Err(e) => {
+                    err(format_args!("puppy: {}: {e}", m.shown));
+                    failed.push(Failed {
+                        source: m.shown,
+                        error: e,
+                        code: 1,
+                    });
+                }
+            },
+        }
+    }
 
     if defaults.choice != FileChoice::All || defaults.seed.is_some() {
         let flags = if args.choose {
@@ -567,9 +682,14 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
 
     let mut added = Vec::new();
     if !planned.is_empty() {
-        let client = ctx.client().await?;
+        let client = match env.client.take() {
+            Some(c) => c,
+            None => ctx.client().await?,
+        };
         for Planned {
             shown,
+            label,
+            metalink,
             req,
             paused,
             limit,
@@ -577,7 +697,7 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
         {
             let verify = req.checksum.is_some();
             let mirrored = !req.mirrors.is_empty();
-            let name = req.filename.clone();
+            let name = label.or_else(|| req.filename.clone());
             // SFTP logins try this shell's agent first.
             let req = puppy_client::with_ssh_agent(req);
             let result = match client.add(req, paused, limit).await {
@@ -594,7 +714,12 @@ pub async fn add(ctx: &Ctx, args: AddArgs, wait: bool) -> Result<AddOutcome, Cli
                             name.as_deref().unwrap_or(&shown)
                         ));
                     }
-                    added.push(Added { id, source: shown });
+                    added.push(Added {
+                        id,
+                        source: shown,
+                        name: metalink.is_some().then(|| name.clone()).flatten(),
+                        metalink,
+                    });
                 }
                 Err(e) => {
                     err(format_args!("puppy: {shown}: {e}"));

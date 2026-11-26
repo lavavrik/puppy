@@ -7,6 +7,7 @@ pub mod control;
 pub mod files;
 pub mod input_file;
 pub mod list;
+mod metalink;
 pub mod output;
 pub mod seed;
 pub mod ssh;
