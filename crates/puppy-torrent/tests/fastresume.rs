@@ -303,17 +303,25 @@ async fn corrupt_piece_found_by_the_spot_check_falls_back_to_the_full_check() {
     let root = root.path();
     let req = torrent_req(root, &seeder);
     let (first, added, before, bits) = download_part(root, &seeder, 1, req.clone()).await;
-    // The first piece had that lies inside one file.
+    // The piece the spot check always hashes for a file: the first claimed piece that
+    // overlaps it, which may be shared with the file before it (the files' order in the
+    // torrent follows the seeder's directory listing, so it differs between systems).
+    // The torrent's last piece is shorter; skip it so the expected count below holds.
+    let plen = PIECE_LENGTH as u64;
+    let last = (total().div_ceil(plen) - 1) as usize;
     let (rel, range, piece) = {
         let mut found = None;
         for (rel, _) in MULTI {
             let range = file_range(&first, 1, rel).await;
-            if let Some(p) = whole_pieces(&range).find(|&p| bits[p]) {
+            let overlapping = (range.start / plen) as usize..range.end.div_ceil(plen) as usize;
+            if let Some(p) = overlapping.into_iter().find(|&p| bits[p])
+                && p != last
+            {
                 found = Some((*rel, range, p));
                 break;
             }
         }
-        found.expect("a whole piece was had")
+        found.expect("a file's first claimed piece was had")
     };
     first.shutdown().await;
     drop(first);
@@ -324,7 +332,8 @@ async fn corrupt_piece_found_by_the_spot_check_falls_back_to_the_full_check() {
     let a = added.path.join(rel);
     let mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
     let mut data = std::fs::read(&a).unwrap();
-    data[(piece as u64 * PIECE_LENGTH as u64 - range.start) as usize] ^= 0xFF;
+    // A byte of that piece inside this file (the piece may start in the file before).
+    data[((piece as u64 * plen).max(range.start) - range.start) as usize] ^= 0xFF;
     std::fs::write(&a, &data).unwrap();
     set_mtime(&a, mtime);
 
