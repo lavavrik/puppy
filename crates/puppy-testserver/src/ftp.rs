@@ -12,24 +12,83 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{self, pki_types::pem::PemObject};
+use tokio_rustls::rustls;
+
+/// The test PKI: a CA and a `localhost`/`127.0.0.1` server certificate it signed, made
+/// once per process. Generated rather than committed so they are always short-lived:
+/// Apple's verifier rejects TLS server certificates valid for more than 825 days
+/// (errSecCertificateValidityPeriodTooLong), even under a user-supplied root.
+struct TestPki {
+    ca_pem: String,
+    ca_der: Vec<u8>,
+    server_cert_der: Vec<u8>,
+    server_key_der: Vec<u8>,
+}
+
+fn test_pki() -> &'static TestPki {
+    static PKI: OnceLock<TestPki> = OnceLock::new();
+    PKI.get_or_init(|| {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose, SanType,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let not_before = now - time::Duration::days(1);
+        let not_after = now + time::Duration::days(30);
+
+        let mut ca = CertificateParams::default();
+        ca.distinguished_name
+            .push(DnType::CommonName, "puppy test CA");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca.not_before = not_before;
+        ca.not_after = not_after;
+        let ca_key = KeyPair::generate().expect("test CA key");
+        let ca_cert = ca.self_signed(&ca_key).expect("test CA certificate");
+        let issuer = Issuer::new(ca, ca_key);
+
+        let mut leaf = CertificateParams::default();
+        leaf.distinguished_name
+            .push(DnType::CommonName, "localhost");
+        leaf.subject_alt_names = vec![
+            SanType::DnsName("localhost".try_into().expect("DNS name")),
+            SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+        ];
+        leaf.is_ca = IsCa::ExplicitNoCa;
+        // An ECDSA key: digitalSignature only (keyEncipherment is for RSA key transport).
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf.use_authority_key_identifier_extension = true;
+        leaf.not_before = not_before;
+        leaf.not_after = not_after;
+        let leaf_key = KeyPair::generate().expect("test server key");
+        let leaf_cert = leaf
+            .signed_by(&leaf_key, &issuer)
+            .expect("test server certificate");
+
+        TestPki {
+            ca_pem: ca_cert.pem(),
+            ca_der: ca_cert.der().to_vec(),
+            server_cert_der: leaf_cert.der().to_vec(),
+            server_key_der: leaf_key.serialize_der(),
+        }
+    })
+}
 
 /// The test CA (PEM) that signed the server certificate (`localhost`, `127.0.0.1`).
-pub const TEST_CA_PEM: &str = include_str!("../certs/ca.pem");
-const SERVER_CERT_PEM: &str = include_str!("../certs/server.pem");
-const SERVER_KEY_PEM: &str = include_str!("../certs/server.key");
+pub fn test_ca_pem() -> &'static str {
+    &test_pki().ca_pem
+}
 
 /// The test CA as DER, for a client's trusted roots.
 pub fn test_ca_der() -> Vec<u8> {
-    rustls::pki_types::CertificateDer::from_pem_slice(TEST_CA_PEM.as_bytes())
-        .expect("bundled test CA")
-        .to_vec()
+    test_pki().ca_der.clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,11 +184,11 @@ impl Drop for FtpServer {
 }
 
 fn acceptor() -> TlsAcceptor {
-    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(SERVER_CERT_PEM.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .expect("bundled test certificate");
-    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(SERVER_KEY_PEM.as_bytes())
-        .expect("bundled test key");
+    let pki = test_pki();
+    let certs = vec![rustls::pki_types::CertificateDer::from(
+        pki.server_cert_der.clone(),
+    )];
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(pki.server_key_der.clone()).into();
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

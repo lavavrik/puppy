@@ -1,5 +1,4 @@
 /target
 .superpowers/
 *.pem
-!/crates/puppy-testserver/certs/*.pem
 /dist

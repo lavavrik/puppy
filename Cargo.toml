@@ -67,6 +67,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 # (compression); `rsa` for RSA host and user keys.
 russh = { version = "0.65", default-features = false, features = ["aws-lc-rs", "rsa"] }
 russh-sftp = "4"
+# Test certificates generated at run time (puppy-testserver only), on aws-lc-rs like rustls.
+# Short-lived on purpose: Apple's verifier rejects TLS server certificates valid > 825 days.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+time = "0.3"
 
 # Release binaries (GitHub releases): `cargo build --profile dist`. Kept separate so
 # everyday `--release` builds stay quick.

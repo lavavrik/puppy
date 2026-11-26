@@ -20,3 +20,5 @@ zip.workspace = true
 tokio-rustls.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
+rcgen.workspace = true
+time.workspace = true
