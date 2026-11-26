@@ -88,6 +88,9 @@ pub struct SftpCfg {
     pub max_read: Option<u32>,
     /// Answer reads with this many bytes more than asked for (a broken server).
     pub oversize_reads: Option<u32>,
+    /// Never answer the SFTP subsystem request, sending channel data every 50 ms
+    /// instead (a server that keeps a client waiting).
+    pub stall_subsystem: bool,
 }
 
 impl Default for SftpCfg {
@@ -108,6 +111,7 @@ impl Default for SftpCfg {
             fail_after_bytes_once: None,
             max_read: None,
             oversize_reads: None,
+            stall_subsystem: false,
         }
     }
 }
@@ -446,6 +450,15 @@ impl russh::server::Handler for Ssh {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.cfg.stall_subsystem {
+            let handle = session.handle();
+            tokio::spawn(async move {
+                while handle.data(channel_id, &b"."[..]).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+            return Ok(());
+        }
         match (name, self.channels.remove(&channel_id)) {
             ("sftp", Some(channel)) => {
                 session.channel_success(channel_id)?;

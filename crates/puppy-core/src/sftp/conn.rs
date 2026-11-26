@@ -361,9 +361,12 @@ impl Conn {
         if let Err(e) = channel.request_subsystem(true, "sftp").await {
             return Err(refused("the SFTP subsystem", &e));
         }
-        // The reply to the subsystem request.
+        // The reply to the subsystem request, within one deadline however many other
+        // channel messages come first.
+        let deadline = tokio::time::Instant::now() + read;
         loop {
-            match timed(read, channel.wait()).await {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match timed(left, channel.wait()).await {
                 Ok(Some(russh::ChannelMsg::Success)) => break,
                 Ok(Some(russh::ChannelMsg::Failure)) => {
                     return Err(OpenError::Fatal(EngineError::Ssh(format!(

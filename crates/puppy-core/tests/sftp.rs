@@ -806,3 +806,30 @@ async fn agents_without_keys_or_gone_are_passed_over() {
         "{logins:?}"
     );
 }
+
+/// A server that never answers the SFTP subsystem request, while sending other channel
+/// messages, is given up on within the read timeout (not kept waiting by each message).
+#[tokio::test]
+async fn a_stalled_subsystem_request_times_out() {
+    let fx = Fx::new(|c| c.stall_subsystem = true).await;
+    fx.s.set_file("/f", data(KIB, 0), MTIME);
+    let cfg = fx.cfg_with(|c| {
+        c.read_timeout_ms = 500;
+        c.max_retries = 0;
+    });
+    let t = Instant::now();
+    let e = HttpEngine::new(cfg).unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        e.add(
+            1,
+            fx.request(fx.s.url("/f")),
+            StartMode::Fresh,
+            AddOptions::default(),
+        ),
+    )
+    .await
+    .expect("the add hangs");
+    assert!(r.is_err(), "{r:?}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}

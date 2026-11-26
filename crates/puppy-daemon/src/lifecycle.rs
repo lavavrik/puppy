@@ -693,9 +693,16 @@ fn is_secret_target(target: &str) -> bool {
 }
 
 fn is_ssh_target(target: &str) -> bool {
-    ["russh", "russh_sftp", "russh_cryptovec", "ssh_key"]
-        .iter()
-        .any(|t| target == *t || target.strip_prefix(t).is_some_and(|r| r.starts_with("::")))
+    [
+        "russh",
+        "russh_sftp",
+        "russh_cryptovec",
+        "russh_util",
+        "ssh_key",
+        "pageant",
+    ]
+    .iter()
+    .any(|t| target == *t || target.strip_prefix(t).is_some_and(|r| r.starts_with("::")))
 }
 
 fn init_logging(log_dir: &Path) {
@@ -746,7 +753,14 @@ mod log_filter_tests {
         for t in ["puppy_core::ftp::session", "suppaftpx", "puppy_daemon"] {
             assert!(!super::is_secret_target(t), "{t}");
         }
-        for t in ["russh", "russh::client::encrypted", "russh_sftp::client"] {
+        for t in [
+            "russh",
+            "russh::client::encrypted",
+            "russh_sftp::client",
+            "russh_util::runtime",
+            "pageant",
+            "pageant::pageant_impl",
+        ] {
             assert!(super::is_ssh_target(t), "{t}");
         }
         for t in ["russhx", "puppy_core::sftp::auth"] {
