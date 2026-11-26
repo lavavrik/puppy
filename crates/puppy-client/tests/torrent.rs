@@ -204,6 +204,27 @@ async fn call_ok(c: &Client, req: Request) {
     assert_eq!(c.call(req).await.unwrap(), ReplyData::Done);
 }
 
+/// [`call_ok`] for a download just restored after a restart: it may already show its
+/// restored state while the daemon is still finishing the restore, which the daemon
+/// answers with "being restored; try again shortly". Retries only that answer.
+async fn call_ok_after_restore(c: &Client, req: Request) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match c.call(req.clone()).await {
+            Err(ClientError::Daemon {
+                code: ErrorCode::InvalidState,
+                message,
+            }) if message.contains("being restored") && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => {
+                assert_eq!(other.unwrap(), ReplyData::Done);
+                return;
+            }
+        }
+    }
+}
+
 async fn snapshot(c: &Client, id: DownloadId) -> DownloadSnapshot {
     c.list()
         .await
@@ -1130,7 +1151,7 @@ async fn restart_keeps_magnet_choosing() {
     let files = list_files(&c, id).await;
     assert_eq!(files.len(), 2);
     let ib = files.iter().position(|f| f.path == "sub/b.bin").unwrap();
-    call_ok(&c, select(id, &[ib])).await;
+    call_ok_after_restore(&c, select(id, &[ib])).await;
     let seen = watch(&c, id, "chosen magnet done", is_done).await;
     assert_eq!(seen.last().unwrap().done_bytes, MULTI[1].1 as u64);
     env.shutdown(d, c).await;
