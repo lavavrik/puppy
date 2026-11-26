@@ -5,7 +5,9 @@
 #
 # Picks the archive for this machine, checks it against its published SHA-256,
 # and installs the binary to ~/.local/bin (Linux and macOS), a folder puppy can
-# replace itself in when it updates.
+# replace itself in when it updates. Shell completions (for the bash, zsh and fish
+# found on this machine) and the man pages go to their per-user folders under
+# your home directory.
 # The unpacked archive, with the browser extension and service files, is kept in
 # ~/.local/share/puppy-install. Set PUPPY_VERSION=0.1.0 to pick a version, or
 # PUPPY_BIN_DIR to install somewhere else (a folder you cannot write
@@ -53,11 +55,59 @@ else
 fi
 
 echo "Installed $("$bin/puppy" --version) to $bin/puppy"
+
+# Completions and man pages, from archives that have them (older releases do
+# not), into per-user folders only. An XDG folder outside $HOME is ignored: this
+# script never writes outside your home directory. A folder that cannot be
+# written is skipped.
+under_home() { # under_home <dir> <default>: <dir> if it is inside $HOME
+  case $1 in
+    */../* | */..) echo "$2" ;;
+    "$HOME"/?*) echo "$1" ;;
+    *) echo "$2" ;;
+  esac
+}
+data=$(under_home "${XDG_DATA_HOME:-}" "$HOME/.local/share")
+config=$(under_home "${XDG_CONFIG_HOME:-}" "$HOME/.config")
+put() { # put <file> <dir> <name>
+  if mkdir -p "$2" 2>/dev/null && install -m 644 "$1" "$2/$3" 2>/dev/null; then
+    echo "  $2/$3"
+  else
+    echo "  (skipped $2/$3: cannot write there)"
+  fi
+}
+zsh_dir=
+if [ -d "$name/completions" ]; then
+  echo "Shell completions:"
+  if command -v bash >/dev/null; then
+    put "$name/completions/puppy.bash" "$data/bash-completion/completions" puppy
+  fi
+  if command -v zsh >/dev/null; then
+    zsh_dir=$data/zsh/site-functions
+    put "$name/completions/_puppy" "$zsh_dir" _puppy
+  fi
+  if command -v fish >/dev/null; then
+    put "$name/completions/puppy.fish" "$config/fish/completions" puppy.fish
+  fi
+fi
+if [ -d "$name/man/man1" ]; then
+  man1=$data/man/man1
+  if mkdir -p "$man1" 2>/dev/null && cp "$name"/man/man1/*.1 "$man1/" 2>/dev/null; then
+    echo "Man pages: $man1 (man puppy, man puppy-add, ...)"
+  else
+    echo "Man pages: skipped, cannot write to $man1"
+  fi
+fi
+
 echo "Browser extension and service files: $work/$name"
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "Note: $bin is not on your PATH yet; add it in your shell's startup file." ;;
 esac
+if [ -n "$zsh_dir" ]; then
+  echo "Note: zsh only finds the completions if ~/.zshrc has, before compinit:"
+  echo "  fpath=($zsh_dir \$fpath)"
+fi
 
 # Earlier macOS installs went to /usr/local/bin, where puppy cannot update itself.
 # Left in place (it may be another install the user wants); only pointed out.
