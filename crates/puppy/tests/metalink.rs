@@ -475,3 +475,45 @@ fn metalink_flag_usage_errors() {
         assert!(err.contains(want), "{args:?}: {err}");
     }
 }
+
+/// An SFTP location next to an HTTP one: the scheme filter is the transports', so a
+/// metalink's `sftp://` URLs are used like any other.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sftp_and_http_mirrors() {
+    use puppy_testserver::sftp::{SftpCfg, SftpServer, key_path};
+    let mut env = Env::new();
+    let home = env.home.path().join("home");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::copy(key_path("user_ed25519"), home.join(".ssh/id_ed25519")).unwrap();
+    env.extra.push(("HOME", home.to_str().unwrap().into()));
+    env.extra.push(("SSH_AUTH_SOCK", String::new()));
+    let sftp = SftpServer::start(SftpCfg::default()).await;
+    sftp.set_file("/srv/file.bin", data(LEN), 1_795_000_000);
+    let target = format!("127.0.0.1:{}", sftp.port());
+    let (status, out, err) = env.run(&["ssh", "trust", "--yes", &target]);
+    assert!(status.success(), "{out}\n{err}");
+    let h = server(LEN).await;
+    let doc = meta4(&[(
+        "via-sftp.bin",
+        LEN,
+        Some(body_sha256(LEN, 0)),
+        vec![
+            sftp.url("/srv/file.bin").to_string(),
+            h.url("/file.bin").to_string(),
+        ],
+    )]);
+    let ml = write(&env, "sftp.meta4", &doc);
+    let dl = env.dl_dir();
+    let (status, out, err) = env.run(&[
+        "add",
+        "--wait",
+        "-o",
+        dl.to_str().unwrap(),
+        ml.to_str().unwrap(),
+    ]);
+    assert_eq!(status.code(), Some(0), "{out}\n{err}");
+    assert_data(&dl.join("via-sftp.bin"), LEN);
+    assert!(sftp.opens() > 0, "the SFTP location was not used");
+    assert!(h.range_requests() > 0, "the HTTP location was not used");
+}

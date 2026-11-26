@@ -194,6 +194,16 @@ fn unusable_urls() {
         ["https://h/f"]
     );
 
+    // Whatever the transports serve is kept: FTP(S) and SFTP too.
+    let doc = v4(
+        r#"<file name="f"><url>ftps://h/f</url><url>ftpes://h/f</url>
+        <url>sftp://u@h:2222/srv/f</url><url>scp://h/f</url></file>"#,
+    );
+    assert_eq!(
+        urls(&parse(doc.as_bytes()).unwrap().files[0]),
+        ["ftps://h/f", "ftpes://h/f", "sftp://u@h:2222/srv/f"]
+    );
+
     let torrent =
         v4(r#"<file name="f"><metaurl mediatype="torrent">http://h/f.torrent</metaurl></file>"#);
     let why = file_error(&torrent);
