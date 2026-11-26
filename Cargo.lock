@@ -3105,6 +3105,7 @@ dependencies = [
  "libc",
  "librqbit",
  "librqbit-dualstack-sockets",
+ "librqbit-sha1-wrapper",
  "puppy-core",
  "serde",
  "serde_json",

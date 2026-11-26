@@ -28,9 +28,10 @@ use tracing::{info, warn};
 /// After a second shutdown signal, how long the state may take to be saved before the
 /// daemon exits anyway.
 const FORCED_FLUSH: Duration = Duration::from_secs(1);
-/// How long the torrent session may take to stop (it normally takes about 1 s). Taken
-/// from the manager's pause phase, so shutdown stays within its overall bound.
-const TORRENT_SHUTDOWN: Duration = Duration::from_millis(1500);
+/// How long the torrent session may take to stop (it normally takes about 1 s, then the
+/// piece maps for a fast resume are written). Taken from the manager's pause phase, so
+/// shutdown stays within its overall bound.
+const TORRENT_SHUTDOWN: Duration = Duration::from_millis(3000);
 /// How long the notifier may take to hand its last popups to the system at shutdown.
 /// Taken from the manager's pause phase like [`TORRENT_SHUTDOWN`].
 const NOTIFY_FLUSH: Duration = Duration::from_secs(1);

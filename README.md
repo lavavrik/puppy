@@ -417,15 +417,25 @@ Things to know about v1:
   from librqbit while the torrent is live or paused. When librqbit has none
   (while it checks the data, or after an error): a complete torrent shows
   its selected pieces as had; otherwise the last exact map seen is shown;
-  before there was one (after a restart, until the torrent goes live) the map
+  before there was one (after a restart, until the check is done) the map
   is synthesized from per-file progress, assuming each file fills in order.
+  After a fast resume the exact map is back within moments.
 - **Per-torrent speed limits** can only be set while the torrent is queued
   or waiting for its files to be chosen, before it starts (librqbit takes a torrent's limit only when it is added);
   later the dashboard says so and the limit is not kept. The global limits
   apply to torrents at any time.
-- **After a daemon restart** every unfinished torrent re-checks the data
-  already on disk before it goes on (there is no fast resume); its progress
-  shows 0 until the check is done, and a large library takes a while.
+- **After a daemon restart** a torrent goes on from the pieces it had when
+  the daemon stopped (fast resume). At a clean stop (`puppy stop`, or any
+  normal shutdown) the daemon keeps each torrent's piece map and the size and
+  modification time of its files (`torrents/<id>.resume`). On restore, if the
+  files are exactly as recorded, up to 64 of the recorded pieces are read
+  back and their hashes checked; the torrent then shows its progress at once
+  instead of re-checking all its data. Otherwise it checks the data already
+  on disk in full before it goes on, showing 0 until the check is done (a
+  large library takes a while): after the daemon was killed or crashed, when
+  a file was changed, moved, truncated or deleted while the daemon was down,
+  when a checked piece is bad, or when the `.torrent` changed. A record is
+  used once: after a restart, only the next clean stop writes a new one.
 - **Deleting a torrent's files** (also once it has completed) deletes exactly
   the files the torrent lists, then its folders once empty; anything else in
   them stays. A torrent whose `.torrent` file is gone (shown as "torrent file

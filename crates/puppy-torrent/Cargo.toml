@@ -20,6 +20,9 @@ serde_json.workspace = true
 bytes.workspace = true
 # Same version librqbit 9.1 uses: its bind errors are this crate's `Error::Bind`.
 librqbit-dualstack-sockets = "0.7"
+# librqbit's own SHA-1 (aws-lc-rs, as with its `rust-tls` feature): the fast-resume
+# spot check of stored piece maps.
+librqbit-sha1-wrapper = { version = "9.1", default-features = false, features = ["sha1-ring"] }
 
 [dev-dependencies]
 tempfile.workspace = true

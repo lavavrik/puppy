@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use librqbit::dht::{DhtPersistenceConfig, Id20};
 use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
-    ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
+    ManagedTorrent, ManagedTorrentState, Session, SessionOptions, SessionPersistenceConfig,
 };
 use puppy_core::engine::{
     AddOptions, Added, Engine, EngineError, EngineEvent, EngineKind, StartMode,
@@ -28,6 +28,7 @@ use tokio::sync::{OnceCell, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::fastresume;
 use crate::map;
 use crate::poll;
 use crate::seeding::{self, SeedPhase, SeedRecord, SeedTracker, SeedView, Targets};
@@ -69,8 +70,9 @@ pub struct TorrentEngineOptions {
     pub test_initial_peers: Vec<SocketAddr>,
 }
 
-/// Torrent engine: owns one librqbit [`Session`] (its own persistence off: puppy's store is
-/// the source of truth, torrents are re-added on restore).
+/// Torrent engine: owns one librqbit [`Session`] (puppy's store is the source of truth,
+/// torrents are re-added on restore; librqbit's persistence store only keeps the piece
+/// maps for a fast resume, see [`fastresume`]).
 ///
 /// - The session (listener, DHT, its state dirs) starts with the first torrent that
 ///   needs it, not with the engine: a daemon that only downloads over HTTP opens no
@@ -89,6 +91,11 @@ pub struct TorrentEngineOptions {
 ///   librqbit's check: paused, `NeedsAttention`, downloaded again on `resume`).
 /// - The piece map is librqbit's own (`api_dump_haves`); see [`map::fallback_map`] for
 ///   when it is not available.
+/// - Fast resume: a clean [`TorrentEngine::shutdown`] stores every torrent's exact piece
+///   map with a record of its files (`<data_dir>/torrents/<id>.resume`); restoring it
+///   with its files unchanged goes on from that map after a spot check of its pieces
+///   instead of checking all of its data. Anything else (a fresh add, no record, a file
+///   changed, a bad piece) is checked in full ([`fastresume`]).
 /// - Unlike the HTTP engine, dropping it stops its torrents (the session goes with it).
 /// - File selection (once, when the contents are known: at add for a `.torrent`, after
 ///   the metadata for a magnet): `FileChoice::Ask` on a multi-file torrent, or a magnet
@@ -340,6 +347,9 @@ pub(crate) struct Shared {
     pub(crate) events: broadcast::Sender<EngineEvent>,
     pub(crate) opts: TorrentEngineOptions,
     next_gen: AtomicU64,
+    /// The next librqbit torrent id (given with every add: librqbit's persistence store,
+    /// see [`fastresume`], would hand out ids that concurrent adds can share).
+    next_lib_id: AtomicUsize,
     /// Serializes `pause`, `resume`, `remove` and [`Shared::unstick`], so a pause and an
     /// unstick never interleave between their check and their action.
     ops: tokio::sync::Mutex<()>,
@@ -371,6 +381,11 @@ impl Shared {
     async fn start_session(&self) -> anyhow::Result<Arc<Session>> {
         create_private_dir(&self.opts.data_dir.join("torrent"))?;
         create_private_dir(&self.opts.data_dir.join("torrents"))?;
+        fastresume::prepare_dir(
+            &fastresume::dir(&self.opts.data_dir),
+            &self.opts.data_dir.join("torrents"),
+        )
+        .map_err(|e| anyhow::Error::from(e).context("clearing librqbit's torrent list"))?;
         let session = SessionPlan::from_options(&self.opts)
             .start_with_fallback(&self.cancel)
             .await
@@ -538,6 +553,7 @@ impl Shared {
         Ok(AddTorrentOptions {
             paused,
             overwrite,
+            preferred_id: Some(self.next_lib_id.fetch_add(1, Ordering::Relaxed)),
             output_folder: Some(output_folder),
             trackers: (!trackers.is_empty()).then_some(trackers),
             ratelimits: LimitsConfig {
@@ -567,13 +583,16 @@ impl Shared {
     ) -> Slot {
         let r#gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let weak = Arc::downgrade(self);
+        let trackers_and_hash = source::parse_magnet(&uri).ok();
         let files = SideFiles {
             stored: self.stored_torrent(id),
             selection: self.selection_file(id),
+            bitv: trackers_and_hash
+                .as_ref()
+                .map(|m| self.bitv_file(&m.info_hash)),
+            record: self.resume_record(id),
         };
-        let trackers = source::parse_magnet(&uri)
-            .map(|m| m.trackers)
-            .unwrap_or_default();
+        let trackers = trackers_and_hash.map(|m| m.trackers).unwrap_or_default();
         let task = tokio::spawn(async move {
             let session = match weak.upgrade() {
                 Some(shared) => shared.session().await.cloned(),
@@ -728,6 +747,11 @@ impl Shared {
         opts.only_files = only_files;
         let session = self.live()?;
         tracing::info!(id, "restarting a failed torrent over its own files");
+        let hash = self.lock().get(&id).map(|e| e.info_hash.clone());
+        if let Some(hash) = hash {
+            // Checked in full: the data is in doubt.
+            fastresume::admit(&self.bitv_file(&hash), &self.resume_record(id), None)?;
+        }
         // Already gone (an earlier attempt) is fine: the add below retries.
         if let Err(e) = session.delete(TorrentIdOrHash::Id(h.id()), false).await {
             tracing::debug!(id, "dropping the failed torrent: {e:#}");
@@ -969,6 +993,50 @@ impl Shared {
             .join(format!("{id}.seed"))
     }
 
+    /// `<data_dir>/torrents/<id>.resume`: what vouches for download `id`'s stored piece
+    /// map after a clean shutdown ([`fastresume::Record`]).
+    fn resume_record(&self, id: DownloadId) -> PathBuf {
+        self.opts
+            .data_dir
+            .join("torrents")
+            .join(format!("{id}.resume"))
+    }
+
+    /// The piece map librqbit keeps for torrent `info_hash` (see [`fastresume`]).
+    fn bitv_file(&self, info_hash: &str) -> PathBuf {
+        fastresume::bitv_path(&fastresume::dir(&self.opts.data_dir), info_hash)
+    }
+
+    /// Shutdown, once the session has stopped (nothing writes any more): stores the
+    /// exact piece map of every torrent librqbit has one of, with the record that
+    /// vouches for it (see [`fastresume::save`]), all at once. A torrent without one
+    /// (still checking its data, failed) is checked in full after the restart.
+    async fn persist_resume(&self) {
+        let todo: Vec<_> = self
+            .lock()
+            .iter()
+            .filter_map(|(&id, e)| match (&e.slot, &e.info) {
+                (Slot::Managed(h), Some(info)) => {
+                    Some((id, h.clone(), info.clone(), e.layout.output_folder.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut writes = tokio::task::JoinSet::new();
+        for (id, h, info, output) in todo {
+            let Some((_, bits)) = self.exact_map(&h) else {
+                continue;
+            };
+            let (bitv, record) = (self.bitv_file(&info.info_hash), self.resume_record(id));
+            writes.spawn(async move {
+                if let Err(e) = fastresume::save(bitv, record, bits, info, output).await {
+                    tracing::warn!(id, "recording the pieces for a fast resume: {e}");
+                }
+            });
+        }
+        while writes.join_next().await.is_some() {}
+    }
+
     /// Writes download `id`'s seeding record `rec` (sequence `seq`, from
     /// [`SeedTracker::record`]) atomically and durably, if the download is still there
     /// and no newer record of it has been written: writers are serialized, so a stale
@@ -1047,13 +1115,14 @@ impl Shared {
     }
 
     /// Deletes the stored `.torrent` copy of download `id`, its placement marker, its
-    /// selection sidecar and its seeding record, if any.
+    /// selection sidecar, its seeding record and its resume record, if any.
     fn forget(&self, id: DownloadId) {
         for path in [
             self.stored_torrent(id),
             self.placement_marker(id),
             self.selection_file(id),
             self.seed_file(id),
+            self.resume_record(id),
         ] {
             match std::fs::remove_file(&path) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -1119,6 +1188,10 @@ struct SideFiles {
     stored: PathBuf,
     /// The `.selection` sidecar.
     selection: PathBuf,
+    /// The stored piece map of the torrent (`None`: the link has no valid hash) and the
+    /// resume record: never used for a magnet's add (see [`fastresume::admit`]).
+    bitv: Option<PathBuf>,
+    record: PathBuf,
 }
 
 /// What a magnet's metadata task ends with.
@@ -1231,6 +1304,13 @@ async fn resolve_and_add(
         }
     }
     opts.initial_peers = (!peers.is_empty()).then_some(peers);
+    if let Some(bitv) = &files.bitv
+        && let Err(e) = fastresume::admit(bitv, &files.record, None)
+    {
+        return Err(ResolveFailure::permanent(format!(
+            "removing the stored piece map: {e}"
+        )));
+    }
     match session
         .add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(opts))
         .await
@@ -1398,6 +1478,7 @@ impl TorrentEngine {
             events,
             opts,
             next_gen: AtomicU64::new(0),
+            next_lib_id: AtomicUsize::new(0),
             ops: tokio::sync::Mutex::new(()),
         });
         tokio::spawn(poll::run(Arc::downgrade(&shared), cancel));
@@ -1495,9 +1576,10 @@ impl TorrentEngine {
         self.shared.started()?.listen_addr()
     }
 
-    /// Pauses every torrent and stops the session's tasks (listener, DHT, peers, poll).
-    /// Takes about 1 s (librqbit gives its tasks a moment to wind down); nothing to do if
-    /// the session never started.
+    /// Pauses every torrent and stops the session's tasks (listener, DHT, peers, poll),
+    /// then stores the torrents' piece maps for a fast resume. Takes about 1 s (librqbit
+    /// gives its tasks a moment to wind down); nothing to do if the session never
+    /// started.
     pub async fn shutdown(&self) {
         self.shared.abort_resolving();
         // What was written so far, for deleting placeholders after a restart.
@@ -1509,6 +1591,7 @@ impl TorrentEngine {
         self.shared.persist_seeds().await;
         if let Some(session) = self.shared.started() {
             session.stop().await;
+            self.shared.persist_resume().await;
         }
     }
 
@@ -1627,6 +1710,28 @@ impl TorrentEngine {
         let placement = source::Placement::of(&layout).as_str();
         if let Err(e) = tokio::fs::write(self.shared.placement_marker(id), placement).await {
             tracing::warn!(id, "recording where the torrent's files go: {e}");
+        }
+        // Restored after a clean shutdown with its files as they were: librqbit goes on
+        // from the stored piece map. Otherwise it checks the data in full.
+        let restored = matches!(target, Target::Restore { .. });
+        let (bitv, record) = (
+            self.shared.bitv_file(&info.info_hash),
+            self.shared.resume_record(id),
+        );
+        let (check_info, output, torrent) =
+            (info.clone(), layout.output_folder.clone(), bytes.clone());
+        let fast = tokio::task::spawn_blocking(move || {
+            let restored = restored.then_some(fastresume::Restored {
+                info: &check_info,
+                torrent: &torrent,
+                output_folder: &output,
+            });
+            fastresume::admit(&bitv, &record, restored)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        if fast {
+            tracing::info!(id, "resuming from the pieces recorded at shutdown");
         }
         let res = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(add_opts))
@@ -1916,6 +2021,15 @@ impl TorrentEngine {
             }
             None => Ok(()),
         };
+        // librqbit drops the piece map of a torrent it had; this one of a torrent it
+        // did not have (restored choosing or needing attention) would only be cleared
+        // at the next session start.
+        if !e.info_hash.is_empty()
+            && let Err(err) = std::fs::remove_file(self.shared.bitv_file(&e.info_hash))
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(id, "removing the stored piece map: {err}");
+        }
         if !keep_copy {
             // The download is gone either way: drop its stored copy before reporting.
             self.shared.forget_serialized(id).await;
@@ -1928,8 +2042,10 @@ impl TorrentEngine {
     /// Restores a download added before a restart, its files at `path`: a `.torrent`
     /// from its stored copy (else the original file, if still there), a magnet from its
     /// stored metadata (else its link: the metadata is fetched again). librqbit checks
-    /// the existing data before the torrent goes on. With neither copy nor original, a
-    /// `.torrent` download is registered as needing attention.
+    /// the existing data before the torrent goes on: in full, or (stopped cleanly, files
+    /// unchanged) from the piece map stored at shutdown ([`fastresume::admit`]). With
+    /// neither copy nor original, a `.torrent` download is registered as needing
+    /// attention.
     ///
     /// The file choice recorded in the `.selection` sidecar is kept (choosing stays
     /// choosing, nothing added to librqbit). A magnet restored from its link applies its
@@ -2080,7 +2196,7 @@ impl Drop for TorrentEngine {
 
 /// An engine dir (`<data_dir>/torrent/`: DHT state; `<data_dir>/torrents/`: stored
 /// `.torrent` copies): owner-only on Unix.
-fn create_private_dir(p: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(p: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -2116,6 +2232,9 @@ struct SessionPlan {
     upnp: bool,
     /// Check the listen port with a plain bind first (see [`Self::start_recording_attempts`]).
     probe_port: bool,
+    /// librqbit's persistence store, for the stored piece maps only (see
+    /// [`fastresume`]); `None`: none (no fast resume).
+    fastresume: Option<PathBuf>,
 }
 
 impl SessionPlan {
@@ -2136,6 +2255,7 @@ impl SessionPlan {
             lsd: opts.lsd && !test,
             upnp: opts.upnp && !test,
             probe_port: true,
+            fastresume: Some(fastresume::dir(&opts.data_dir)),
         }
     }
 
@@ -2216,8 +2336,15 @@ impl SessionPlan {
             dht,
             disable_trackers: !self.trackers,
             disable_local_service_discovery: !self.lsd,
-            persistence: None,
-            fastresume: false,
+            // Only for the stored piece maps: its torrent list is deleted before every
+            // start (see `fastresume::prepare_dir`).
+            persistence: self
+                .fastresume
+                .clone()
+                .map(|folder| SessionPersistenceConfig::Json {
+                    folder: Some(folder),
+                }),
+            fastresume: self.fastresume.is_some(),
             // IPv4 only (listen on 0.0.0.0; DHT/LSD on IPv4): works on IPv6-less hosts.
             ipv4_only: true,
             listen: Some(ListenerOptions {
@@ -2760,6 +2887,12 @@ impl Engine for TorrentEngine {
         }
         let added = async {
             let session = self.shared.session().await?;
+            // Never added before: nothing vouches for a stored piece map.
+            fastresume::admit(
+                &self.shared.bitv_file(&info.info_hash),
+                &self.shared.resume_record(id),
+                None,
+            )?;
             let res = session
                 .add_torrent(AddTorrent::from_bytes(bytes), Some(opts))
                 .await
@@ -2857,6 +2990,7 @@ mod tests {
             lsd: false,
             upnp: false,
             probe_port: true,
+            fastresume: None,
         }
     }
 
