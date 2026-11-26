@@ -83,6 +83,8 @@ pub struct SftpCfg {
     pub fail_after_bytes_once: Option<u64>,
     /// Answer reads with at most this many bytes (short reads).
     pub max_read: Option<u32>,
+    /// Answer reads with this many bytes more than asked for (a broken server).
+    pub oversize_reads: Option<u32>,
 }
 
 impl Default for SftpCfg {
@@ -102,6 +104,7 @@ impl Default for SftpCfg {
             max_connections: None,
             fail_after_bytes_once: None,
             max_read: None,
+            oversize_reads: None,
         }
     }
 }
@@ -588,6 +591,9 @@ impl russh_sftp::server::Handler for Fs {
         let mut len = u64::from(len);
         if let Some(m) = cfg.max_read {
             len = len.min(u64::from(m));
+        }
+        if let Some(extra) = cfg.oversize_reads {
+            len += u64::from(extra);
         }
         let end = (offset + len).min(size);
         let n = end - offset;

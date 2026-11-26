@@ -688,3 +688,57 @@ async fn an_sftp_mirror_without_mtime_is_checked_before_use() {
         "the SFTP mirror was never used"
     );
 }
+
+/// A server answering a read with more bytes than asked for breaks the protocol: none
+/// of the excess is written, the location is refused (the download fails rather than
+/// completing with wrong bytes), and as a mirror it is dropped while the others finish.
+#[tokio::test]
+async fn oversized_read_answers_are_refused() {
+    let fx = Fx::new(|c| c.oversize_reads = Some(1000)).await;
+    let len = 3 * 1024 * KIB + 7;
+    fx.s.set_file("/f", data(len, 20), MTIME);
+    let e = HttpEngine::new(fx.cfg_with(|c| c.connections = 1)).unwrap();
+    e.add(
+        1,
+        fx.request(fx.s.url("/f")),
+        StartMode::Fresh,
+        AddOptions::default(),
+    )
+    .await
+    .unwrap();
+    let st = wait(&e, 1, done).await;
+    assert!(
+        matches!(&st.state, DownloadState::Failed { reason, transient: false } if reason.contains("bytes for a")),
+        "{st:?}"
+    );
+
+    // As a mirror of an HTTP source: dropped, and the file is right.
+    let http = TestServer::start(ServerCfg {
+        len,
+        bytes_per_sec: Some(4096 * KIB),
+        ..ServerCfg::default()
+    })
+    .await;
+    fx.s.set_file("/file.bin", data(len, 0), MTIME);
+    let mut req = fx.request(http.url("/file.bin"));
+    req.mirrors = vec![Mirror::new(fx.s.url("/file.bin"))];
+    let e = HttpEngine::new(fx.cfg()).unwrap();
+    e.add(1, req, StartMode::Fresh, AddOptions::default())
+        .await
+        .unwrap();
+    let path = completed(&e, 1).await;
+    assert!(std::fs::read(path).unwrap() == data(len, 0), "wrong bytes");
+
+    // Without modification times the mirror is compared byte for byte first: that
+    // fetch refuses the oversized answers too.
+    fx.s.set_cfg(|c| c.mtime = false);
+    let mut req = fx.request(http.url("/file.bin"));
+    req.filename = Some("again.bin".into());
+    req.mirrors = vec![Mirror::new(fx.s.url("/file.bin"))];
+    let e = HttpEngine::new(fx.cfg()).unwrap();
+    e.add(1, req, StartMode::Fresh, AddOptions::default())
+        .await
+        .unwrap();
+    let path = completed(&e, 1).await;
+    assert!(std::fs::read(path).unwrap() == data(len, 0), "wrong bytes");
+}

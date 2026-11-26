@@ -137,6 +137,12 @@ async fn fetch(
             let len =
                 u32::try_from((end - off).min(u64::from(conn.read_len))).unwrap_or(conn.read_len);
             match crate::http::probe::timed(read, conn.read(&h, path, off, len)).await?? {
+                Some(d) if d.len() as u64 > u64::from(len) => {
+                    return Err(EngineError::Ssh(format!(
+                        "SFTP: the server sent {} bytes for a {len}-byte read at offset {off}",
+                        d.len()
+                    )));
+                }
                 Some(d) if !d.is_empty() => {
                     off += d.len() as u64;
                     data.extend_from_slice(&d);

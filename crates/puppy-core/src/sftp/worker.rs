@@ -245,8 +245,20 @@ async fn read_into(
             // Nothing in flight and nothing left to ask for: the file ended.
             return ended(ctx, start, seg, single);
         };
-        debug_assert_eq!(off, cursor);
+        // Answers come in offset order and never hold more than asked for; a server
+        // breaking that cannot be trusted with this file (its bytes are not written).
+        if off != cursor {
+            return protocol_error(format!(
+                "SFTP: an answer for offset {off} arrived at offset {cursor}"
+            ));
+        }
         let data = match got {
+            Ok(Some(d)) if d.len() as u64 > u64::from(len) => {
+                return protocol_error(format!(
+                    "SFTP: the server sent {} bytes for a {len}-byte read at offset {off}",
+                    d.len()
+                ));
+            }
             Ok(Some(d)) if !d.is_empty() => d,
             Ok(_) => {
                 // End of file at `off`: later requests are past it too.
@@ -295,6 +307,12 @@ async fn read_into(
             inflight.push_front(request(conn, h, path, off + n as u64, rest));
         }
     }
+}
+
+/// The server broke the protocol: this location cannot serve the file.
+fn protocol_error(why: String) -> Attempt {
+    tracing::warn!("{why}");
+    Attempt::Exit(WorkerExit::Refused(why))
 }
 
 /// The file ended at the cursor before the range did.
