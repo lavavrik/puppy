@@ -1,4 +1,4 @@
-//! Whole-file checksums: the `ALGO=HEX` spec (`sha-256=…`, as aria2 and Metalink write
+//! Whole-file checksums: the `ALGO=HEX` spec (`sha-256=…`, as Metalink writes
 //! it) and hashing a finished file.
 //!
 //! A download carries at most one [`Checksum`] (`AddRequest::checksum`), checked once the

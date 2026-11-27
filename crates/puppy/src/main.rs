@@ -89,13 +89,13 @@ enum Command {
         check: bool,
     },
     /// Add downloads from URLs, magnet links, .torrent files or metalinks (`-` reads them
-    /// from stdin, `-i` from an aria2-style input file).
+    /// from stdin, `-i` from an input file).
     Add {
         /// URLs, magnet links, .torrent or .meta4/.metalink paths or URLs; `-` reads one
         /// per line from stdin.
         #[arg(required_unless_present = "input_file", value_name = "SOURCE")]
         sources: Vec<String>,
-        /// Read downloads from an aria2-style input file (`-`: stdin): one URI per
+        /// Read downloads from an input file (`-`: stdin): one URI per
         /// line, each followed by indented `key=value` options (`dir`, `out`,
         /// `checksum`, `header`, ...). The other flags are defaults the options
         /// override.

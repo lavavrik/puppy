@@ -1,9 +1,9 @@
-//! `puppy add -i FILE`: aria2's input-file format.
+//! `puppy add -i FILE`: the input-file format.
 //!
 //! One download per line that does not start with whitespace: its URI, or several
 //! TAB-separated URIs of the same file (mirrors). Lines under it that start with a space
-//! or a TAB are `key=value` options for that download, named as aria2's command-line
-//! options without the `--`. Lines starting with `#` (also indented ones) are comments;
+//! or a TAB are `key=value` options for that download (`dir`, `out`, `checksum`,
+//! ...). Lines starting with `#` (also indented ones) are comments;
 //! blank lines are skipped. CRLF line endings and a leading BOM are accepted.
 //!
 //! [`parse`] only splits the text into [`Entry`]s; [`interpret`] turns one entry's
@@ -166,8 +166,8 @@ pub fn split_header(h: &str) -> Option<(String, String)> {
     }
 }
 
-/// `seed-time`: a bare number is minutes, as in aria2 (`90`, `1.5`); anything else is
-/// a puppy duration (`2h`) or `default`. aria2's `0` (do not seed at all) has no puppy
+/// `seed-time`: a bare number is minutes (`90`, `1.5`); anything else is
+/// a puppy duration (`2h`) or `default`. `0` (in this format: do not seed at all) has no puppy
 /// equivalent and is refused rather than turned into its opposite (puppy's `0`: never
 /// stop).
 fn parse_seed_time(v: &str) -> Result<Option<u64>, String> {
@@ -176,11 +176,9 @@ fn parse_seed_time(v: &str) -> Result<Option<u64>, String> {
             return Err(format!("bad seed-time {v:?}: expected minutes, e.g. 90"));
         }
         if minutes == 0.0 {
-            return Err(
-                "seed-time=0 (aria2: do not seed) is not supported: puppy seeds a \
+            return Err("seed-time=0 (do not seed) is not supported: puppy seeds a \
                  finished torrent until a limit is reached; give a time, e.g. seed-time=1"
-                    .into(),
-            );
+                .into());
         }
         return Ok(Some(((minutes * 60.0).round() as u64).max(1)));
     }
@@ -198,7 +196,7 @@ pub struct Interpreted {
 }
 
 /// Reads one entry's options. Later values of a single-valued option replace earlier
-/// ones (as in aria2); `header` adds up. Unsupported options become warnings (one per
+/// ones; `header` adds up. Unsupported options become warnings (one per
 /// line); bad values are errors.
 pub fn interpret(entry: &Entry) -> Interpreted {
     let mut o = EntryOptions::default();

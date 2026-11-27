@@ -6,7 +6,7 @@ The path is absolute (`sftp://host/srv/a.iso` is `/srv/a.iso`); start it with
 (`sftp://host/~/a.iso`), as curl does. Without a user name puppy logs in as
 your local user, as `ssh` does. Percent-encoded characters are decoded. A URL
 ending in `/` names a directory and is refused. `scp://` URLs are not
-supported (neither are they in aria2): use `sftp://`, which every OpenSSH
+supported: use `sftp://`, which every OpenSSH
 server offers.
 
 puppy logs in without asking anything, since the daemon has no terminal to ask

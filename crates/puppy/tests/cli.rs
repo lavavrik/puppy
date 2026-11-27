@@ -1872,7 +1872,7 @@ fn add_input_file_tabs_are_mirrors() {
     assert!(err.contains("mirrors only apply to HTTP(S)"), "{err}");
 }
 
-// ---- add -i (aria2-style input file) ----
+// ---- add -i (input file) ----
 
 /// Runs `puppy <args>` in `cwd` with `input` on stdin: (status, stdout, stderr).
 fn run_in(
@@ -2130,7 +2130,7 @@ fn add_input_file_single_source_flags() {
 }
 
 /// A torrent entry: `select-file` by number, `seed-ratio` overriding `--seed-ratio`,
-/// `seed-time` in aria2's minutes; `checksum` on a torrent rejects the file.
+/// `seed-time` in minutes; `checksum` on a torrent rejects the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_input_file_torrent_options() {
     let seeder = Seeder::start(MULTI).await;

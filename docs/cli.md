@@ -13,7 +13,7 @@ puppy add -o ~/isos --limit 2M URL1 URL2    # into a folder, at most 2 MiB/s eac
 puppy add --name b.iso --paused URL         # under another name, without starting
 puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
 puppy add - < urls.txt                      # one source per line from stdin (# comments)
-puppy add -i list.txt                       # an aria2-style input file, with per-download options
+puppy add -i list.txt                       # an input file, with per-download options
 puppy add --wait URL                        # add, then wait like `puppy wait`
 puppy add --checksum sha-256=9f86d0… URL    # check the finished file against this digest
 puppy add --mirror URL2 --mirror URL3 URL   # one file from several places at once
@@ -127,7 +127,7 @@ files` on a download that is not a torrent, or one that already completed
 
 `add --checksum ALGO=HEX` checks the finished file against a digest:
 `md5`, `sha-1`, `sha-224`, `sha-256`, `sha-384` or `sha-512` (written as
-aria2 and Metalink do, `sha-256=…`; `sha256=…` works too; algorithm and hex
+Metalink does, `sha-256=…`; `sha256=…` works too; algorithm and hex
 digits in any case). It needs exactly one HTTP(S), FTP(S) or SFTP source (also on stdin):
 torrents are refused, since BitTorrent already checks every piece. A
 malformed digest, an unknown algorithm or a wrong number of hex digits is a
@@ -151,13 +151,13 @@ after the next start, without the network. `pause` during the check stops it;
 from before checksums cannot verify, so `add --checksum` against one
 removes the download again and fails, asking you to `puppy stop` it.
 
-`add -i FILE` (`--input-file`) reads downloads from a file in aria2's
-input-file format; `-i -` reads it from stdin (not together with a `-`
+`add -i FILE` (`--input-file`) reads downloads from an input
+file; `-i -` reads it from stdin (not together with a `-`
 source). Each line that does not start with whitespace is one download: a
 URL (`http`, `https`, `ftp`, `ftps`, `ftpes`), magnet link or `.torrent` path
 (a relative one is relative to the current directory). The lines under it that start with a
-space or a TAB are options for that download, written `key=value` as aria2's
-options without the `--` (spaces around the key and the value are ignored; the
+space or a TAB are options for that download, written `key=value`
+(spaces around the key and the value are ignored; the
 value may contain `=`). Lines starting with `#` are comments, blank lines are
 skipped, and CRLF line endings, a BOM and UTF-16 work as for `add -`.
 
@@ -189,10 +189,10 @@ https://example.com/b.iso
 | `pause` | `true` adds it paused, as `--paused`; `false` starts it |
 | `select-file` | torrent: the files to download, as `--files` (numbers, ranges, globs) |
 | `seed-ratio` | torrent: as `--seed-ratio` |
-| `seed-time` | torrent: a number is minutes, as in aria2; `90m`, `2h` and `default` work too |
+| `seed-time` | torrent: a number is minutes; `90m`, `2h` and `default` work too |
 
-A URI line may hold several URIs of the same file separated by TABs, as in
-aria2: the first is the download's source and the others are its mirrors, as
+A URI line may hold several URIs of the same file separated by TABs:
+the first is the download's source and the others are its mirrors, as
 with `--mirror` (see [Mirrors](mirrors.md)). Each mirror must be an HTTP(S),
 FTP(S) or SFTP URL and the first URI one of these too; anything else is a usage error
 for that line. `--mirror` on the command line adds its URLs after the
@@ -207,14 +207,14 @@ flags still refuse an HTTP(S), FTP(S) or SFTP download anywhere on the line. Sou
 arguments are added first, then the file's, in order; `--json` and `--wait`
 treat them as one list, as for several sources.
 
-Any other aria2 option (`split`, `max-connection-per-server`, ...) is ignored
+Any other option (`split`, `max-connection-per-server`, ...) is ignored
 with a warning on stderr naming it and its line. Everything else wrong with the
 file is a usage error (exit 2) that adds nothing at all, so a script never ends
 up with half a list queued: an option line before the first URI, one without
 `=`, an empty or bad value for one of the options above, an unknown source, `checksum` on a torrent, a
 torrent option on an HTTP(S), FTP(S) or SFTP download, or `pause=true` with `--wait`. Every
 problem is reported with its line (`puppy: list.txt: line 7: bad
-max-download-limit "fast": ...`). `seed-time=0`, which in aria2 means "do not seed", is
+max-download-limit "fast": ...`). `seed-time=0`, which in this format means "do not seed", is
 refused as well, since puppy's `0` would mean the opposite (never stop). What
 the daemon refuses once the file is valid (for example a `select-file` number
 past a torrent's last file) fails that download only, as with several sources.

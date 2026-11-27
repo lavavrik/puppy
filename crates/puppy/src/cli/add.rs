@@ -42,7 +42,7 @@ pub struct AddArgs {
     pub seed_ratio: Option<String>,
     /// `--seed-time` (torrents only).
     pub seed_time: Option<String>,
-    /// `-i FILE`: an aria2-style input file (`-`: stdin), added after `sources`.
+    /// `-i FILE`: an input file (`-`: stdin), added after `sources`.
     pub input_file: Option<PathBuf>,
     /// `--mirror URL` (repeatable): other locations of the one URL source's file.
     pub mirrors: Vec<String>,

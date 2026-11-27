@@ -135,7 +135,7 @@ pub fn without_password(url: &url::Url) -> url::Url {
     out
 }
 
-/// Another location of a URL download's file (aria2's TAB-separated URIs, a
+/// Another location of a URL download's file (an input file's TAB-separated URIs, a
 /// Metalink `<url>`). The download's source stays its primary URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mirror {
