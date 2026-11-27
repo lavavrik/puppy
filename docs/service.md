@@ -51,7 +51,7 @@ your shell's `SSH_AUTH_SOCK`; every `puppy` command hands the daemon its own
 when it connects, but a download resumed at login, before any command, only
 has the service's environment. Run `systemctl --user import-environment
 SSH_AUTH_SOCK` from your session (or use an agent started as a user service),
-or set `[ssh] agent` in `config.toml` (see the README's SFTP section).
+or set `[ssh] agent` in `config.toml` (see [SFTP](sftp.md)).
 
 To remove it:
 

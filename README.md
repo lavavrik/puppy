@@ -1,10 +1,10 @@
 # puppy
 
-A modern terminal download manager written in Rust, meant as a fresh successor
-to [aria2](https://aria2.github.io/). It downloads over HTTP(S), FTP(S), SFTP
-and BitTorrent (magnet links and `.torrent` files), with a full-screen dashboard. A background daemon
-owns every download and the queue, so downloads keep going when no client is
-open; `puppy` talks to it over a per-user local socket. It targets Linux, macOS
+A modern terminal download manager written in Rust. It downloads over HTTP(S),
+FTP(S), SFTP and BitTorrent (magnet links and `.torrent` files), with a
+full-screen dashboard. A background daemon owns every download and the queue,
+so downloads keep going when no client is open; `puppy` talks to it over a
+per-user local socket. It targets Linux, macOS
 and Windows, on x86_64 and aarch64.
 
 <picture>
@@ -14,7 +14,7 @@ and Windows, on x86_64 and aarch64.
 
 ## Status
 
-Early development (v0.2.0). What works today:
+Early development (v0.2.1). What works today:
 
 - **HTTP(S) engine**: segmented multi-connection downloads (8 connections by
   default) with robust resume. A resumed file is revalidated against the
@@ -22,18 +22,18 @@ Early development (v0.2.0). What works today:
   neither) and is never silently continued if the remote file changed.
   Retries with backoff, per-download and global speed limits, proxies. One
   file can come from several mirrors at once, with failover between them
-  (see [Mirrors](#mirrors)).
+  (see [Mirrors](docs/mirrors.md)).
 - **FTP and FTPS**: the same segmented downloads over `ftp://`, `ftps://`
   (implicit TLS) and `ftpes://` (explicit TLS) URLs, with `REST` resume,
   passive mode, TLS tried by default, and the same guarantee: a file whose
-  size or modification time changed is never continued. See [FTP](#ftp).
+  size or modification time changed is never continued. See [FTP](docs/ftp.md).
 - **SFTP**: the same segmented downloads over `sftp://` URLs, several SSH
   connections at once, logging in with ssh-agent, key files or a password in
   the URL, and host keys checked against `known_hosts` (`puppy ssh trust` to
-  add one). See [SFTP](#sftp).
+  add one). See [SFTP](docs/sftp.md).
 - **Metalink**: `.meta4` (RFC 5854) and Metalink 3 `.metalink` documents, local
   or fetched, become one download per file, from its mirrors at once, checked
-  against its size and strongest hash. See [Metalink](#metalink).
+  against its size and strongest hash. See [Metalink](docs/metalink.md).
 - **Daemon**: a single instance per user owns the queue (3 active at a time by
   default), with atomically persisted state, a versioned JSON protocol,
   graceful shutdown, and an idle exit when started on demand.
@@ -43,7 +43,7 @@ Early development (v0.2.0). What works today:
 - **BitTorrent**: magnet links and `.torrent` files (via
   [librqbit](https://github.com/ikatson/rqbit)), queued alongside HTTP
   downloads, with file selection, seeding limits, peers and a piece map. See
-  [Torrents](#torrents).
+  [Torrents](docs/torrents.md).
 - **Command line**: scriptable subcommands (`puppy add`, `ls`, `wait`, …) with
   `--json` output. See [Command line](#command-line).
 - **Desktop notifications** when downloads finish or fail.
@@ -216,6 +216,7 @@ the dashboard only disconnects; the daemon and its downloads keep running.
 | `/`                               | Filter |
 | `U`                               | Update puppy now (when the update banner shows) |
 | `Esc`                             | Close popup / clear filter |
+| `<` / `>`                         | Move the divider between the list and the details (or drag it; double-click resets) |
 | `?`                               | Help |
 | `q` / `Ctrl+C`                    | Quit |
 
@@ -224,681 +225,53 @@ The footer shows the keys that apply to the current selection.
 ### Command line
 
 Every command talks to the daemon, starting one if none runs (except `stop`).
-Text goes to stdout; errors, and the progress line of `wait` (only on a
-terminal), go to stderr.
 
 ```sh
-puppy add https://example.com/a.iso         # add a URL, magnet link or .torrent path
-puppy add ftp://ftp.example.org/pub/a.iso   # FTP (anonymous); ftps:// and ftpes:// for FTPS
-puppy add sftp://me@host.example/srv/a.iso  # SFTP (ssh-agent or ~/.ssh keys)
-puppy ssh trust host.example:2222           # show an SSH host's key and trust it
+puppy add https://example.com/a.iso         # a URL (HTTP(S), FTP(S), SFTP), magnet link or .torrent path
 puppy add -o ~/isos --limit 2M URL1 URL2    # into a folder, at most 2 MiB/s each
-puppy add --name b.iso --paused URL         # under another name, without starting
-puppy add -H "Authorization: Bearer x" --cookie "a=b" --referer URL URL
-puppy add - < urls.txt                      # one source per line from stdin (# comments)
-puppy add -i list.txt                       # an aria2-style input file, with per-download options
-puppy add --wait URL                        # add, then wait like `puppy wait`
-puppy add --checksum sha-256=9f86d0… URL    # check the finished file against this digest
-puppy add --mirror URL2 --mirror URL3 URL   # one file from several places at once
-puppy add -o ~/isos a.iso.meta4             # every file of a metalink (file or URL)
-puppy add --metalink 'https://mirrors.example/metalink?repo=x'  # a URL that serves one
-puppy add --files 1,3-5 --files '*.mkv' T   # torrent: only these files (1-based numbers, ranges, globs)
-puppy add --choose T                        # torrent: wait for `puppy select` to pick the files
-puppy add --seed-ratio 2 --seed-time 6h T   # torrent: seeding limits for this one (`default` inherits)
-puppy files 3                               # a torrent's files: `#  SIZE  PATH`, numbered from 1
-puppy select 3 2-4 'docs/*'                 # choose files of a torrent that is waiting for it
-puppy seed 3 --ratio 3 --time 0             # change when torrent 3 stops seeding
-puppy status                                # "3 downloads, 1 active"
+puppy add -i list.txt                       # many downloads from an input file
+puppy add --checksum sha-256=9f86d0… URL    # check the finished file
+puppy add --mirror URL2 URL                 # one file from several places at once
+puppy add --files 1,3-5 T                   # torrent: only these files
 puppy ls                                    # table of downloads
-puppy ls --state active,queued              # only these states
 puppy info 3                                # everything about download 3
-puppy pause 3 4                             # pause downloads (ids, or `all`)
-puppy resume all                            # resume paused or failed downloads
-puppy restart 3                             # start a failed / needs-attention download over
+puppy pause 3 4                             # pause (ids, or `all`); `resume` likewise
 puppy rm 3 --delete-files                   # remove, and delete its files
-puppy move 5 0                              # move a queued download to the front
-puppy limit 3 500K                          # speed limit for one download (`none` lifts it)
-puppy limit --global --down 5M --up 1M      # global limits; `limit --global` shows them
-puppy max-active 2                          # run at most 2 downloads at once
-puppy wait 3 4                              # wait until they complete, fail or need attention
-puppy watch                                 # print events as they happen, until Ctrl-C
-puppy update --check                        # is a newer puppy out? (no install)
-puppy update                                # install it; the daemon restarts into it
+puppy limit --global --down 5M              # global speed limit
+puppy wait 3 4                              # wait until they finish
+puppy watch                                 # print events as they happen
+puppy update                                # install a newer puppy, if out
 puppy stop                                  # stop the daemon
-puppy completions zsh                       # print a shell completion script
 ```
 
-The text formats are for people and may change; scripts should use `--json`
-(anywhere on the line), which prints the protocol's own types as exactly one
-JSON value (`watch` excepted):
-
-- `ls`: an array of download snapshots; `info`: `{"download":…,"detail":…}`;
-  `limit --global`: the settings; `status`: `{"downloads":N,"active":N,"update":…}`;
-  `update`: `{"status":…}` (the final update status).
-- `add`: `{"added":[{"id","source"}…],"failed":[{"source","error","code"}…]}`;
-  with `--wait` also `"final"` (the snapshots once done) and `"missing"`
-  (ids that no longer exist). A metalink's file has `"source"` (its primary
-  URL), `"name"` (its path below the output folder) and `"metalink"` (the
-  metalink as given).
-- `wait`: `{"final":[…snapshots…],"missing":[ids…]}`.
-- `pause`, `resume`, `restart`, `rm`, `move`, `limit <ID>`: one result per id,
-  e.g. `[{"id":3,"ok":true},{"id":"abc","ok":false,"error":"…","code":2}]`.
-- `files`: `[{"index","number","path","size"}…]` (`index` is the protocol's
-  0-based one, `number` the 1-based one the CLI uses).
-- `select`: `{"id","selection":{"indices","globs"}}` (0-based indices);
-  `seed`: `{"id","policy":{"ratio","time_secs"}}`.
-- `stop`: `{"stopped":true}` or `{"running":false}`.
-- `watch --json` prints NDJSON: one event per line (`snapshot`, `added`,
-  `completed`, `failed`, `removed`, `needs_attention`), snapshots included, so
-  `puppy --json watch | jq` works; without `--json` it prints lines like
-  `14:02:11 completed 3 a.iso` and leaves out snapshots.
-
-`-H`, `--cookie` and `--referer` are sent to the URL you give and to redirect
-targets on the same origin (scheme, host and port). A redirect to another origin
-gets what a browser would send there:
-
-- of the `-H` headers, only `Accept`, `Accept-Language` and `User-Agent`; any
-  other (an API key, say) is not sent;
-- no cookies, no basic-auth credentials, and no `Cookie`, `Authorization` or
-  `Proxy-Authorization` header;
-- the referer cut down to its origin (`https://example.com/`), or none when the
-  redirect leads from HTTPS (the URL you gave, or the referer) to plain HTTP;
-- the user agent.
-
-This is judged against the URL you gave on every hop, not the previous one: a
-redirect back to its origin gets everything again. The same goes for segment
-requests, resume checks and the re-resolution of an expired redirect. It is
-stricter than curl, which keeps custom headers on another host: a header that
-a CDN needs after a redirect must be given with the final URL instead.
-
-`ls --state` takes `queued`, `starting`, `active`, `verifying`, `paused`, `completed`
-(completed only, not seeding), `done` (finished downloading: completed or
-seeding), `choosing`, `seeding`, `failed` (for good), `retrying` and
-`attention`. Piped `ls` output
-(no terminal, no `COLUMNS`) never truncates names. `add -` reads UTF-8 or
-UTF-16 (with a BOM) from stdin. If an incompatible puppy daemon (another
-version) is running, commands say so; `puppy stop` stops it.
-
-`wait` treats a transient failure (e.g. the server answering 503) as not yet
-ended, since puppy retries it on its own: it keeps waiting and shows
-`retrying in m:ss`. Ctrl-C stops waiting (exit 130); the downloads keep going.
-
-A torrent that is waiting for you to pick its files (`add --choose`, or a
-magnet whose files are not known until its metadata arrives) shows as
-`choosing`; `wait` and `add --wait` end at once with exit 5 and the hint
-`choose files: puppy select <id> …` (so `add --choose --wait` always exits 5).
-A torrent that has finished downloading and is uploading shows as `seeding`
-(100%), and counts as finished for `wait` (exit 0). A note puppy attaches to a
-download (for example a file pattern that matched nothing) appears after the
-name of a `choosing` row in `ls`, and as `note` in `info`.
-
-File specs (`add --files`, `select`) are numbers (`3`), ranges (`2-5`) and
-globs (`*.mkv`, `Season 1/*`), separated by commas (a space belongs to the
-glob; `select` also takes several arguments); numbers are the 1-based
-ones `puppy files` prints. Every comma separates specs, even inside a glob, so
-brace globs (`*.{mkv,srt}`) and names containing a comma cannot be written as
-globs: use their numbers (or several globs). `0`, empty ranges (`5-2`) and
-malformed ones (`1-3-5`, `-3`, `1-`; "not a number or range") are usage errors
-(exit 2). A number past the last file: for `select`, and for `add` of a local
-`.torrent`, the add or choice is refused (exit 2; `add` lists the download in
-`failed` with `"code":2`); for a magnet the file list is not known yet when
-adding, so the torrent waits in `choosing` with a note saying what did not fit,
-for `puppy select`. `--files` and `--choose` cannot be
-combined, and neither (nor `--seed-*`) applies to a non-torrent source. `puppy
-files` on a download that is not a torrent, or one that already completed
-(and so left the torrent engine), fails with exit 1 and the daemon's message.
-
-`add --checksum ALGO=HEX` checks the finished file against a digest:
-`md5`, `sha-1`, `sha-224`, `sha-256`, `sha-384` or `sha-512` (written as
-aria2 and Metalink do, `sha-256=…`; `sha256=…` works too; algorithm and hex
-digits in any case). It needs exactly one HTTP(S), FTP(S) or SFTP source (also on stdin):
-torrents are refused, since BitTorrent already checks every piece. A
-malformed digest, an unknown algorithm or a wrong number of hex digits is a
-usage error (exit 2). The dashboard's add form (`a`) has an optional
-checksum field that takes the same spec.
-
-Once every byte is downloaded, puppy hashes the whole file (also when it was
-resumed, or finished before a restart) and shows the download as
-`verifying` meanwhile, its progress counting the bytes hashed; it holds its
-`max_active` slot until then. A match completes it. A mismatch fails it for
-good (no automatic retry; `wait` exits 4) with the reason `checksum mismatch
-(sha-256): expected <hex>, got <hex>`, and keeps the file where it is:
-`resume` checks it again (for example after you replaced it), `restart`
-deletes it and downloads it again, and `rm --delete-files` deletes it. If
-the daemon stops before the check has passed, it checks the file again
-after the next start, without the network. `pause` during the check stops it;
-`resume` starts it over. `info` shows the digest (`checksum`) and the result
-(`verified`: `yes`, `verifying (N%)`, `no` or `not yet`), the detail pane a
-`Checksum` line; `--json` snapshots carry it as
-`"checksum":{"algo":"sha-256","hex":"…"}` and the state `verifying`. A daemon
-from before checksums cannot verify, so `add --checksum` against one
-removes the download again and fails, asking you to `puppy stop` it.
-
-`add -i FILE` (`--input-file`) reads downloads from a file in aria2's
-input-file format; `-i -` reads it from stdin (not together with a `-`
-source). Each line that does not start with whitespace is one download: a
-URL (`http`, `https`, `ftp`, `ftps`, `ftpes`), magnet link or `.torrent` path
-(a relative one is relative to the current directory). The lines under it that start with a
-space or a TAB are options for that download, written `key=value` as aria2's
-options without the `--` (spaces around the key and the value are ignored; the
-value may contain `=`). Lines starting with `#` are comments, blank lines are
-skipped, and CRLF line endings, a BOM and UTF-16 work as for `add -`.
-
-```text
-# Two ISOs into one folder, the second under another name.
-https://example.com/a.iso
-  dir=~/isos
-  checksum=sha-256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-https://example.com/b.iso
-  dir=~/isos
-  out=b-latest.iso
-  header=Authorization: Bearer x
-  max-download-limit=2M
-/home/me/debian.torrent
-  select-file=1,3-5
-  seed-ratio=2
-  seed-time=90
-```
-
-| Option | Meaning |
-|--------|---------|
-| `dir` | the folder, as `-o`; a relative one is relative to the current directory |
-| `out` | the file name, as `--name` (a name only: put folders in `dir`) |
-| `checksum` | `ALGO=HEX`, as `--checksum` (HTTP(S), FTP(S) and SFTP only) |
-| `header` | `Name: value`, as `-H` (repeatable) |
-| `referer` | as `--referer` |
-| `user-agent` | the `User-Agent` header |
-| `max-download-limit` | as `--limit` (`0`: none) |
-| `pause` | `true` adds it paused, as `--paused`; `false` starts it |
-| `select-file` | torrent: the files to download, as `--files` (numbers, ranges, globs) |
-| `seed-ratio` | torrent: as `--seed-ratio` |
-| `seed-time` | torrent: a number is minutes, as in aria2; `90m`, `2h` and `default` work too |
-
-A URI line may hold several URIs of the same file separated by TABs, as in
-aria2: the first is the download's source and the others are its mirrors, as
-with `--mirror` (see [Mirrors](#mirrors)). Each mirror must be an HTTP(S),
-FTP(S) or SFTP URL and the first URI one of these too; anything else is a usage error
-for that line. `--mirror` on the command line adds its URLs after the
-line's own.
-
-The flags on the command line are defaults for every download of the file,
-and an entry's options override them: `-o`, `--limit`, `--paused`, `--files`,
-`--seed-ratio`/`--seed-time` and `--referer` are replaced, and an entry's
-`header` replaces a `-H` of the same name and adds to the others. `--name` and
-`--checksum` still need exactly one download in all, and the torrent-only
-flags still refuse an HTTP(S), FTP(S) or SFTP download anywhere on the line. Sources given as
-arguments are added first, then the file's, in order; `--json` and `--wait`
-treat them as one list, as for several sources.
-
-Any other aria2 option (`split`, `max-connection-per-server`, ...) is ignored
-with a warning on stderr naming it and its line. Everything else wrong with the
-file is a usage error (exit 2) that adds nothing at all, so a script never ends
-up with half a list queued: an option line before the first URI, one without
-`=`, an empty or bad value for one of the options above, an unknown source, `checksum` on a torrent, a
-torrent option on an HTTP(S), FTP(S) or SFTP download, or `pause=true` with `--wait`. Every
-problem is reported with its line (`puppy: list.txt: line 7: bad
-max-download-limit "fast": ...`). `seed-time=0`, which in aria2 means "do not seed", is
-refused as well, since puppy's `0` would mean the opposite (never stop). What
-the daemon refuses once the file is valid (for example a `select-file` number
-past a torrent's last file) fails that download only, as with several sources.
-
-### Mirrors
-
-`add --mirror URL` (repeatable) gives an HTTP(S), FTP(S) or SFTP download other
-places to get the same file from; the source stays its primary URL. It needs
-exactly one such source, like `--name`. Mirrors are `http://`, `https://`,
-`ftp://`, `ftps://`, `ftpes://` or `sftp://` URLs, whatever the source's
-protocol: an HTTP download can take ranges from an FTP or SFTP mirror and the
-other way round. A torrent with
-mirrors is refused.
-
-When the download starts, puppy probes the primary and every mirror at once.
-The file is what the primary says it is (its size and name); if the primary
-does not answer, the first mirror that does decides. A location is dropped,
-with its reason, if its probe fails, if it reports another size, or if it does
-not honour range requests while others do. If no location honours ranges, or
-the size is unknown (so nothing can be compared), one stream goes to the first
-location that answered and the rest are dropped. The download fails only if
-no location answers at all; it fails transiently (and is retried) if one of
-them failed with an error that may go away.
-
-The connection count (`connections`, 8 by default) is the total over all
-mirrors. Each new connection goes to the usable mirror with the fewest
-connections, so 8 connections over two mirrors are 4 and 4; between equally
-loaded mirrors, the one that is faster per connection wins. Work stealing
-then favours fast mirrors by itself: a connection that finishes its range
-early takes half of the largest range still running, and the freed connection
-goes back to the least loaded mirror, usually the fast one. A mirror that
-becomes usable again (after its backoff, say) while every connection is taken
-gets one moved to it from the busiest mirror. There is no
-separate per-host limit: without mirrors puppy already opens all 8
-connections to one host, and a download whose other mirrors failed keeps that.
-
-A connection that fails on an error that may go away (network error, timeout,
-5xx, 429, 408) hands its range back at once, and the range continues on
-another usable mirror. The failing mirror is benched: it gets no new
-connections for the usual retry backoff, which grows with each failure in a
-row; its other connections carry on, and their failures during the bench
-count as the same outage. A mirror that fails `max_retries` (8) times in a row
-without progress, refuses the request (401, 403, 404, 410: an expired
-redirect target is re-resolved first, for that mirror alone while the others
-keep downloading, and again only after that mirror made progress), sends another file
-(its `If-Range` no longer matches, or another size) or stops honouring ranges
-is dropped. The download fails only when no mirror is left: transiently if
-one of them kept failing on such errors, with a reason naming each mirror and
-why it went (`no mirror works: a.example: HTTP 404; b.example: retries
-exhausted: HTTP 503`), as needing attention if one serves a changed file, and
-otherwise for good. `resume` (and the automatic retry of a transient failure)
-tries every mirror again.
-
-Each location is validated on its own, since mirrors have their own ETag and
-Last-Modified (an FTP location: its size and `MDTM`, checked before each of
-its transfers, see [FTP](#ftp); an SFTP location: its size and modification
-time, see [SFTP](#sftp)). Every request to a location carries that
-location's own validator as `If-Range`, and the resume sidecar records each location's
-final URL and validators. On resume (also after a restart) every location is
-checked against the partial file as a download without mirrors is: with a
-strong ETag by `If-Range`, otherwise by its size and a byte comparison of
-already downloaded parts, whichever mirror they came from. A location without
-any validator recorded is probed first and then compared byte for byte. A
-mirror whose file changed is dropped and never asked for another byte; the
-download continues from the locations proven unchanged. If the primary's file
-changed (and the primary has an ETag or Last-Modified, so this is certain),
-the download needs attention (`remote changed`), as without mirrors, even if
-a mirror still serves the old file; it does so too when every location
-changed, at resume or during the download. A location that cannot be checked
-because it does not answer for now is benched, and checked again before it
-gets a range; if none can be checked, the resume fails transiently.
-
-A location without validators (neither ETag nor Last-Modified; an FTP server
-without `MDTM`, an SFTP server that does not report modification times) cannot be checked with `If-Range`. Before each range it is given, puppy compares the
-last bytes (64 KiB) of the largest part already downloaded against what that
-location serves there, and drops it if they differ. Until there are such
-bytes it waits, unless no location has validators at all. What this cannot
-catch is such a mirror changing its file in the middle of one response, or
-serving different bytes only outside the compared window: give a
-`--checksum` to be sure.
-
-Mirrors that agree on the size may still serve different bytes. Give a
-`--checksum` with mirrors: puppy warns on stderr when there is none, but adds
-the download anyway. A daemon from before mirrors ignores them and downloads
-from the primary only; `add` warns about that.
-
-`-H`, `--cookie` and `--referer` (and a browser's cookies) belong to the
-primary's site. A mirror on the primary's own origin (scheme, host and port)
-gets them; a mirror on another origin gets none of them, no basic-auth
-credentials and no headers at all, only the user agent.
-
-`info` lists every location after `mirrors`: the primary first, then the
-mirrors by priority, each with how it is used (`in use, 4 connections,
-2.1 MiB/s, 30.0 MiB from it`, `failed, retried in 2 s: HTTP 503`, or
-`dropped: its size (4194305 bytes) differs from the file's (4194304 bytes)`).
-The dashboard's detail pane shows the same under `Mirrors`. In `--json`
-snapshots, `"mirrors"` lists the mirror URLs as added; `info --json` has the
-live state in the detail's `"mirrors"`: `{"url","primary","state":{"kind":
-"in_use"|"benched"|"dropped",…},"connections","bps","done_bytes"}`. Both are
-absent for a download without mirrors.
-
-`puppy seed <id>` **replaces the torrent's whole seeding policy**: `--ratio R`
-and `--time DUR` (`90m`, `2h`, ...) set a limit, `0` turns that limit off, and
-`default` (or leaving the option out) goes back to the daemon's `seed_ratio` /
-`seed_time`. At least one of the two options is required.
-
-Exit codes (with several ids, the highest wins):
-
-| Code | Meaning |
-|------|---------|
-| `0`  | ok |
-| `1`  | error (daemon or operation) |
-| `2`  | usage |
-| `3`  | unknown id |
-| `4`  | waited download failed (including a checksum mismatch) |
-| `5`  | waited download needs attention |
-| `6`  | update not possible here (not a release build, or a folder puppy cannot write) |
-
-### FTP
-
-FTP URLs are `ftp://[user[:password]@]host[:port]/path`. Without a user name
-puppy logs in as `anonymous` (password `anonymous@`). The path is relative to
-the directory the server puts you in after login, as RFC 1738 says; most
-servers put anonymous users at `/`, so `ftp://host/pub/a.iso` is `/pub/a.iso`.
-Start the path with `%2F` for an absolute one (`ftp://host/%2Fsrv/a.iso`).
-Percent-encoded characters in the path, user and password are decoded, and a
-trailing `;type=i` is ignored (transfers are always binary). A URL ending in
-`/` names a directory and is refused: puppy downloads files, not directories.
-
-FTPS comes in two forms:
-
-| URL | Port | TLS |
-|-----|------|-----|
-| `ftp://` | 21 | as `[ftp] tls` says (below); `try` by default |
-| `ftpes://` | 21 | explicit (`AUTH TLS`), required |
-| `ftps://` | 990 | implicit: TLS from the first byte |
-
-The `tls` setting only applies to `ftp://` URLs:
-
-```toml
-[ftp]
-tls = "try"       # "try" (the default), "require" or "off"
-```
-
-With `try`, puppy sends `AUTH TLS` before logging in. If the server refuses
-it, the session goes on in plain FTP, user name and password
-included. If the server agrees but its certificate does not verify, the
-download fails: puppy never falls back to plain FTP over a failed handshake.
-With `require` (and always for `ftpes://`), a server that refuses `AUTH TLS`
-fails the download (`TLS: the server refused AUTH TLS (...), and TLS is
-required`) before any credentials are sent. With `off`, puppy never asks. A
-TLS session also protects the data connections (`PROT P`). Certificates are
-verified as for HTTPS (the system's CA certificates, or puppy's bundled ones on
-a system without any); there is no option to skip the check or to add a CA.
-
-puppy uses passive mode only: `EPSV`, then `PASV` once a server refuses
-`EPSV`. The address in a `PASV` reply is ignored and the data connection goes
-to the server's own address, so a NATed server's private address (or a hostile
-one) never matters. Active mode (`PORT`/`EPRT`) is not supported.
-
-When the server tells the size (`SIZE`) and can restart transfers (its `FEAT`
-lists `REST STREAM`, or it does not answer `FEAT`), a download is segmented as
-over HTTP: up to `connections` sessions, each one control and one data
-connection, each starting its range with `REST <offset>`, with the same work
-stealing. A session whose range ends with the file is reused for the next
-range; one whose range ends earlier logs out (`QUIT`), since its transfer is
-cut short. A server that cannot tell the size or restart a transfer gets one
-stream, which, as over HTTP, cannot be resumed and restarts from zero. A
-server that turns a session away with 421 or 530 while others are logged in
-(a per-client or per-user limit) caps the download at the sessions it got;
-the refused range waits for one of them, and the cap holds until the
-download is paused or retried.
-
-Before every transfer puppy asks for the file's `SIZE` and `MDTM`
-(modification time) again; a different answer means the file changed, and the
-download needs attention (`remote changed`) without taking another byte of
-it. Resuming (also after a restart) checks the same: the size must match, and
-with a recorded `MDTM` that is enough. A server without `MDTM` gets the byte
-comparison HTTP servers without validators get: up to three pieces of what is
-downloaded are fetched again and compared with the partial file.
-
-A password in an FTP URL (like one in an HTTP URL or a mirror) is kept only in
-the daemon's state file, which only your user can read. It is shown as `***`
-everywhere else: `puppy add`'s output, `ls`, `info` and their `--json` forms,
-the dashboard. It is never written to the daemon's log or to the resume
-sidecar next to the download. `~/.netrc` is not read.
-
-FTP connections never go through the `proxy` setting, which is an HTTP proxy:
-an FTP download connects to the server directly, and the daemon's log says so
-when a proxy is set. Retries, backoff, speed limits, `--checksum`, pause,
-resume and restart work as for HTTP; `info` and the dashboard show an FTP
-download's connections and segment map as for HTTP.
-
-### SFTP
-
-SFTP URLs are `sftp://[user[:password]@]host[:port]/path`, port 22 by default.
-The path is absolute (`sftp://host/srv/a.iso` is `/srv/a.iso`); start it with
-`/~/` for one relative to your home directory on the server
-(`sftp://host/~/a.iso`), as curl does. Without a user name puppy logs in as
-your local user, as `ssh` does. Percent-encoded characters are decoded. A URL
-ending in `/` names a directory and is refused. `scp://` URLs are not
-supported (neither are they in aria2): use `sftp://`, which every OpenSSH
-server offers.
-
-puppy logs in without asking anything, since the daemon has no terminal to ask
-on. It tries, in this order, what the server accepts:
-
-1. The keys of your ssh-agent. On Unix that is the agent at `SSH_AUTH_SOCK`;
-   on Windows the OpenSSH agent's pipe (`\\.\pipe\openssh-ssh-agent`), then
-   Pageant.
-2. Private key files: `[ssh] identity_file` if set, then `~/.ssh/id_ed25519`,
-   `~/.ssh/id_ecdsa` and `~/.ssh/id_rsa`. Only unencrypted ones can be used. An
-   encrypted key needs its passphrase, which puppy cannot ask for: if nothing
-   else works, the download fails saying so (`~/.ssh/id_ed25519 is encrypted
-   and puppy cannot ask for a passphrase: load it into ssh-agent (ssh-add
-   ~/.ssh/id_ed25519) ...`). Load the key into your agent with `ssh-add`.
-3. The password in the URL, with the `password` method or, if the server only
-   offers that, `keyboard-interactive` (answering its password prompt).
-
-A login that fails says what was tried and what the server accepts. It is not
-retried: fix the cause and `puppy resume` the download. Agent forwarding is
-never requested, and channels the server tries to open (forwarding requests)
-are refused. A password is sent only to the host in its own URL, never to a
-mirror's.
-
-**The agent and the daemon.** The daemon signs logins with an agent, so it
-needs to reach one. An SFTP download added with `puppy add` or the dashboard
-remembers the `SSH_AUTH_SOCK` of the command that added it. Every `puppy`
-command and the dashboard also tell the daemon their `SSH_AUTH_SOCK` when they
-connect, and the daemon keeps the last four. A login tries, in order, the
-download's own agent, those of the clients (the most recent first), then the
-one in the daemon's environment, passing over any that is gone or holds no
-keys; so a dashboard opened over SSH with a forwarded agent does not take over
-the logins of downloads added from your desktop, though its agent may be tried
-after theirs. A daemon that
-`puppy` starts on demand has your shell's agent either way. One that runs as a
-login service (see [docs/service.md](docs/service.md)) starts without it and
-picks it up from the first command you run; a download it resumes after a
-reboot, before any command, has only the service's own `SSH_AUTH_SOCK` (with
-systemd: `systemctl --user import-environment SSH_AUTH_SOCK`, or an agent
-started as a user service), so give it a key file without a passphrase, or run
-any `puppy` command to hand it your agent. To fix the agent instead, set its
-socket (a named pipe on Windows):
-
-```toml
-[ssh]
-agent = "/run/user/1000/ssh-agent.socket"   # always this agent
-identity_file = "~/.ssh/puppy_ed25519"      # tried after the agent's keys
-```
-
-**Host keys.** Before anything is sent, the server's host key must be listed
-for it in `~/.ssh/known_hosts` or in puppy's own `known_hosts`, in its data
-directory (`~/.local/share/puppy/known_hosts` on Linux,
-`~/Library/Application Support/puppy/known_hosts` on macOS,
-`%APPDATA%\puppy\known_hosts` on Windows). Both are read in OpenSSH's
-format: hashed entries (`HashKnownHosts`), `[host]:port` for another port than
-22, wildcards and `!` negations, and `@revoked` keys, which are refused.
-Host certificates (`@cert-authority`) are not supported. puppy never trusts a
-key on first use. A server whose key is not listed fails the download with
-its fingerprint, as OpenSSH prints it:
-
-```
-SSH: the host key of [host.example]:2222 is not known (ssh-ed25519 key
-SHA256:Qm8T…). Check the fingerprint with the server's administrator; to trust
-it, run `puppy ssh trust host.example:2222`
-```
-
-A server presenting another key of a type listed for it fails with
-`REMOTE HOST IDENTIFICATION HAS CHANGED`, naming the file and line of the old
-key: it may be an attack, so nothing is sent and puppy offers no way to go on
-other than removing the old key yourself (`ssh-keygen -R`).
-
-`puppy ssh trust HOST[:PORT]` (also `[IPv6]:PORT` or an `sftp://` URL)
-connects, prints the server's key and fingerprint, and on a terminal asks
-whether to trust it; check the fingerprint with whoever runs the server (on
-the server: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). `--yes`
-trusts without asking (in scripts, where it refuses to ask otherwise). The key
-goes into puppy's own `known_hosts`, never into `~/.ssh/known_hosts`. A host
-already known is left as it is, and a changed key is refused as above. HOST
-must be a plain host name (letters, digits, `.`, `_`, `-`) or an IP address:
-patterns, lists and markers are refused, as they would mean more in
-`known_hosts`.
-
-A host known only with keys of other types that now offers a key of a new
-type (puppy asks for the known types first, so it offers none of them) looks
-like an attack as well: downloads from it fail, and `puppy ssh trust` refuses
-it with a warning naming the keys it is known with. If the server's keys
-really changed, `--replace-type` trusts the new key anyway (after the usual
-question, or with `--yes`). `--json` prints the host, port, key type,
-fingerprint and what happened (`added`, `known`, `changed`, `other-type`,
-`revoked`).
-
-Downloads are segmented as over HTTP: up to `connections` SSH connections to
-the server, each logged in once, with one SFTP session that reads its range
-with several requests in flight, and is reused for the next range. Several
-connections, rather than several channels on one, give several TCP streams,
-which is what makes segments faster. A server that closes a new connection
-while others are logged in (OpenSSH's `MaxStartups`, a per-user limit) caps
-the download at the connections it accepted; the refused range waits for one
-of them, after a growing delay, and the cap holds until the download is paused
-or retried.
-
-The file's size and modification time (`STAT`) are its validator. Every range
-opens the file and checks them on the open file first; different values mean
-the file changed, and the download needs attention (`remote changed`) without
-taking a byte of it. They are checked again when a range is done. Resuming
-(also after a restart) checks the same; a server that reports no modification
-time gets the byte comparison of HTTP servers without validators.
-
-A password in an SFTP URL is kept and hidden as one in an FTP URL is: only in
-the daemon's private state file, `***` everywhere it is shown, never in the
-log or the resume sidecar. The daemon's log keeps only warnings and errors of
-the SSH library, whatever `RUST_LOG` says. SFTP connections never go through
-the `proxy` setting, and there is no `ProxyJump` or `~/.ssh/config` support:
-puppy connects to the URL's host and port directly. Retries, speed limits,
-`--checksum`, pause, resume, restart and mirrors work as for HTTP.
-
-### Metalink
-
-A metalink lists one or more files, where to get each and how to check it.
-puppy reads Metalink 4 (RFC 5854, `.meta4`, `application/metalink4+xml`) and
-the older Metalink 3 (`.metalink`, `application/metalink+xml`), which
-Fedora's MirrorManager still serves. Each `<file>` becomes its own download,
-with its own id.
-
-`puppy add` takes a metalink as:
-
-- a local file ending in `.meta4` or `.metalink`, or any file whose content
-  starts with a `<metalink>` element (a `.torrent` file never is one);
-- an `http://` or `https://` URL whose path ends in `.meta4` or `.metalink`;
-- a line of an input file (`-i`) that is either of these.
-
-`--metalink` reads every source as a metalink: any HTTP(S) URL (for one that
-serves a metalink under another name, such as
-`https://mirrors.fedoraproject.org/metalink?repo=…`) and any file. A URL is
-always fetched with `Accept: application/metalink4+xml, application/metalink+xml`,
-so MirrorBrain and MirrorCache servers (openSUSE's `download.opensuse.org`)
-answer even a file's own URL with its metalink. (`*/*` is deliberately not
-accepted as well: MirrorCache then sends the file itself, even at its `.meta4`
-URL.)
-`--no-metalink` turns detection off: a `.meta4` source is then downloaded as a
-file. Without either flag, an HTTP(S) URL that does not end in `.meta4` or
-`.metalink` is downloaded as a file whatever it serves: puppy does not make an
-extra request for every URL to look at its `Content-Type`. An `ftp://` or
-`sftp://` URL is always downloaded as a file.
-
-The metalink is read, or fetched, by `puppy add` itself, before anything is
-queued, and each file goes to the daemon as an ordinary download (so a
-daemon older than this works too). The fetch goes through the configured
-`proxy`, follows up to 10 redirects and must finish within 60 s. `-H`,
-`--cookie`, `--referer` and an entry's `header` and `referer` options are sent
-only to the origin (scheme, host and port) of the URL you gave; a redirect to
-any other origin gets the user agent alone. A redirect from HTTPS to plain HTTP
-is refused, since the document supplies the hashes the files are checked
-against. If it fails, or the document is not a usable metalink, the source
-is reported like one that cannot be added (exit 1; `"failed"` in `--json`) and
-none of its files is queued; the other sources are added. The dashboard's add
-form takes a metalink path or URL as well (detected as above, without the
-flags), and adds every file into the form's folder.
-
-How a `<file>` is used:
-
-- **URLs.** Its `<url>`s are the download's locations, best first: by
-  `priority` (1 is best; Metalink 3: by `preference`, 100 is best), then in
-  document order, URLs without one last. The first is the primary, the rest
-  are mirrors (see [Mirrors](#mirrors)), with their `location`. Only
-  `http`, `https`, `ftp`, `ftps`, `ftpes` and `sftp` URLs are kept (the schemes
-  puppy downloads from; others, such as `rsync`, are skipped), at most 16 per
-  file: the engine probes every location when the download starts.
-- **Hashes.** The strongest `<hash>` puppy supports becomes the download's
-  checksum, in the order `sha-512`, `sha-384`, `sha-256`, `sha-224`, `sha-1`,
-  `md5`; types it does not know (`sha3-256`, `ed2k`, …) are skipped. A hash of a
-  known type that is not a valid digest refuses the metalink. A file without a
-  usable hash is downloaded unchecked, with the usual warning when it has
-  mirrors.
-- **Size.** `<size>` is checked against every location when the download
-  starts: one that reports another size is dropped, even the primary, and if
-  every location that answers does, the download fails
-  (`the file is N bytes, not the expected M`). A location that reports the
-  size decides what the file is; one that does not report a size comes after
-  it and is taken to have it (the totals of its range responses are checked).
-  The finished file's length is checked too, before its hash: a download whose
-  locations never said their size fails if it ends up with another length.
-  Snapshots show the size as `"expected_size"`; a daemon too old to check it
-  ignores it, and `add` warns.
-- **Name.** `<name>` may contain subdirectories (`iso/x86_64/a.iso`), which
-  are created below the output folder (`-o`, an entry's `dir`, or the daemon's
-  download folder). The name comes from a document puppy does not control, so
-  a metalink is refused, whole, if any of its names could leave that folder:
-  an absolute path, a drive letter or UNC prefix, a `..` component (or one of
-  dots and spaces only, which Windows reads as `.` or `..`), a control
-  character (NUL included), an invisible Unicode formatting character (bidi
-  overrides such as U+202E, zero-width characters, U+FEFF), more than 32
-  components or more than 4096 bytes.
-  Each component is then cleaned like any downloaded file name: `<>:"|?*`
-  become `_`, trailing dots and spaces are dropped, Windows device names
-  (`CON`, `nul.txt`, `COM1`, …) get a leading `_`, and components longer than
-  200 bytes are shortened. Two files with the same path (ignoring case and
-  Unicode normalization) refuse the metalink. A subdirectory that already
-  exists below the output folder as a symbolic link (or as a file) refuses it
-  too, so creating the folders never follows a link out of it. As for any download, an existing file is never overwritten:
-  the new one gets a free name next to it.
-
-Options:
-
-- `-o`, `--paused`, `--limit` and `--wait` (and an input-file entry's `dir`,
-  `pause` and `max-download-limit`) apply to every file.
-- `--name`, `--checksum` and `--mirror` (an entry's `out` and `checksum`)
-  apply to a metalink of one file only: `--name` replaces its name and
-  subdirectories, `--checksum` its hash, `--mirror` adds locations. With
-  several files they are usage errors (exit 2) and nothing is added.
-- `-H`, `--cookie` and `--referer` (and an entry's `header` and `referer`)
-  belong to the site of the metalink's URL. A file gets them only if its
-  primary URL is on that origin and the metalink was served from there too,
-  not after a redirect to another origin (that site wrote the list then).
-  Any other file gets the user agent alone, and its mirrors are treated as in
-  [Mirrors](#mirrors). With a local metalink puppy cannot tell which of the
-  hosts it lists they are meant for, so giving any of them (a `User-Agent`
-  header excepted) is a usage error: add the metalink by its URL instead.
-- TAB-separated mirrors on a metalink's input-file line, and torrent-only
-  options, are usage errors.
-
-`puppy add` prints `added ID PATH` for each file; `--json` lists each in
-`"added"` with its `"name"` and `"metalink"`.
-
-Ignored, by design or for now:
-
-- `<metaurl>` (torrents) and Metalink 3 `type="bittorrent"` URLs: puppy
-  downloads a metalink's files from their plain URLs. A file with only a
-  torrent is refused (`no usable URL (puppy does not use a metalink's
-  torrents)`).
-- `<pieces>` (chunk hashes): the whole-file hash is checked once the file is
-  complete, so a mirror serving bad bytes fails the download (keeping the
-  file) rather than having its ranges fetched again elsewhere.
-- `<signature>`: OpenPGP and other signatures are not verified. Check them
-  yourself if you need to.
-- `<origin dynamic="true">` (the metalink is not fetched again), `<os>`,
-  `<language>`, `<version>`, `<publisher>`, `<description>` and the other
-  descriptive elements, and elements of other namespaces (MirrorManager's
-  `mm0:alternates`, the hashes of older versions of a file, are not the
-  file's).
-- Metalink/HTTP (RFC 6249: `Link: rel=duplicate` and `Digest` response
-  headers) is not used.
-
-The parser is a safe one for documents from the network: a metalink with a
-`<!DOCTYPE>` is refused (Metalink has no use for one), so no DTD, entity
-definition or external entity is ever read; only XML's five predefined
-entities and character references are expanded. A document is at most 4 MiB
-(a larger one is refused from its `Content-Length`, or once that many bytes
-have been read), with at most 1000 files, 1000 URLs per file, nesting 32
-deep and 250000 elements. It must be UTF-8.
+Add `--json` anywhere for output meant for scripts. `puppy --help` and
+`man puppy-<command>` list every option. The full reference (JSON formats,
+headers on redirects, file specs, checksums, input files) is in
+[docs/cli.md](docs/cli.md).
+
+### Protocols
+
+- **HTTP(S)**: the default; 8 connections per download, set with
+  `connections` in [config.toml](docs/configuration.md).
+- **FTP and FTPS**: `ftp://` (TLS tried first), `ftps://` (implicit TLS) and
+  `ftpes://` (TLS required). Anonymous unless the URL has a user. See
+  [docs/ftp.md](docs/ftp.md).
+- **SFTP**: `sftp://user@host/path`, logging in with your ssh-agent, then your
+  default keys, then a password in the URL. Unknown hosts are refused until you
+  `puppy ssh trust HOST`. See [docs/sftp.md](docs/sftp.md).
+- **Mirrors**: `--mirror URL` (repeatable) spreads one file over several
+  locations, mixing HTTP, FTP and SFTP. See [docs/mirrors.md](docs/mirrors.md).
+- **Metalink**: `puppy add file.meta4`, or a `.meta4` / `.metalink` URL, adds
+  every file it lists, with its mirrors and hash. See
+  [docs/metalink.md](docs/metalink.md).
+- **BitTorrent**: magnet links and `.torrent` files, with file selection
+  (`--files`, `puppy select`) and seeding limits (`puppy seed`). See
+  [docs/torrents.md](docs/torrents.md).
 
 ### Shell completions and man pages
 
-`puppy completions <shell>` prints a completion script for `bash`, `zsh`,
-`fish`, `powershell` or `elvish` on stdout. It is generated from the same
-definitions as `puppy --help`, so it always matches the binary that prints
-it, and it does not start a daemon. The release archives carry the scripts in
-`completions/` and the man pages in `man/man1/`: `puppy.1`, and one page per
-command (`puppy-add.1`, `puppy-browser-install.1`, ...). `install.sh` puts
-them in the places below; to do it by hand, or after `cargo install`:
+The release archives carry completion scripts and man pages, and `install.sh`
+installs them. To do it by hand, or after `cargo install`:
 
 | Shell      | Where the script goes                                       |
 |------------|-------------------------------------------------------------|
@@ -908,236 +281,46 @@ them in the places below; to do it by hand, or after `cargo install`:
 | PowerShell | `puppy completions powershell \| Out-String \| Invoke-Expression` in your `$PROFILE` |
 | elvish     | `eval (puppy completions elvish \| slurp)` in `~/.config/elvish/rc.elv` |
 
-New shells pick the script up; an open one needs `exec $SHELL` (or, in
-PowerShell, `. $PROFILE`).
-
-For the man pages, copy the archive's `man/man1/*.1` into
-`~/.local/share/man/man1/`. `man` searches that folder when `~/.local/bin` is
-on your `PATH`; otherwise add it to `MANPATH`. Then `man puppy` and
-`man puppy-add` work. `puppy man` prints `puppy.1` itself, and
-`puppy man --dir <DIR>` writes every page into `<DIR>`.
+For the man pages, `puppy man --dir ~/.local/share/man/man1` writes every page
+there; then `man puppy` and `man puppy-add` work.
 
 ### Configuration
 
-Settings go in `config.toml` (where it lives: see below). Keys:
-`download_dir`, `connections` (default 8), `max_active` (default 3),
-`global_down_limit`, `global_up_limit` (bytes per second), `theme`
-(`"auto"`, `"dark"` or `"light"`; `auto` follows `COLORFGBG`, else dark) and
-`proxy`. `NO_COLOR` switches to monochrome; without `COLORTERM=truecolor` the
-16 ANSI colors are used. `--theme` overrides the file. `[ftp]` holds the TLS
-setting for `ftp://` URLs (see [FTP](#ftp)), `[ssh]` the agent and key file for
-`sftp://` ones (see [SFTP](#sftp)).
-
-Torrents have their own section:
+Settings go in `config.toml`, in `~/.config/puppy` on Linux and the data
+directory elsewhere:
 
 ```toml
-[torrent]
-dht = true            # find peers through the DHT
-upnp = false          # ask the router to forward listen_port (UPnP)
-lsd = true            # find peers on the local network (local service discovery)
-listen_port = 42069   # incoming peer connections; an OS-assigned port if busy
-seed_ratio = 1.0      # stop seeding at this upload/download ratio; 0 = never
-seed_time = "2h"      # ... or after seeding this long; 0 = never
-```
+download_dir = "~/Downloads"
+connections = 8         # per download
+max_active = 3          # downloads at once
+theme = "auto"          # "dark", "light"
 
-A finished torrent keeps seeding until the ratio or the time is reached,
-whichever comes first; with both at `0` it stops at completion, as it did
-before seeding existed. Both can be set per torrent (`puppy add --seed-ratio
-… --seed-time …`, `puppy seed`), and are shown by `puppy info`.
-
-**Upgrading:** `seed_time` is new and defaults to `2h`. A config written for
-an older puppy with `seed_ratio = 0.0` (to stop at completion) therefore now
-seeds for up to 2 hours; add `seed_time = 0` as well to keep stopping at
-completion.
-
-Desktop notifications come from the daemon, so they work with the dashboard and
-terminal closed:
-
-```toml
-[notifications]
-enabled = true
-completed = true        # download finished (incl. a torrent entering seeding)
-failed = true           # failed permanently (transient retries never notify)
-choose_files = true     # torrent waiting for its files to be chosen
-seeding_finished = false
-```
-
-Several popups of one kind are grouped into one ("3 downloads finished"): it is
-sent after 3 seconds without another such event, and at most 10 seconds after the
-first. Config is read when the daemon starts, so run `puppy stop` and let the next
-command restart it. `PUPPY_NO_NOTIFY=1` turns popups off for a daemon. A headless
-box or SSH session without a notification server simply shows none.
-
-Updates are checked on GitHub and installed when puppy is idle:
-
-```toml
 [update]
-check = true            # false: no daily check and no automatic install
-auto_install = true     # install a found release when no download is running
+auto_install = true     # install new releases when nothing is downloading
 ```
 
-With `check = false` puppy never contacts GitHub by itself, only when you run
-`puppy update`, and never installs an update by itself, whatever `auto_install`
-says.
-
-A daemon that `puppy` starts on demand exits after 30 seconds without
-downloads or clients. To keep downloads going across reboots without opening
-puppy, run the daemon as a login service (a systemd user unit, a launchd
-LaunchAgent, or a Windows log-on task): see [docs/service.md](docs/service.md)
-and the files in [packaging/](packaging/).
-
-### Torrents
-
-Add a magnet link or the path of a `.torrent` file in the dashboard's add
-form (`a`). A `.torrent` is copied into the daemon's data directory
-(`torrents/<id>.torrent`) so the download can be restored after a restart
-even if the original is moved; a magnet's metadata is kept there too once it
-has been fetched, so a restart needs no network to restore it. A single-file
-torrent goes straight into the download directory; a multi-file torrent, or
-any magnet, into its own folder there. Existing files are never overwritten:
-a taken folder name gets a counter (`Show (1)`), and a single file whose name
-is taken goes into a folder of its own (`file.iso (1)/file.iso`). The torrent
-engine starts (and opens its ports) only once the first torrent is added.
-Things to know about v1:
-
-- **Seeding**: a finished torrent seeds (state `seeding`) until `seed_ratio`
-  or `seed_time` is reached, then shows as completed. Seeding torrents never
-  occupy one of the `max_active` download slots.
-- **Choosing files**: `puppy add --files SPEC` downloads only some files of a
-  torrent; `--choose` (or the file picker) waits for you in the `choosing`
-  state first. See "Command line". Torrents added from the dashboard always
-  ask: once a multi-file torrent's contents are known the file picker opens
-  (a folder tree with checkboxes; `Space` toggles, `a`/`n` all/none, `/`
-  filters by path, `←`/`→` fold, `Enter` (or `y`) confirms; with a filter,
-  `a`/`n` act on the shown files). `Esc` leaves it
-  waiting; `c` reopens it. The folder layout is fixed when the torrent starts
-  waiting: if a file of it appears on disk meanwhile, choosing fails and the
-  torrent must be removed and added again.
-- **Piece map**: the detail pane shows the exact set of verified pieces, read
-  from librqbit while the torrent is live or paused. When librqbit has none
-  (while it checks the data, or after an error): a complete torrent shows
-  its selected pieces as had; otherwise the last exact map seen is shown;
-  before there was one (after a restart, until the check is done) the map
-  is synthesized from per-file progress, assuming each file fills in order.
-  After a fast resume the exact map is back within moments.
-- **Per-torrent speed limits** can only be set while the torrent is queued
-  or waiting for its files to be chosen, before it starts (librqbit takes a torrent's limit only when it is added);
-  later the dashboard says so and the limit is not kept. The global limits
-  apply to torrents at any time.
-- **After a daemon restart** a torrent goes on from the pieces it had when
-  the daemon stopped (fast resume). At a clean stop (`puppy stop`, or any
-  normal shutdown) the daemon flushes each torrent's files to disk and keeps
-  its piece map and the size and modification time of its files
-  (`torrents/<id>.resume`). It keeps none for a torrent whose file is shorter
-  than the pieces it had, or was modified after the torrent last wrote to it
-  (for example a seeding torrent's file edited by another program). On
-  restore, if the files are exactly as recorded, up to 64 of the recorded
-  pieces are read back and their hashes checked; the torrent then shows its
-  progress at once instead of re-checking all its data. Otherwise it checks
-  the data already on disk in full before it goes on, showing 0 until the
-  check is done (a large library takes a while): after the daemon was killed
-  or crashed, when there was no record, when a file was changed, moved,
-  truncated or deleted while the daemon was down, when a checked piece is
-  bad, or when the `.torrent` changed. A record is used once: after a
-  restart, only the next clean stop writes a new one.
-- **Deleting a torrent's files** (also once it has completed) deletes exactly
-  the files the torrent lists, then its folders once empty; anything else in
-  them stays. A torrent whose `.torrent` file is gone (shown as "torrent file
-  missing") leaves its files on disk, even when asked to delete them.
-- **Choosing only some files**: librqbit still creates every file of the
-  torrent, so unselected files show up as empty placeholders. A placeholder
-  also gets the bytes of a piece it shares with a selected file. Deleting
-  removes the selected files and the placeholders puppy's download created, as
-  long as they are unchanged; a file that was already there, or that you
-  replaced or edited, stays. After a restart, a file that was already at an
-  unselected path (one puppy did not create) may still get those shared-piece
-  bytes written into it when the torrent goes on.
-- **DHT is on by default, UPnP is off.** Trackers and local peer discovery are
-  used too (`lsd = false` turns the latter off). If the torrent engine cannot
-  start, torrents fail with "torrent engine unavailable (see daemon log)" and
-  are retried automatically.
+The daemon reads it at start: run `puppy stop` after a change. Every key
+(proxy, torrents, notifications, FTP TLS, SSH) is in
+[docs/configuration.md](docs/configuration.md). To keep downloading across
+reboots, run the daemon as a login service: see
+[docs/service.md](docs/service.md).
 
 State lives in the platform data directory (`~/.local/share/puppy`,
 `~/Library/Application Support/puppy` or `%APPDATA%\puppy`); the daemon's log
-is `logs/puppyd.log` there. `config.toml` lives in the config directory
-(`~/.config/puppy` on Linux, the data directory elsewhere). Setting
-`PUPPY_HOME=<dir>` relocates both (config in `<dir>/config`, data in `<dir>/data`).
+is `logs/puppyd.log` there. `PUPPY_HOME=<dir>` relocates both (config in
+`<dir>/config`, data in `<dir>/data`).
 
 ## Browser downloads
 
 An extension for Chrome, Chromium, Brave, Edge and Vivaldi hands the browser's
-downloads to puppy. It talks to puppy through the browser's native messaging,
-so no network port is opened. Firefox is not supported yet.
+downloads to puppy, with their cookies. Firefox is not supported yet.
 
-1. **Install the native host.** `puppy browser install` registers it for every
-   browser found; `--browser chrome|chromium|brave|edge|vivaldi` picks one, and
-   `--force` with it registers that browser even if it is not found.
-   `puppy browser status` shows what is registered, and `puppy browser
-   uninstall` removes it. Re-run `install` after moving the puppy binary
-   (`status` then says "stale").
-2. **Load the extension.** Open `chrome://extensions`, turn on Developer mode,
-   choose Load unpacked and pick the `extension/` folder from the release
-   archive (or from this repo). Keep the folder where it is: the browser loads
-   it from there every time. The card must
-   show the ID `cbfmabianfipnmdcdipmcpaggpejlaeg`.
-3. **What happens.** Every download goes to puppy's download folder, sent with
-   the browser's cookies, referrer and user agent. The browser's own copy is
-   cancelled only after puppy accepted the download, and the browser keeps it
-   if puppy does not answer within 10 s. If puppy accepts late, or the browser
-   finishes first, puppy removes its own copy and keeps the browser's.
-4. **Bypass and settings.** The toolbar popup has a "Let the browser take the
-   next download" button; Alt+Shift+B does the same. It covers one download
-   within 60 s. The options page sets a minimum size and the file types and
-   sites to leave to the browser, and shows the connection status.
-5. **Privacy.** A browser download's cookies are kept in puppy's private state
-   file (mode 0600) and cleared when the download completes or is removed. They
-   never reach logs, `puppy info`, `--json` output or the resume sidecar. An
-   interrupted logged-in download resumes after a restart.
+1. Run `puppy browser install` to register the native host.
+2. Open `chrome://extensions`, turn on Developer mode, choose Load unpacked
+   and pick the `extension/` folder from the release archive.
 
-### Known limits
-
-- `blob:`, `data:` and `file:` downloads stay in the browser.
-- Incognito downloads and downloads started by other extensions stay in the
-  browser.
-- POST-backed (form) downloads can't be detected, and may fail in puppy. Use
-  the bypass (toolbar button or Alt+Shift+B) for them.
-- Cookies are read for the original URL only. If that URL redirects to another
-  origin (a different scheme, host or port), the target gets what a browser
-  would send it: no cookies, credentials or page headers other than `Accept`,
-  `Accept-Language` and `User-Agent`, and the page's referer cut down to its
-  origin (none from HTTPS to plain HTTP). See
-  [Command line](#command-line) for the whole rule. A download whose redirect
-  target needs a login or a header of its own fails in puppy. The extension
-  never adds mirrors; a mirror added otherwise gets none of a download's
-  cookies unless it is on the same origin.
-- A metalink the browser hands over is downloaded as a file, not read: add
-  it with `puppy add` (or the dashboard) to get its files.
-- CHIPS partitioned cookies are not read below Chrome 119.
-- "Ask where to save each file" is not mirrored: files go to puppy's folder.
-- Re-downloading a completed download after a post-completion recheck failure
-  goes without cookies.
-- Flatpak and Snap browsers are not supported.
-- On Windows, Vivaldi shares Chrome's native-messaging registration, and Brave
-  is registered both under its own key and under Chrome's. Brave's location
-  is unverified.
-- The Windows registry code has been compile-checked only.
-
-### Manual check (Chrome)
-
-1. `cargo build --release -p puppy && ./target/release/puppy browser install && ./target/release/puppy browser status`: chrome shows `ok`.
-2. Load the extension unpacked. The ID matches, and the options page status reads "Ready: ...".
-3. Download a large public file. It leaves the browser's list, and `puppy ls` shows it under the same name.
-4. Download something behind a login (for example a private GitHub release asset). It completes in puppy.
-5. Press Alt+Shift+B, then download. It stays in the browser.
-6. Run `puppy browser uninstall`, then download. It stays in the browser, and the popup lists it as failed with "not reachable".
-7. Start a `blob:` download (for example "export" in a web app). It stays in the browser.
-8. Add `pdf` to the file types. A PDF stays in the browser.
-9. Midway through a logged-in download, run `puppy stop` then `puppy resume <id>`. It resumes.
-10. Pausing during filename determination: start a download from a link that sets its name in a header (`Content-Disposition`). The browser shows no "Save as" and no partial file, and puppy gets the final name. With puppy unreachable the same download still completes in the browser.
-11. Erase removes the entry: after puppy took a download, it is gone from `chrome://downloads` and the toolbar download bubble, not left as a cancelled entry.
-12. Turn on "Ask where to save each file" in the browser settings and download. No save dialog flashes, and puppy gets the file.
-13. Late accept: suspend the daemon (`kill -STOP <pid>`) so the browser's 10 s wait runs out, and download. The browser finishes the file itself. Resume the daemon (`kill -CONT <pid>`): puppy removes its own copy, keeping the browser's file.
-14. Browser finished first: download a tiny file. The browser's copy completes and puppy ends up with no second copy of it (if puppy took one, it removes it).
+Alt+Shift+B lets the browser keep the next download. Settings, privacy and
+known limits are in [docs/browser.md](docs/browser.md).
 
 ## Project layout
 
