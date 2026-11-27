@@ -900,7 +900,9 @@ async fn run_refuses_without_a_terminal() {
         return; // Run interactively: nothing to check here.
     }
     let api: Arc<dyn DaemonApi> = Arc::new(FakeApi::new(Vec::new()));
-    let e = puppy_tui::runtime::run(api, theme()).await.unwrap_err();
+    let e = puppy_tui::runtime::run(api, theme(), None)
+        .await
+        .unwrap_err();
     assert_eq!(e.to_string(), puppy_tui::runtime::NOT_A_TERMINAL);
 }
 
@@ -930,9 +932,16 @@ fn terminal_events_to_messages() {
     );
     assert_eq!(input_msg(mouse(MouseEventKind::Moved)), None);
     assert_eq!(
-        input_msg(mouse(MouseEventKind::Up(MouseButton::Left))),
+        input_msg(mouse(MouseEventKind::Up(MouseButton::Right))),
         None
     );
+    assert_eq!(
+        input_msg(mouse(MouseEventKind::Drag(MouseButton::Right))),
+        None
+    );
+    // Left drags and releases move the pane divider.
+    assert!(input_msg(mouse(MouseEventKind::Up(MouseButton::Left))).is_some());
+    assert!(input_msg(mouse(MouseEventKind::Drag(MouseButton::Left))).is_some());
     assert!(input_msg(mouse(MouseEventKind::Down(MouseButton::Left))).is_some());
     assert!(input_msg(mouse(MouseEventKind::ScrollDown)).is_some());
     assert_eq!(
@@ -1128,4 +1137,43 @@ async fn picker_commands_report_back_to_the_picker() {
     }
     assert!(app.toasts.is_empty(), "{:?}", app.toasts);
     assert!(last(&frames).contains("refusing to overwrite"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn divider_position_is_saved_for_the_next_run() {
+    use puppy_tui::runtime::run_with_prefs;
+    let dir = tempfile::tempdir().unwrap();
+    let prefs = dir.path().join(puppy_tui::prefs::FILE_NAME);
+    let downloads = || vec![ok(vec![snap(1, "a.bin", WireState::Active)])];
+
+    let api = Arc::new(FakeApi::new(downloads()));
+    let (tx, input) = input();
+    send_after(
+        &tx,
+        Duration::from_millis(100),
+        vec![key('<'), key('<'), key('q')],
+    );
+    let (mut term, _) = Recorder::terminal(160, 40);
+    let app = run_with_prefs(api, theme(), &mut term, input, None, &prefs)
+        .await
+        .unwrap();
+    // 92 columns by default, 4 per press.
+    assert_eq!(app.split.list_width(160), 84);
+    assert!(prefs.exists());
+
+    // A new dashboard starts where the last one left the divider.
+    let api = Arc::new(FakeApi::new(downloads()));
+    let (tx, input) = self::input();
+    send_after(&tx, Duration::from_millis(100), vec![key('q')]);
+    let app = run_with_prefs(api, theme(), &mut term, input, None, &prefs)
+        .await
+        .unwrap();
+    assert_eq!(app.split.list_width(160), 84);
+    let shown = app
+        .hits
+        .iter()
+        .find(|(_, t)| *t == puppy_tui::app::HitTarget::List)
+        .expect("list drawn")
+        .0;
+    assert_eq!(shown.width, 84);
 }

@@ -59,6 +59,7 @@ const HELP: &[(&str, &str)] = &[
     ("+, -", "more / fewer active downloads"),
     ("L", "global speed limits"),
     ("", "App"),
+    ("<, >", "move the divider between the panes"),
     ("?", "this help"),
     ("q, Ctrl+C", "quit (the daemon keeps running)"),
     ("", "In popups"),
@@ -70,6 +71,7 @@ const HELP: &[(&str, &str)] = &[
     ("click", "select a download"),
     ("double-click", "pause / resume"),
     ("wheel", "scroll the list"),
+    ("drag a divider", "resize the panes (double-click: reset)"),
     ("click a hint", "run that key"),
     ("paste", "add the pasted link"),
 ];

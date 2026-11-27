@@ -7,6 +7,7 @@ pub mod history;
 pub mod input;
 pub mod keys;
 pub mod picker;
+pub mod split;
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ pub use history::History;
 pub use input::TextInput;
 pub use keys::KeyAction;
 pub use picker::{Picker, PickerOutcome};
+pub use split::{Panes, Split};
 
 use crate::theme::Theme;
 
@@ -164,6 +166,8 @@ pub enum HitTarget {
     FooterKey(char),
     /// The whole list panel (wheel scrolling).
     List,
+    /// The borders between the list and the detail pane: dragging moves them.
+    Divider,
     PopupInside,
     PopupCheckbox,
     /// A popup's confirm button.
@@ -400,6 +404,15 @@ pub struct App {
     pub should_quit: bool,
     /// Hit regions set by drawing.
     pub hits: HitMap,
+    /// Where the divider between the list and the detail pane sits.
+    pub split: Split,
+    /// The list and the detail pane as last drawn (set by drawing; `None` without a
+    /// detail pane).
+    pub panes: Option<Panes>,
+    /// While the divider is dragged: how far from it it was pressed ([`Split::grab`]).
+    drag: Option<i32>,
+    /// The last press on the divider, for double-click (reset) detection.
+    divider_click: Option<Instant>,
     /// Wall-clock Unix seconds for "retry in m:ss" (the runtime sets it before each
     /// [`Msg::Tick`]; `update` itself never reads a clock).
     pub now_unix: u64,
@@ -450,6 +463,10 @@ impl App {
             theme,
             should_quit: false,
             hits: HitMap::new(),
+            split: Split::default(),
+            panes: None,
+            drag: None,
+            divider_click: None,
             now_unix: 0,
             ticks: 0,
             help_scroll: 0,
@@ -463,6 +480,12 @@ impl App {
             asked: HashSet::new(),
             auto_pending: None,
         }
+    }
+
+    /// Whether the divider is being dragged (the runtime saves the split once it is
+    /// let go).
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Downloads matching the filter, in daemon order.
@@ -644,6 +667,8 @@ impl App {
                 self.size = (w, h);
                 // The regions are stale until the next frame.
                 self.hits.clear();
+                self.panes = None;
+                self.drag = None;
                 Vec::new()
             }
             Msg::Tick => self.on_tick(now),
@@ -1127,6 +1152,7 @@ impl App {
         let popup = matches!(self.mode, Mode::Popup(_));
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = None;
                 if let Some(HitTarget::FooterKey(c)) =
                     self.hit_at(x, y, |t| matches!(t, HitTarget::FooterKey(_)))
                 {
@@ -1169,6 +1195,22 @@ impl App {
                     }
                     return Vec::new();
                 }
+                if let Some(p) = self.panes
+                    && self.hit_at(x, y, |t| *t == HitTarget::Divider).is_some()
+                {
+                    self.last_click = None;
+                    let double = matches!(self.divider_click,
+                        Some(at) if now.saturating_duration_since(at) <= DOUBLE_CLICK);
+                    if double {
+                        self.divider_click = None;
+                        self.split.reset(p);
+                    } else {
+                        self.divider_click = Some(now);
+                        self.drag = Some(self.split.grab(p, p.along(x, y)));
+                    }
+                    return Vec::new();
+                }
+                self.divider_click = None;
                 let Some(HitTarget::ListRow(id)) =
                     self.hit_at(x, y, |t| matches!(t, HitTarget::ListRow(_)))
                 else {
@@ -1194,6 +1236,17 @@ impl App {
                 } else {
                     Vec::new()
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some(grab), Some(p)) = (self.drag, self.panes) {
+                    self.divider_click = None;
+                    self.split.drag(p, p.along(x, y), grab);
+                }
+                Vec::new()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = None;
+                Vec::new()
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
@@ -1368,6 +1421,14 @@ impl App {
                 self.mode = Mode::Popup(Popup::Help);
             }
             KeyAction::Quit => return self.quit(),
+            KeyAction::ShrinkList | KeyAction::GrowList => {
+                if let Some(p) = self.panes {
+                    // Columns are narrower than rows: wide steps are bigger.
+                    let step = if p.wide { 4 } else { 1 };
+                    let sign = if action == KeyAction::GrowList { 1 } else { -1 };
+                    self.split.nudge(p, sign * step);
+                }
+            }
         }
         Vec::new()
     }

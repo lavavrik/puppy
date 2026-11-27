@@ -683,6 +683,7 @@ async fn dashboard(theme: Option<ThemeArg>) -> anyhow::Result<()> {
     };
     let theme = Theme::detect(choice, &|k| std::env::var(k).ok());
     let exe = std::env::current_exe().context("cannot find the puppy executable")?;
+    let prefs = paths.data_dir.join(puppy_tui::prefs::FILE_NAME);
     let api = ClientApi::new(paths, exe).with_http(config.http_config());
-    puppy_tui::runtime::run(Arc::new(api), theme).await
+    puppy_tui::runtime::run(Arc::new(api), theme, Some(prefs)).await
 }

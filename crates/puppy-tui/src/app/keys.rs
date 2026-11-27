@@ -27,6 +27,10 @@ pub enum KeyAction {
     ClearFilter,
     Help,
     Quit,
+    /// `<`: moves the divider toward the list (the detail pane grows).
+    ShrinkList,
+    /// `>`: moves the divider toward the detail pane (the list grows).
+    GrowList,
 }
 
 impl KeyAction {
@@ -55,6 +59,8 @@ impl KeyAction {
             KeyAction::ClearFilter => '\u{1b}',
             KeyAction::Help => '?',
             KeyAction::Quit => 'q',
+            KeyAction::ShrinkList => '<',
+            KeyAction::GrowList => '>',
         }
     }
 
@@ -82,6 +88,8 @@ impl KeyAction {
             '\u{1b}' => KeyAction::ClearFilter,
             '?' => KeyAction::Help,
             'q' => KeyAction::Quit,
+            '<' => KeyAction::ShrinkList,
+            '>' => KeyAction::GrowList,
             _ => return None,
         })
     }

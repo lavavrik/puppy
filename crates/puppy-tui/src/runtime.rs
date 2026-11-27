@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::panic::{self, PanicHookInfo};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, MouseEventKind,
+    EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -32,6 +33,7 @@ use puppy_core::types::DownloadId;
 
 use crate::api::{ApiError, DaemonApi};
 use crate::app::{App, Cmd, CmdOutcome, Msg};
+use crate::prefs::{self, Prefs};
 use crate::theme::Theme;
 use crate::ui::draw;
 
@@ -53,8 +55,13 @@ const DAEMON_QUEUE: usize = 256;
 pub const NOT_A_TERMINAL: &str = "puppy's dashboard needs an interactive terminal";
 
 /// Runs the dashboard in the real terminal until the user quits. The daemon is left
-/// running.
-pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
+/// running. `prefs`, when given, is the [`prefs`](crate::prefs) file: read at the
+/// start and kept up to date.
+pub async fn run(
+    api: Arc<dyn DaemonApi>,
+    theme: Theme,
+    prefs: Option<PathBuf>,
+) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!(NOT_A_TERMINAL);
     }
@@ -94,6 +101,7 @@ pub async fn run(api: Arc<dyn DaemonApi>, theme: Theme) -> anyhow::Result<()> {
         Box::pin(input),
         None,
         Some(&TERMINAL_ACTIVE),
+        prefs.as_deref(),
     )
     .await;
     drop(terminal);
@@ -132,14 +140,19 @@ fn reexec(exe: std::io::Result<std::path::PathBuf>) {
 }
 
 /// The message for a terminal event; `None` for what the app ignores (key releases,
-/// mouse motion and button releases), so it causes no redraw.
+/// mouse motion without a button held, releases of other buttons), so it causes no
+/// redraw. Left drags and releases move the pane divider.
 pub fn input_msg(e: Event) -> Option<Msg> {
     match e {
         Event::Key(k) if k.kind != KeyEventKind::Release => Some(Msg::Key(k)),
         Event::Mouse(m)
             if matches!(
                 m.kind,
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                MouseEventKind::Down(_)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
             ) =>
         {
             Some(Msg::Mouse(m))
@@ -160,7 +173,20 @@ pub async fn run_with<B: Backend>(
     input: impl Stream<Item = Msg> + Unpin,
     stop_after: Option<Duration>,
 ) -> anyhow::Result<App> {
-    run_loop(api, theme, terminal, input, stop_after, None).await
+    run_loop(api, theme, terminal, input, stop_after, None, None).await
+}
+
+/// [`run_with`], reading and keeping up to date the [`prefs`](crate::prefs) file at
+/// `prefs`.
+pub async fn run_with_prefs<B: Backend>(
+    api: Arc<dyn DaemonApi>,
+    theme: Theme,
+    terminal: &mut Terminal<B>,
+    input: impl Stream<Item = Msg> + Unpin,
+    stop_after: Option<Duration>,
+    prefs: &Path,
+) -> anyhow::Result<App> {
+    run_loop(api, theme, terminal, input, stop_after, None, Some(prefs)).await
 }
 
 /// [`Msg::Quit`] for each SIGTERM or SIGHUP (Unix; nothing elsewhere, where closing
@@ -188,6 +214,8 @@ pub fn termination_signals() -> impl Stream<Item = Msg> + Send + Unpin + 'static
 
 /// The loop; `live`, when given, says whether the terminal is still in dashboard
 /// mode (after the panic hook restored it, drawing would scribble over the shell).
+/// The split is saved to `prefs` when it changes (once a drag is let go) and on the
+/// way out.
 async fn run_loop<B: Backend>(
     api: Arc<dyn DaemonApi>,
     theme: Theme,
@@ -195,12 +223,15 @@ async fn run_loop<B: Backend>(
     mut input: impl Stream<Item = Msg> + Unpin,
     stop_after: Option<Duration>,
     live: Option<&AtomicBool>,
+    prefs: Option<&Path>,
 ) -> anyhow::Result<App> {
     let can_draw = || live.is_none_or(|l| l.load(Ordering::SeqCst));
     let term_err = |e: B::Error| anyhow::anyhow!("terminal: {e}");
     let start = Instant::now();
     let deadline = stop_after.map(|d| start + d);
     let mut app = App::new(theme);
+    let mut saved = prefs.map(prefs::load).unwrap_or_default();
+    app.split = saved.split;
     app.now_unix = unix_now();
     let size = terminal.size().map_err(term_err)?;
     app.update(Msg::Resize(size.width, size.height), start.into_std());
@@ -280,10 +311,14 @@ async fn run_loop<B: Backend>(
                 );
             }
         }
+        if !app.dragging() {
+            save_prefs(prefs, &app, &mut saved);
+        }
         if app.should_quit {
             break;
         }
     }
+    save_prefs(prefs, &app, &mut saved);
     drop(connection);
     if !app.should_quit && dirty && can_draw() {
         // Leave the final state on screen (tests read it).
@@ -294,6 +329,18 @@ async fn run_loop<B: Backend>(
     })
     .await;
     Ok(app)
+}
+
+/// Writes the prefs to `path` if they changed since `saved`. A failure is not worth
+/// interrupting anyone over: the next change tries again.
+fn save_prefs(path: Option<&Path>, app: &App, saved: &mut Prefs) {
+    let now = Prefs { split: app.split };
+    if let Some(path) = path
+        && now != *saved
+        && prefs::save(path, &now).is_ok()
+    {
+        *saved = now;
+    }
 }
 
 /// A finished command: the detail fetch it was (if one) and what to tell the app.
@@ -590,6 +637,7 @@ mod tests {
             input,
             stop,
             Some(&restored),
+            None,
         )
         .await
         .unwrap();
@@ -605,6 +653,7 @@ mod tests {
             input,
             stop,
             Some(&active),
+            None,
         )
         .await
         .unwrap();

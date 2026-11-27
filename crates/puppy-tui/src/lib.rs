@@ -6,6 +6,7 @@
 pub mod api;
 pub mod app;
 pub mod format;
+pub mod prefs;
 pub mod runtime;
 pub mod theme;
 pub mod ui;

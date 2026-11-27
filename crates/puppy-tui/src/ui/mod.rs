@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use puppy_proto::{DownloadSnapshot, WireState};
 use ratatui::style::{Color, Modifier};
 
-use crate::app::{App, Banner, Conn, HitTarget, Mode};
+use crate::app::{App, Banner, Conn, HitTarget, Mode, Panes, Split};
 use crate::format;
 use crate::theme::{Theme, Token};
 
@@ -33,19 +33,13 @@ pub const MIN_SIZE: (u16, u16) = (60, 16);
 pub const WIDE_WIDTH: u16 = 110;
 pub const TOO_SMALL: &str = "puppy needs a bigger terminal (60×16)";
 
-/// Share of the body width the list gets in the wide layout.
-const LIST_PERCENT: u16 = 58;
-/// Narrow layout: the list keeps at least this many rows; the detail pane needs at
-/// least `DETAIL_MIN` rows (else it is omitted) and gets at most `DETAIL_MAX`.
-const LIST_MIN: u16 = 8;
-const DETAIL_MIN: u16 = 7;
-const DETAIL_MAX: u16 = 18;
 const FOOTER_ROWS: u16 = 2;
 
 /// Draws one frame. Takes `&mut` only to refill [`App::hits`] and to adjust
 /// [`App::list_offset`] so the selection stays visible.
 pub fn draw(app: &mut App, f: &mut Frame) {
     app.hits.clear();
+    app.panes = None;
     let area = f.area();
     let cursor = draw_into(app, f.buffer_mut(), area);
     if let Some(pos) = cursor {
@@ -60,10 +54,12 @@ struct Layout {
     banner: Option<Rect>,
     list: Rect,
     detail: Option<Rect>,
+    /// The list and the detail pane together, when the detail pane shows.
+    panes: Option<Panes>,
     footer: Rect,
 }
 
-fn layout(area: Rect, banner: bool) -> Layout {
+fn layout(area: Rect, banner: bool, split: &Split) -> Layout {
     let title = Rect::new(area.x, area.y, area.width, 1);
     let top = 1 + u16::from(banner);
     let banner = banner.then(|| Rect::new(area.x, area.y + 1, area.width, 1));
@@ -75,7 +71,7 @@ fn layout(area: Rect, banner: bool) -> Layout {
         area.height - top - FOOTER_ROWS,
     );
     if area.width >= WIDE_WIDTH {
-        let lw = body.width * LIST_PERCENT / 100;
+        let lw = split.list_width(body.width);
         return Layout {
             title,
             banner,
@@ -85,22 +81,20 @@ fn layout(area: Rect, banner: bool) -> Layout {
                 width: body.width - lw,
                 ..body
             }),
+            panes: Some(Panes { body, wide: true }),
             footer,
         };
     }
-    let mut dh = (body.height * 45 / 100).clamp(DETAIL_MIN, DETAIL_MAX);
-    if body.height.saturating_sub(dh) < LIST_MIN {
-        dh = body.height.saturating_sub(LIST_MIN);
-    }
-    if dh < DETAIL_MIN {
+    let Some(dh) = split.detail_height(body.height) else {
         return Layout {
             title,
             banner,
             list: body,
             detail: None,
+            panes: None,
             footer,
         };
-    }
+    };
     let lh = body.height - dh;
     Layout {
         title,
@@ -111,6 +105,7 @@ fn layout(area: Rect, banner: bool) -> Layout {
             height: dh,
             ..body
         }),
+        panes: Some(Panes { body, wide: false }),
         footer,
     }
 }
@@ -198,7 +193,11 @@ fn draw_parts(app: &mut App, buf: &mut Buffer, area: Rect) -> Option<Position> {
         too_small(&app.theme, buf, area);
         return None;
     }
-    let l = layout(area, app.banner.is_some());
+    let l = layout(area, app.banner.is_some(), &app.split);
+    app.panes = l.panes;
+    if let Some(p) = l.panes {
+        app.hits.push((p.divider(&app.split), HitTarget::Divider));
+    }
     if let Some(b) = l.banner {
         banner(app, buf, b);
     }

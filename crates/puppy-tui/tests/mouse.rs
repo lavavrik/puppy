@@ -396,3 +396,112 @@ fn altgr_chars_are_not_normal_mode_actions() {
     };
     assert_eq!(f.source.value, "@");
 }
+
+fn drag_divider(a: &mut App, from: (u16, u16), to: (u16, u16), now: Instant) {
+    click(a, from.0, from.1, now);
+    let ev = |kind, (x, y)| mouse(kind, x, y, KeyModifiers::NONE);
+    a.update(ev(MouseEventKind::Drag(MouseButton::Left), to), now);
+    a.update(ev(MouseEventKind::Up(MouseButton::Left), to), now);
+}
+
+/// Wide layout: the list's width (the detail pane starts right after it).
+fn list_width(a: &App) -> u16 {
+    rect_of(a, HitTarget::List).width
+}
+
+#[test]
+fn drag_wide_divider_resizes_panes() {
+    let mut a = three();
+    render_at(&mut a, 160, 40);
+    let d = rect_of(&a, HitTarget::Divider);
+    assert_eq!((d.width, list_width(&a)), (2, 92));
+    let now = Instant::now();
+    // Grabbed on the list's border, dropped 20 columns left: the border follows.
+    drag_divider(&mut a, (d.x, 10), (d.x - 20, 12), now);
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 72);
+    // Moves after the release do nothing.
+    a.update(
+        mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            10,
+            KeyModifiers::NONE,
+        ),
+        now,
+    );
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 72);
+    // Dragged past the edge: the detail pane keeps its minimum.
+    let d = rect_of(&a, HitTarget::Divider);
+    drag_divider(
+        &mut a,
+        (d.x + 1, 10),
+        (159, 10),
+        now + Duration::from_secs(1),
+    );
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 130);
+    // Scales with the terminal.
+    render_at(&mut a, 320, 40);
+    assert_eq!(list_width(&a), 260);
+}
+
+#[test]
+fn double_click_divider_resets() {
+    let mut a = three();
+    render_at(&mut a, 160, 40);
+    let d = rect_of(&a, HitTarget::Divider);
+    let now = Instant::now();
+    drag_divider(&mut a, (d.x, 10), (d.x - 20, 10), now);
+    render_at(&mut a, 160, 40);
+    let d = rect_of(&a, HitTarget::Divider);
+    let later = now + Duration::from_secs(2);
+    click(&mut a, d.x, 10, later);
+    click(&mut a, d.x, 10, later + Duration::from_millis(200));
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 92);
+}
+
+#[test]
+fn drag_narrow_divider_resizes_panes() {
+    let mut a = three();
+    render_at(&mut a, 90, 40);
+    let list = rect_of(&a, HitTarget::List);
+    let d = rect_of(&a, HitTarget::Divider);
+    assert_eq!((d.height, d.y), (2, list.bottom() - 1));
+    // Grabbed on the detail pane's title row, dropped 5 rows up.
+    drag_divider(&mut a, (30, d.y + 1), (30, d.y - 4), Instant::now());
+    render_at(&mut a, 90, 40);
+    assert_eq!(rect_of(&a, HitTarget::List).height, list.height - 5);
+}
+
+#[test]
+fn divider_keys_move_it() {
+    let mut a = three();
+    render_at(&mut a, 160, 40);
+    let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    a.update(key('<'), Instant::now());
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 88);
+    a.update(key('>'), Instant::now());
+    a.update(key('>'), Instant::now());
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 96);
+    // Narrow: rows.
+    render_at(&mut a, 90, 40);
+    let h = rect_of(&a, HitTarget::List).height;
+    a.update(key('>'), Instant::now());
+    render_at(&mut a, 90, 40);
+    assert_eq!(rect_of(&a, HitTarget::List).height, h + 1);
+}
+
+#[test]
+fn press_beside_divider_does_not_drag() {
+    let mut a = three();
+    render_at(&mut a, 160, 40);
+    let d = rect_of(&a, HitTarget::Divider);
+    drag_divider(&mut a, (d.x - 5, 10), (d.x - 25, 10), Instant::now());
+    render_at(&mut a, 160, 40);
+    assert_eq!(list_width(&a), 92);
+}
